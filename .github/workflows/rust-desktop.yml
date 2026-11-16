@@ -44,7 +44,7 @@ jobs:
       - name: Animation asset decoder
         run: cargo test --locked --manifest-path animation-codec/Cargo.toml
       - name: Rust host and real executable startup
-        run: cargo test --locked --manifest-path rust-client/Cargo.toml --all-targets -- --test-threads=1
+        run: cargo test --locked --manifest-path rust-client/Cargo.toml --all-targets --no-fail-fast -- --test-threads=1
       - name: Release build and package
         shell: pwsh
         run: ./build-windows.ps1

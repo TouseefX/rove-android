@@ -56,19 +56,23 @@ fn actor_script_publishes_edited_and_cloned_curves_to_root_scripts() {
         json!({"id":"source","class_name":"LocalScript","name":"Source","parent":"actor","properties":{"Enabled":true,"Disabled":false}})
     ]);
     snapshot["script_sources"] = json!({"source":{"source":r#"
+        local ok, message = pcall(function()
+        assert(typeof(RotationCurveKey.new(0, CFrame.identity)) == 'RotationCurveKey')
         local v=Instance.new('Vector3Curve',workspace);v.Name='FromActor'
         v:X():SetKeys({FloatCurveKey.new(0,0,Enum.KeyInterpolationMode.Linear),FloatCurveKey.new(2,4)})
         local copy=v:Clone();copy.Name='Copy';copy.Parent=workspace
         v:X():InsertKey(FloatCurveKey.new(2,8))
         script.Parent:SetAttribute('Ready',true)
+        end)
+        if not ok then script.Parent:SetAttribute('Failure', tostring(message)); error(message) end
     "#}});
     let runtime = Runtime::new(snapshot, 32).unwrap();
     let reply = execute(
         runtime,
         r#"
         local deadline=os.clock()+5
-        while not workspace.Worker:GetAttribute('Ready') and os.clock()<deadline do task.wait() end
-        assert(workspace.Worker:GetAttribute('Ready'))
+        while not workspace.Worker:GetAttribute('Ready') and not workspace.Worker:GetAttribute('Failure') and os.clock()<deadline do task.wait() end
+        assert(workspace.Worker:GetAttribute('Ready'), workspace.Worker:GetAttribute('Failure'))
         assert(workspace.FromActor:X():GetValueAtTime(1)==4)
         assert(workspace.Copy:X():GetValueAtTime(1)==2)
         return true

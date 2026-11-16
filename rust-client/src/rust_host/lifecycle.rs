@@ -327,10 +327,10 @@ fn is_engine_global(name: &str) -> bool {
         | "tostring" | "type" | "typeof" | "unpack" | "warn" | "xpcall"
         | "bit32" | "buffer" | "coroutine" | "debug" | "math" | "os" | "string" | "table"
         | "utf8" | "vector" | "Axes" | "BrickColor" | "CFrame" | "Color3" | "ColorSequence"
-        | "ColorSequenceKeypoint" | "DateTime" | "Enum" | "Faces" | "Font" | "Instance"
+        | "ColorSequenceKeypoint" | "DateTime" | "Enum" | "Faces" | "FloatCurveKey" | "Font" | "Instance"
         | "NumberRange" | "NumberSequence" | "NumberSequenceKeypoint" | "OverlapParams"
         | "PathWaypoint" | "PhysicalProperties" | "Random" | "Ray" | "RaycastParams" | "Rect"
-        | "Region3" | "Region3int16" | "SharedTable" | "TweenInfo" | "UDim" | "UDim2"
+        | "Region3" | "Region3int16" | "RotationCurveKey" | "SharedTable" | "TweenInfo" | "UDim" | "UDim2"
         | "Vector2" | "Vector2int16" | "Vector3" | "Vector3int16"
         | "game" | "workspace" | "settings" | "UserSettings" | "shared"
         | "require" | "task" | "time" | "tick" | "elapsedTime" | "wait" | "spawn" | "delay")
