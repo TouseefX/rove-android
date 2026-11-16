@@ -14,7 +14,7 @@ this is the current rust runtime snapshot, with the official luau vm.
 - the actor test now expects only the new VM's connection after replacement, and checks that old handles cannot change it.
 - game scripts can use `FloatCurveKey` and `RotationCurveKey`, including inside actors.
 - both command-line entry points use the same user agent. the VM bridge includes the C++ header required by MSVC.
-- physics tests explicitly supply anchoring state and advance queued callbacks before checking completion.
+- physics tests include receipt revisions and anchoring state, advance queued callbacks, and check every Actor command batch even when callbacks span frames.
 
 ## verification
 

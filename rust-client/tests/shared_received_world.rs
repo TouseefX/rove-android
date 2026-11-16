@@ -679,6 +679,11 @@ fn shared_point_velocity_reads_current_received_assembly_motion() {
     part["properties"]["AssemblyLinearVelocity"]=json!({"$vector3":[1,0,0]});
     part["properties"]["AssemblyAngularVelocity"]=json!({"$vector3":[0,0,2]});
     part["properties"]["AssemblyCenterOfMass"]=json!({"$vector3":[1,2,3]});
+    // These observations arrived with the pose, not before its revision.
+    for key in ["Anchored", "AssemblyLinearVelocity", "AssemblyAngularVelocity", "AssemblyCenterOfMass"] {
+        part["origins"][key] = json!("received");
+        part["property_revisions"][key] = json!(7);
+    }
     let mut h=Harness::from_raw(raw);
     assert_eq!(h.run("local v=workspace.SharedProbe:GetVelocityAtPosition(Vector3.new(3,2,3));return v.X,v.Y,v.Z"),json!([1.,4.,0.]));
     let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":8,"actions":[{"kind":"set","sequence":8,"id":"scope:root-1","fields":{"AssemblyAngularVelocity":{"$vector3":[0,0,0]}}}]}));

@@ -1292,18 +1292,43 @@ fn actor_jump_and_pivot_replay_do_not_duplicate_commands() {
     );
 }
 #[test]
-fn actor_command_capacity_is_reported_to_the_script_before_forwarding() {
+fn actor_command_acceptance_matches_forwarded_batches_across_slices() {
     let (mut vm, _) = runtime_with_actors(2);
     poll_actors(&mut vm);
     run(
         &mut vm,
         "workspace.Worker0:SendMessage('moves',200);workspace.Worker1:SendMessage('moves',200)",
     );
-    poll_actors(&mut vm);
-    let commands = vm.take_movement_intents();
-    assert_eq!(commands.len(), 256, "{commands:?}");
-    let accepted=run(&mut vm,"return workspace.Worker0.Driver:GetAttribute('Accepted')+workspace.Worker1.Driver:GetAttribute('Accepted')");
-    assert_eq!(accepted, json!([256.]));
+    let mut accepted = json!([-1., -1.]);
+    for _ in 0..100 {
+        poll_actors(&mut vm);
+        accepted = run(&mut vm, "return workspace.Worker0.Driver:GetAttribute('Accepted') or -1, workspace.Worker1.Driver:GetAttribute('Accepted') or -1");
+        if accepted.as_array().unwrap().iter().all(|n| n.as_f64().unwrap() >= 0.) {
+            break;
+        }
+    }
+    let counts: Vec<_> = accepted.as_array().unwrap().iter().map(|n| n.as_f64().unwrap()).collect();
+    assert!(counts.iter().all(|n| (0.0..=200.0).contains(n)), "actors did not finish: {accepted}");
+    let total = counts.iter().sum::<f64>() as usize;
+    assert!((256..=400).contains(&total), "{accepted}");
+
+    // A slower machine can split the callbacks across frames. Drain every batch
+    // and check that each successful call reached the host exactly once.
+    let mut commands = Vec::new();
+    loop {
+        let batch = vm.take_movement_intents();
+        assert!(batch.len() <= 256);
+        if batch.is_empty() { break; }
+        commands.extend(batch);
+    }
+    assert_eq!(commands.len(), total, "{accepted}");
+    for (index, count) in counts.iter().enumerate() {
+        let actor = format!("worker{index}");
+        assert_eq!(commands.iter().filter(|row| row["actor_origin"] == actor).count(), *count as usize);
+    }
+    for pair in commands.windows(2) {
+        assert!(pair[0]["sequence"].as_u64().unwrap() < pair[1]["sequence"].as_u64().unwrap());
+    }
     run(&mut vm, "workspace.Worker0:SendMessage('moves',1)");
     poll_actors(&mut vm);
     assert_eq!(vm.take_movement_intents().len(), 1);
