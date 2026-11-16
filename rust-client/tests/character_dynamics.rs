@@ -258,6 +258,11 @@ fn relative_move_to_arrival_delivers_completion_back_to_luau() {
     for _ in 0..2 {
         successful(&vm.call(json!({"op":"physics_feedback","engine_poses":feedback["engine_poses"],"feedback":feedback})).unwrap()).unwrap();
     }
+    // Feedback queues the callback; a control read doesn't advance other tasks.
+    assert_eq!(run(&mut vm, "return finished")[0].as_f64(), Some(0.));
+    successful(&vm.poll().unwrap()).unwrap();
+    assert_eq!(run(&mut vm, "return finished")[0].as_f64(), Some(1.));
+    successful(&vm.poll().unwrap()).unwrap();
     assert_eq!(run(&mut vm, "return finished")[0].as_f64(), Some(1.));
 }
 

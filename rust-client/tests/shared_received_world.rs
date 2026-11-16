@@ -675,6 +675,7 @@ fn shared_owned_body_feedback_reads_received_authority_and_stops_after_owner_cha
 fn shared_point_velocity_reads_current_received_assembly_motion() {
     let mut raw=raw_snapshot();
     let part=raw["nodes"].as_array_mut().unwrap().iter_mut().find(|n|n["id"]=="scope:root-1").unwrap();
+    part["properties"]["Anchored"]=json!(false);
     part["properties"]["AssemblyLinearVelocity"]=json!({"$vector3":[1,0,0]});
     part["properties"]["AssemblyAngularVelocity"]=json!({"$vector3":[0,0,2]});
     part["properties"]["AssemblyCenterOfMass"]=json!({"$vector3":[1,2,3]});
