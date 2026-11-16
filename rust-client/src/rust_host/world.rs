@@ -128,6 +128,10 @@ pub(super) fn instance_full_name(world: &World, instance_id: &str) -> mlua::Resu
         let Some(node) = world.nodes.get(id) else {
             break;
         };
+        // game is the container, not part of a descendant's full name.
+        if node.class_name == "DataModel" && id != instance_id {
+            break;
+        }
         names.push(node.name.clone());
         if node.class_name == "DataModel" {
             break;

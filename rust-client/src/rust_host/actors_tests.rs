@@ -296,6 +296,18 @@ fn getconnections_exposes_real_foreign_actor_records_with_generation_fencing() {
         signals::connect_owned(actor_lua, actor_world, "worker", "Event", callback, "new-incarnation", false)?;
         Ok(())
     }).unwrap().unwrap();
-    root.load("assert(not foreign_connection.Connected); local rows=getconnections(foreign_event); assert(#rows==2 and rows[1].Connected and rows[1].ForeignState)").exec().unwrap();
+    root.load(r#"
+        assert(not foreign_connection.Connected)
+        assert(not foreign_rows[2].Connected)
+        local rows = getconnections(foreign_event)
+        -- the new VM only has the new callback; both old records are gone.
+        assert(#rows == 1 and rows[1].Connected and rows[1].ForeignState)
+        assert(rows[1].LuaConnection and rows[1].Enabled)
+        foreign_connection:Disable()
+        foreign_connection:Disconnect()
+        assert(rows[1].Connected and rows[1].Enabled)
+        rows[1]:Disconnect()
+        assert(not rows[1].Connected and #getconnections(foreign_event) == 0)
+    "#).exec().unwrap();
     let _ = actor_connection;
 }

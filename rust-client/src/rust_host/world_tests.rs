@@ -23,17 +23,23 @@ fn instance_tostring_uses_current_name_independent_of_parent_identity() {
     lua.load(r#"
         local part = workspace.Part
         assert(tostring(part) == 'Part')
+        assert(workspace:GetFullName() == 'Workspace')
         assert(part:GetFullName() == 'Workspace.Part')
         part.Name = 'renamed'
         assert(tostring(part) == 'renamed')
         part.Parent = nil
         assert(tostring(part) == 'renamed')
+        assert(part:GetFullName() == 'renamed')
         part:Destroy()
         assert(tostring(part) == 'renamed')
         local humanoid = Instance.new('Humanoid')
         humanoid.Parent = workspace
         local function capture() return humanoid end
         assert(tostring(capture()) == 'Humanoid')
+        local folder = Instance.new('Folder')
+        folder.Name = 'detached'
+        humanoid.Parent = folder
+        assert(humanoid:GetFullName() == 'detached.Humanoid')
     "#).exec().unwrap();
 }
 
