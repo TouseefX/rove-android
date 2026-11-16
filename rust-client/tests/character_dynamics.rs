@@ -82,7 +82,7 @@ fn runtime_with_actors(count: usize) -> (Runtime, WorldStore) {
         let script = format!("script{i}");
         snapshot["nodes"].as_array_mut().unwrap().extend([
             json!({"id":actor,"class_name":"Actor","name":format!("Worker{i}"),"parent":"1:4"}),
-            json!({"id":script,"class_name":"LocalScript","name":"Driver","parent":actor,"properties":{"Enabled":true,"Disabled":false}})
+            json!({"id":script,"class_name":"LocalScript","name":"Driver","parent":actor,"properties":{"Enabled":true,"Disabled":false},"attributes":{}})
         ]);
         snapshot["script_sources"][&script] = json!({"source":r#"
             local c=game:GetService('Players').LocalPlayer.Character
