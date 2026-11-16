@@ -27,3 +27,5 @@ cargo test --locked --manifest-path rust-client/Cargo.toml
 ```
 
 upstream code and notices are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+original rove code is licensed under [MIT](LICENSE), copyright (c) 2026 alexkkork. you can modify, redistribute and sell it; keep the copyright and license notice with copies or substantial portions. third-party code and assets keep their own licenses.
