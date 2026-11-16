@@ -2,7 +2,7 @@
 extern crate self as headless_luau;
 pub(crate) const EXECUTOR_NAME: &str = "rove";
 pub(crate) const EXECUTOR_VERSION: &str = "1.00";
-pub(crate) const EXECUTOR_USER_AGENT: &str = "rove 1.00";
+pub const EXECUTOR_USER_AGENT: &str = "rove 1.00";
 pub mod account_auth;
 pub mod allocation;
 mod animation_queue;

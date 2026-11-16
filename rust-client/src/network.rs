@@ -606,7 +606,7 @@ fn operation_with_ws_timeout(v: Value, websocket_timeout: Duration) -> Result<Va
                 .build();
             let mut request = agent
                 .request(method, url)
-                .set("User-Agent", crate::EXECUTOR_USER_AGENT);
+                .set("User-Agent", headless_luau::EXECUTOR_USER_AGENT);
             if let Some(headers) = v["Headers"].as_object() {
                 if headers.len() > 64 {
                     return Err("too many HTTP headers".into());
