@@ -1,7 +1,9 @@
 //! one owner for the official luau vm, running in this process.
-//! keep the native handle on its owner thread. frontends send bounded commands
+//! keep the VM on its owner thread. frontends send bounded commands
 //! instead of sharing the raw handle or copying the world into another vm.
 use crate::engine_services::{TextServiceBackend, TextServiceQueue};
+use crate::animation_assets::{self, AnimationBackend};
+use crate::animation_queue::AnimationQueue;
 use crate::engine_world_view::SharedProjectedWorldView;
 use crate::native::Session;
 use crate::render_projection::{project_frame, RenderProjection};
@@ -21,7 +23,10 @@ pub struct Runtime {
     events: EventHistory,
     diagnostics: Value,
     text_backend: Option<Arc<dyn TextServiceBackend>>,
+    text_measurements: std::rc::Rc<crate::engine_text_measure::Context>,
     text_service: Option<TextServiceQueue>,
+    animation_backend: Arc<dyn AnimationBackend>,
+    animation_service: Option<AnimationQueue>,
     local_errors: VecDeque<Value>,
     remote_client_replies: VecDeque<Value>,
     remote_server_events: VecDeque<Value>,
@@ -51,31 +56,47 @@ impl Runtime {
         memory: u32,
         world: Option<&SharedProjectedWorldView>,
     ) -> Result<Self, String> {
-        #[cfg(target_os = "macos")]
         let backend = Some(
             Arc::new(crate::engine_services::local_text::LocalTextBackend::default())
                 as Arc<dyn TextServiceBackend>,
         );
-        #[cfg(not(target_os = "macos"))]
-        let backend = None;
-        Self::initialize(snapshot, memory, backend, world)
+        Self::with_services(snapshot, memory, backend, animation_assets::default_backend(), world)
     }
     pub fn with_text_backend(
         snapshot: Value,
         memory: u32,
         text_backend: Option<Arc<dyn TextServiceBackend>>,
     ) -> Result<Self, String> {
-        Self::initialize(snapshot, memory, text_backend, None)
+        Self::with_services(snapshot, memory, text_backend, animation_assets::default_backend(), None)
     }
-    fn initialize(
+    pub fn with_text_backend_and_shared_world(
         snapshot: Value,
         memory: u32,
         text_backend: Option<Arc<dyn TextServiceBackend>>,
+        world: &SharedProjectedWorldView,
+    ) -> Result<Self, String> {
+        Self::with_services(snapshot, memory, text_backend, animation_assets::default_backend(), Some(world))
+    }
+    pub fn with_animation_backend(
+        snapshot: Value,
+        memory: u32,
+        animation_backend: Arc<dyn AnimationBackend>,
+        world: Option<&SharedProjectedWorldView>,
+    ) -> Result<Self, String> {
+        let text = Some(Arc::new(crate::engine_services::local_text::LocalTextBackend::default()) as Arc<dyn TextServiceBackend>);
+        Self::with_services(snapshot, memory, text, animation_backend, world)
+    }
+    pub fn with_services(
+        snapshot: Value,
+        memory: u32,
+        text_backend: Option<Arc<dyn TextServiceBackend>>,
+        animation_backend: Arc<dyn AnimationBackend>,
         world: Option<&SharedProjectedWorldView>,
     ) -> Result<Self, String> {
         if !(8..=512).contains(&memory) {
             return Err("Lua memory limit must be 8..512 MiB".into());
         }
+        let text_measurements = crate::engine_text_measure::Context::new(text_backend.clone());
         let mut driver = Self {
             vm: Some(Session::new()),
             buffer: Vec::new(),
@@ -87,7 +108,10 @@ impl Runtime {
             events: EventHistory::default(),
             diagnostics: json!({}),
             text_backend,
+            text_measurements,
             text_service: None,
+            animation_backend,
+            animation_service: None,
             local_errors: VecDeque::new(),
             remote_client_replies: VecDeque::new(),
             remote_server_events: VecDeque::new(),
@@ -132,6 +156,7 @@ impl Runtime {
         if self.vm.is_none() {
             return Err("Runtime is closed".into());
         }
+        let _text_scope = crate::engine_text_measure::enter(&self.text_measurements);
         let operation = command
             .get("op")
             .and_then(Value::as_str)
@@ -141,6 +166,15 @@ impl Runtime {
             operation.as_str(),
             "init" | "render" | "host_io" | "physics_feedback"
         ) {
+            if command.get("loaded_animation_responses").is_some() {
+                return Err("Animation loading responses are owned by this runtime".into());
+            }
+            if command.get("animation_responses").is_none() && command.pointer("/delta/animation_responses").is_none() {
+                if let Some(service) = &self.animation_service {
+                    let ready = service.drain();
+                    if !ready.is_empty() { command["loaded_animation_responses"] = Value::Array(ready); }
+                }
+            }
             if let Some(service) = &self.text_service {
                 let ready = service.drain();
                 if !ready.is_empty() {
@@ -151,17 +185,20 @@ impl Runtime {
                 }
             }
         }
-        self.buffer.clear();
-        serde_json::to_writer(&mut self.buffer, &command).map_err(|e| e.to_string())?;
-        drop(command);
-        let result = self
-            .vm
-            .as_mut()
-            .unwrap()
-            .request_owned_with_world(&self.buffer, world)?;
-        let mut parsed: Value = serde_json::from_slice(result.as_bytes())
-            .map_err(|e| format!("invalid VM reply: {e}"))?;
-        drop(result);
+        #[cfg(feature = "rust-host")]
+        let mut parsed = {
+            let reply = self.vm.as_mut().unwrap().request_value_with_world(&command, world)?;
+            drop(command);
+            reply
+        };
+        #[cfg(not(feature = "rust-host"))]
+        let mut parsed: Value = {
+            self.buffer.clear();
+            serde_json::to_writer(&mut self.buffer, &command).map_err(|e| e.to_string())?;
+            drop(command);
+            let result = self.vm.as_mut().unwrap().request_owned_with_world(&self.buffer, world)?;
+            serde_json::from_slice(result.as_bytes()).map_err(|e| format!("invalid VM reply: {e}"))?
+        };
         self.calls += 1;
         // Large one-off source/init frames must not remain resident forever.
         if self.buffer.capacity() > 256 * 1024 {
@@ -254,6 +291,9 @@ impl Runtime {
             "root_pending_tasks",
             "actor_pending_tasks",
             "runtime_stage_timings_ms",
+            "host_stage_timings",
+            "frame_stage_timings",
+            "actor_stage_timings",
         ] {
             if let Some(value) = response.get(key) {
                 // Keep a compact diagnostic view; full actor/source catalogs
@@ -302,7 +342,16 @@ impl Runtime {
                     if self.completed.iter().any(|entry| entry.0 == id) {
                         continue;
                     }
-                    self.active.insert(id,json!({"ok":true,"values":[],"job_id":id,"state":"running","scheduler_state":job.get("scheduler_state")}));
+                    let mut status = json!({"ok":true,"values":[],"job_id":id,"state":"running",
+                        "scheduler_state":job.get("scheduler_state")});
+                    // Preserve measured progress so callers can distinguish a
+                    // busy coroutine from one waiting on an external result.
+                    for key in ["resume_count", "yield_count", "slice_interruptions", "execution_ms"] {
+                        if let Some(value) = job.get(key).filter(|value| value.is_number()) {
+                            status[key] = value.clone();
+                        }
+                    }
+                    self.active.insert(id, status);
                 }
             }
         }
@@ -358,6 +407,13 @@ impl Runtime {
     }
 
     fn observe_services(&mut self, response: &Value) -> Result<(), String> {
+        #[cfg(feature = "rust-host")]
+        {
+            if self.animation_service.is_none() && AnimationQueue::has_requests(response) {
+                self.animation_service = Some(AnimationQueue::new(self.animation_backend.clone())?);
+            }
+            if let Some(service) = &self.animation_service { service.observe(response)?; }
+        }
         if let Some(active) = response
             .get("active_text_service_requests")
             .and_then(Value::as_array)
@@ -443,7 +499,7 @@ impl Runtime {
         }
         if self.networked {
             if let Some(intents) = response.get("movement_intents").and_then(Value::as_array) {
-                if self.movement_intents.len() + intents.len() > 512 {
+                if self.movement_intents.len() + intents.len() > crate::movement_queue::PENDING_LIMIT {
                     return Err("Movement intent queue limit exceeded".into());
                 }
                 self.movement_intents.extend(intents.iter().cloned());
@@ -452,7 +508,6 @@ impl Runtime {
         for field in [
             "animation_intents",
             "movement_intents",
-            "animation_requests",
         ] {
             if self.networked && field == "movement_intents" {
                 continue;
@@ -477,7 +532,14 @@ impl Runtime {
     }
 
     pub fn take_movement_intents(&mut self) -> Vec<Value> {
-        self.movement_intents.drain(..).collect()
+        self.take_movement_intents_up_to(crate::movement_queue::BATCH_LIMIT)
+    }
+
+    pub(crate) fn take_movement_intents_up_to(&mut self, available: usize) -> Vec<Value> {
+        let count = self.movement_intents.len()
+            .min(available)
+            .min(crate::movement_queue::BATCH_LIMIT);
+        self.movement_intents.drain(..count).collect()
     }
 
     pub fn active_remote_server_requests(&self) -> BTreeSet<u64> {
@@ -509,7 +571,17 @@ impl Runtime {
     pub fn summary(&self) -> Value {
         json!({"ok":true,"values":[],"connected":self.vm.is_some(),"closed":self.vm.is_none(),
             "runtime":"rust_in_process_official_luau","live_game_session":false,
-            "rust_engine_bindings":["class_ancestry","Vector2int16","Vector3int16","Region3int16","PhysicalProperties","Color3","Vector2","InstanceAttributes"],
+            "engine_host":if cfg!(feature = "rust-host") { "rust" } else { "legacy_cpp" },
+            "rust_engine_bindings":if cfg!(feature = "rust-host") {
+                &[
+                    "world", "typed_values", "attributes", "services", "signals",
+                    "scheduler", "script_lifecycle", "actors", "shared_tables", "remotes",
+                    "movement", "spatial_queries", "input", "gui", "drawing", "playback",
+                    "files", "console", "http", "websockets",
+                ][..]
+            } else {
+                &["class_ancestry","Vector2int16","Vector3int16","Region3int16","PhysicalProperties","Color3","Vector2","InstanceAttributes"][..]
+            },
             "elapsed_seconds":self.started.elapsed().as_secs_f64(),"vm_requests":self.calls,
             "actor_vm_count":self.actor_vms,"active_jobs":self.active.len(),
             "cached_job_results":self.completed.len(),"event_bytes":self.events.bytes,
@@ -553,10 +625,11 @@ impl Runtime {
     }
 
     pub fn close(&mut self) {
-        self.vm.take(); // Session::drop calls the native close ABI exactly once.
+        self.vm.take(); // The selected Session backend owns and closes its VM.
         if let Some(mut queue) = self.text_service.take() {
             queue.close();
         }
+        self.animation_service.take();
         self.local_errors.clear();
         self.render_cache = None;
         self.buffer = Vec::new();

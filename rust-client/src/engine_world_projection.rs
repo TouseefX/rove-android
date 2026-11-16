@@ -31,10 +31,10 @@ impl ProjectionContext {
         let mut property_types = HashMap::with_capacity(schema.classes.len());
         for class in &schema.classes {
             let mut types = HashMap::with_capacity(class.properties.len());
-            for property_id in &class.properties {
+            for property_id in class.properties.iter().copied().chain(class.isr_properties.iter().map(|&id| id as usize)) {
                 let property = schema
                     .properties
-                    .get(*property_id)
+                    .get(property_id)
                     .ok_or("schema class references missing property")?;
                 if property.class != class.id {
                     return Err("schema class property belongs to another class".into());
@@ -153,6 +153,15 @@ impl ProjectedNode {
             ReadOnlyField::Missing => ReadOnlyField::Missing,
             ReadOnlyField::Null => ReadOnlyField::Null,
             ReadOnlyField::Value(parent) => ReadOnlyField::Value(parent.to_owned()),
+        }
+    }
+
+    /// Check a hierarchy edge without allocating a copied parent ID.
+    pub(crate) fn parent_matches(&self, parent: &str) -> bool {
+        if self.context.service_roots.contains_key(self.id()) {
+            matches!(self.parent(), ReadOnlyField::Value(value) if value == parent)
+        } else {
+            matches!(self.node.parent(), ReadOnlyField::Value(value) if value == parent)
         }
     }
 
@@ -299,6 +308,13 @@ impl ProjectedNode {
                             count += 1;
                         }
                         if self.node.property("Position").is_none() {
+                            count += 1;
+                        }
+                    }
+                    for key in ["AssemblyLinearVelocity", "Velocity", "AssemblyAngularVelocity", "RotVelocity"] {
+                        if self.node.property(key).is_none()
+                            && project_node_property(&self.node, None, key)?.is_some()
+                        {
                             count += 1;
                         }
                     }

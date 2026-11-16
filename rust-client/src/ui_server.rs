@@ -261,6 +261,8 @@ fn serve(
     key: &str,
     port: u16,
 ) -> io::Result<()> {
+    // Accepted sockets can inherit the listener's nonblocking mode.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
     let request = match read_request(&mut stream) {
@@ -904,17 +906,7 @@ fn serve_asset(
 /// it only for the lifetime of the local UI process.
 pub fn random_ui_key() -> io::Result<String> {
     let mut bytes = [0u8; 32];
-    #[cfg(unix)]
-    {
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    }
-    #[cfg(not(unix))]
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "OS random token provider unavailable",
-        ));
-    }
+    rove_client_core::entropy::fill(&mut bytes)?;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
     Ok(bytes
         .iter()
@@ -947,16 +939,48 @@ mod tests {
         key: &str,
     ) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let body = data
             .map(|v| serde_json::to_vec(&v).unwrap())
             .unwrap_or_default();
         let host = format!("127.0.0.1:{}", addr.port());
         let origin = format!("http://{host}");
-        write!(stream, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nX-Console-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-        stream.write_all(&body).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nX-Console-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        request.extend_from_slice(&body);
+        stream.write_all(&request).unwrap();
+        read_response(stream)
+    }
+
+    fn read_response(stream: TcpStream) -> (u16, String) {
+        use std::io::{BufRead, BufReader};
+
+        // A rejected request may close with a reset after sending its response.
+        // Read the HTTP body by length instead of requiring a clean TCP EOF.
+        let mut reader = BufReader::new(stream);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+            assert!(head.len() <= 16 * 1024, "oversized HTTP response header");
+        }
+        let length: usize = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .expect("response needs Content-Length")
+            .1
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(length <= 4 * 1024 * 1024, "oversized test response");
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
         let status = head
             .lines()
             .next()
@@ -966,7 +990,7 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        (status, body.to_owned())
+        (status, String::from_utf8(body).unwrap())
     }
 
     fn mock_owner(rx: Receiver<UiCommand>) -> JoinHandle<()> {
@@ -981,6 +1005,55 @@ mod tests {
                 let _ = cmd.reply.send(Ok(response));
             }
         })
+    }
+
+    #[test]
+    fn loopback_session_accepts_delayed_headers_and_bodies() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let owner = mock_owner(rx);
+        let key = "a".repeat(32);
+        let mut server = UiServer::bind(
+            UiConfig {
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                assets: std::env::temp_dir(),
+                key: key.clone(),
+            },
+            tx,
+        )
+        .unwrap();
+        for (method, path, body) in [
+            ("GET", "/api/runtime/status", ""),
+            ("POST", "/api/runtime/render", "{}"),
+        ] {
+            let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let host = format!("127.0.0.1:{}", server.local_addr().port());
+            let parts = [
+                format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n"),
+                format!("Origin: http://{host}\r\nX-Console-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()),
+                body.to_owned(),
+            ];
+            // Browsers need not send a complete request before accept() returns.
+            for part in parts {
+                thread::sleep(Duration::from_millis(50));
+                stream.write_all(part.as_bytes()).unwrap();
+            }
+            let (status, body) = read_response(stream);
+            assert_eq!(status, 200, "{method} {path}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            if method == "GET" {
+                assert_eq!(value["connected"], true);
+            } else {
+                assert_eq!(value["frame"]["parts"], json!([]));
+            }
+        }
+        server.shutdown();
+        owner.join().unwrap();
     }
 
     #[test]

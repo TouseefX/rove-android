@@ -1,5 +1,5 @@
-//! Bounded local bytecode reconstruction using the project's pinned Tovek.
-//! Recovered source is returned as text; this adapter never executes it.
+//! Uses the pinned Tovek backend to turn bytecode into source text.
+//! The output is just text; running it is up to the caller.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -64,6 +64,16 @@ pub fn decompile(value: &Value) -> Result<Value, String> {
         .decode(encoded)
         .map_err(|_| "invalid bytecode Base64")?;
     if bytecode.len() > MAX_BYTECODE || !supported_header(&bytecode) {
+        return Err("unsupported or oversized Luau bytecode".into());
+    }
+    let source = decompile_bytecode(&bytecode)?;
+    Ok(json!({"Source":source}))
+}
+
+/// Decompile a bounded bytecode payload locally. This returns reconstructed
+/// source text only; callers must not execute the result implicitly.
+pub fn decompile_bytecode(bytecode: &[u8]) -> Result<String, String> {
+    if bytecode.len() > MAX_BYTECODE || !supported_header(bytecode) {
         return Err("unsupported or oversized Luau bytecode".into());
     }
     // Installed workers live under runtime/build; find their project first so
@@ -145,9 +155,9 @@ pub fn decompile(value: &Value) -> Result<Value, String> {
     if source.len() as u64 > MAX_SOURCE || source.trim().is_empty() || source.contains('\0') {
         return Err("decompiler returned invalid or oversized source".into());
     }
-    Ok(
-        json!({"Source":format!("-- Reconstructed locally by Tovek V2.7; original source may differ.\n{source}")}),
-    )
+    Ok(format!(
+        "-- Reconstructed locally by Tovek V2.7; original source may differ.\n{source}"
+    ))
 }
 
 #[cfg(test)]

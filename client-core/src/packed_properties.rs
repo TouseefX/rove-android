@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 use std::{borrow::Cow, fmt, io};
 use std::{
     cell::RefCell,
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::{Arc, Weak},
 };
@@ -24,9 +24,130 @@ thread_local! {
     // Weak, bounded deduplication of immutable large values. Removing a world
     // releases its payloads; this cache cannot retain an old world's data.
     static LARGE_VALUES: RefCell<HashMap<u64,Vec<Weak<PackedValue>>>> = RefCell::new(HashMap::new());
+    // Hot reads often select several fields from the same immutable packed
+    // property block. Keep only content-validated decompressions, with no
+    // references back to the world or its property owners.
+    static DECODED_PATH_CACHE: RefCell<DecodedPathCache> = RefCell::new(DecodedPathCache::default());
+}
+
+const DECODED_PATH_CACHE_BYTES: usize = 256 * 1024;
+const DECODED_PATH_CACHE_ENTRIES: usize = 128;
+const DECODED_PATH_CACHE_MAX_BLOCK: usize = 64 * 1024;
+
+struct DecodedPathBlock {
+    hash: u64,
+    expanded: usize,
+    compressed: Vec<u8>,
+    decoded: Arc<[u8]>,
+}
+
+fn decoded_path_block_cost(compressed_len: usize, decoded_len: usize) -> usize {
+    compressed_len
+        .saturating_add(decoded_len)
+        .saturating_add(std::mem::size_of::<DecodedPathBlock>() + 32)
+}
+
+#[derive(Default)]
+struct DecodedPathCache {
+    blocks: VecDeque<DecodedPathBlock>,
+    bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl DecodedPathCache {
+    fn clear(&mut self) {
+        self.blocks.clear();
+        self.bytes = 0;
+        #[cfg(test)]
+        {
+            self.hits = 0;
+            self.misses = 0;
+        }
+    }
+
+    fn get_or_decode(&mut self, compressed: Cow<'_, [u8]>, expanded: usize) -> Arc<[u8]> {
+        let mut hasher = DefaultHasher::new();
+        compressed.hash(&mut hasher);
+        let hash = hasher.finish();
+        if let Some(index) = self.blocks.iter().position(|block| {
+            block.hash == hash
+                && block.expanded == expanded
+                && block.compressed.as_slice() == compressed.as_ref()
+        }) {
+            let block = self.blocks.remove(index).expect("cache index exists");
+            let decoded = Arc::clone(&block.decoded);
+            self.blocks.push_back(block);
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            return decoded;
+        }
+
+        #[cfg(test)]
+        {
+            self.misses += 1;
+        }
+
+        let decoded: Arc<[u8]> = decompress_bytes(compressed.as_ref(), expanded).into();
+        // Count the cache entry and Arc allocation headers too, not just the
+        // two byte buffers, so retained cache memory stays within the budget.
+        let cost = decoded_path_block_cost(compressed.len(), decoded.len());
+        if expanded <= DECODED_PATH_CACHE_MAX_BLOCK
+            && compressed.len() <= DECODED_PATH_CACHE_MAX_BLOCK
+            && cost <= DECODED_PATH_CACHE_BYTES
+        {
+            while self.blocks.len() >= DECODED_PATH_CACHE_ENTRIES
+                || self.bytes.saturating_add(cost) > DECODED_PATH_CACHE_BYTES
+            {
+                let Some(old) = self.blocks.pop_front() else {
+                    break;
+                };
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(decoded_path_block_cost(
+                        old.compressed.len(),
+                        old.decoded.len(),
+                    ));
+            }
+            self.bytes = self.bytes.saturating_add(cost);
+            self.blocks.push_back(DecodedPathBlock {
+                hash,
+                expanded,
+                compressed: compressed.into_owned(),
+                decoded: Arc::clone(&decoded),
+            });
+        }
+        decoded
+    }
+}
+
+#[cfg(test)]
+fn decoded_path_cache_state() -> (usize, usize, usize) {
+    DECODED_PATH_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        (cache.bytes, cache.blocks.len(), cache.hits)
+    })
+}
+
+#[cfg(test)]
+fn clear_decoded_path_cache() {
+    DECODED_PATH_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 pub(crate) type SharedPayloadResolver<'a> = dyn Fn(&[u8]) -> Option<Arc<SharedPayload>> + 'a;
+
+/// One received create can be packed before the rest of its packet is decoded.
+/// The journal retains this immutable backing until an eager reader asks for JSON.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactCreatedProperties {
+    pub(crate) action_index: usize,
+    pub(crate) properties: Arc<PackedProperties>,
+    pub(crate) eager_bytes: usize,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CompactSharedProperty {
@@ -43,101 +164,61 @@ pub(crate) struct SharedPropertyValue {
     pub(crate) force_bytes: bool,
 }
 
+// Mutually exclusive backing kinds share one tag instead of independent
+// optional pointers and flags in every node's property block.
+#[derive(Clone, Debug)]
+enum ValueStorage {
+    Raw(StoredBytes),
+    Compressed(StoredBytes),
+    SharedText(Arc<SharedPayload>),
+    SharedHex(Arc<SharedPayload>),
+}
+
 #[derive(Clone, Debug)]
 struct PackedValue {
-    bytes: Option<StoredBytes>,
+    storage: ValueStorage,
     expanded: usize,
-    compressed: bool,
-    shared_payload: Option<Arc<SharedPayload>>,
-    shared_hex: bool,
 }
 
 impl PackedValue {
     fn new(raw: Vec<u8>) -> Self {
         let expanded = raw.len();
-        let packed = if expanded >= 64 {
-            compress_bytes(&raw)
+        let packed = if expanded >= 64 { compress_bytes(&raw) } else { None };
+        let storage = if let Some(bytes) = packed.filter(|v| v.len() + 16 < expanded) {
+            ValueStorage::Compressed(StoredBytes::new(bytes))
         } else {
-            None
+            ValueStorage::Raw(StoredBytes::new(raw))
         };
-        if let Some(bytes) = packed.filter(|v| v.len() + 16 < expanded) {
-            return Self {
-                bytes: Some(StoredBytes::new(bytes)),
-                expanded,
-                compressed: true,
-                shared_payload: None,
-                shared_hex: false,
-            };
-        }
-        Self {
-            bytes: Some(StoredBytes::new(raw)),
-            expanded,
-            compressed: false,
-            shared_payload: None,
-            shared_hex: false,
-        }
+        Self { storage, expanded }
     }
-
     fn from_shared_hex(payload: Arc<SharedPayload>) -> Self {
-        Self {
-            expanded: 17usize.saturating_add(payload.len().saturating_mul(2)),
-            bytes: None,
-            compressed: false,
-            shared_payload: Some(payload),
-            shared_hex: true,
-        }
+        Self { expanded: 17usize.saturating_add(payload.len().saturating_mul(2)), storage: ValueStorage::SharedHex(payload) }
     }
-
     fn from_shared_payload(payload: Arc<SharedPayload>, is_text: bool, expanded: usize) -> Self {
-        if is_text {
-            Self::from_shared_text(payload, expanded)
-        } else {
-            Self {
-                expanded,
-                ..Self::from_shared_hex(payload)
-            }
-        }
+        Self { expanded, storage: if is_text { ValueStorage::SharedText(payload) } else { ValueStorage::SharedHex(payload) } }
     }
-
     fn from_shared_text(payload: Arc<SharedPayload>, expanded: usize) -> Self {
-        Self {
-            bytes: None,
-            expanded,
-            compressed: false,
-            shared_payload: Some(payload),
-            shared_hex: false,
-        }
+        Self { expanded, storage: ValueStorage::SharedText(payload) }
     }
-
+    fn bytes(&self) -> Option<&StoredBytes> {
+        match &self.storage { ValueStorage::Raw(v) | ValueStorage::Compressed(v) => Some(v), _ => None }
+    }
+    fn shared_payload(&self) -> Option<&Arc<SharedPayload>> {
+        match &self.storage { ValueStorage::SharedText(v) | ValueStorage::SharedHex(v) => Some(v), _ => None }
+    }
     fn raw(&self) -> std::borrow::Cow<'_, [u8]> {
-        // A shared binary payload is not a JSON byte buffer. If a caller asks
-        // for the encoded property representation, materialize the tagged JSON
-        // form rather than parsing the raw payload as JSON.
-        if self.shared_payload.is_some() {
-            return serde_json::to_vec(&self.value())
-                .expect("shared binary property JSON serializes")
-                .into();
-        }
-        let bytes = self.bytes.as_ref().expect("encoded packed value bytes").read();
-        if self.compressed {
-            decompress_bytes(
-                &bytes,
-                self.expanded,
-            )
-            .into()
-        } else {
-            bytes
+        match &self.storage {
+            ValueStorage::Raw(bytes) => bytes.read(),
+            ValueStorage::Compressed(bytes) => decompress_bytes(&bytes.read(), self.expanded).into(),
+            ValueStorage::SharedText(_) | ValueStorage::SharedHex(_) => serde_json::to_vec(&self.value())
+                .expect("shared binary property JSON serializes").into(),
         }
     }
     fn value(&self) -> Value {
-        if let Some(payload) = &self.shared_payload {
+        if let Some(payload) = self.shared_payload() {
             let raw = payload.raw();
-            if !self.shared_hex {
-                return Value::String(
-                    std::str::from_utf8(&raw)
-                        .expect("shared text payload was matched to valid UTF-8")
-                        .to_owned(),
-                );
+            if matches!(self.storage, ValueStorage::SharedText(_)) {
+                return Value::String(std::str::from_utf8(&raw).expect("shared text payload was matched to valid UTF-8").to_owned());
             }
             let mut hex = String::with_capacity(raw.len().saturating_mul(2));
             const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -145,7 +226,7 @@ impl PackedValue {
                 hex.push(HEX[(byte >> 4) as usize] as char);
                 hex.push(HEX[(byte & 0x0f) as usize] as char);
             }
-            return serde_json::json!({"$bytes_hex": hex});
+            return serde_json::json!({"$bytes_hex":hex});
         }
         serde_json::from_slice(&self.raw()).expect("internally encoded property value")
     }
@@ -164,7 +245,7 @@ impl PackedValue {
             if let Some(bucket) = cache.get_mut(&hash) {
                 bucket.retain(|w| w.strong_count() > 0);
                 for item in bucket.iter().filter_map(Weak::upgrade) {
-                    if item.shared_payload.is_none() && item.raw().as_ref() == raw {
+                    if item.shared_payload().is_none() && item.raw().as_ref() == raw {
                         return item;
                     }
                 }
@@ -178,6 +259,32 @@ impl PackedValue {
             }
             result
         })
+    }
+}
+
+fn select_packed_path(value: &PackedValue, path: &[&str]) -> Option<Value> {
+    if let ValueStorage::Compressed(bytes) = &value.storage {
+        let decoded = DECODED_PATH_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .get_or_decode(bytes.read(), value.expanded)
+        });
+        select_path(&decoded, path)
+    } else {
+        select_path(&value.raw(), path)
+    }
+}
+
+fn packed_value(value: &PackedValue) -> Value {
+    if let ValueStorage::Compressed(bytes) = &value.storage {
+        let decoded = DECODED_PATH_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .get_or_decode(bytes.read(), value.expanded)
+        });
+        serde_json::from_slice(&decoded).expect("internally encoded property value")
+    } else {
+        value.value()
     }
 }
 
@@ -553,8 +660,8 @@ impl PackedProperties {
             .and_then(|v| v.iter().find(|(name, _)| name == key))
         {
             return if path.len() == 1 {
-                Some(value.1.value())
-            } else if value.1.shared_payload.is_some() {
+                Some(packed_value(&value.1))
+            } else if value.1.shared_payload().is_some() {
                 let materialized = value.1.value();
                 let mut selected = &materialized;
                 for segment in &path[1..] {
@@ -562,16 +669,16 @@ impl PackedProperties {
                 }
                 Some(selected.clone())
             } else {
-                select_path(&value.1.raw(), &path[1..])
+                select_packed_path(&value.1, &path[1..])
             };
         }
-        select_path(&self.small.raw(), path)
+        select_packed_path(&self.small, path)
     }
 
     pub fn for_each_shared_payload(&self, mut visit: impl FnMut(&Arc<SharedPayload>)) {
         if let Some(values) = &self.large {
             for (_, value) in values.iter() {
-                if let Some(payload) = &value.shared_payload {
+                if let Some(payload) = value.shared_payload() {
                     visit(payload);
                 }
             }
@@ -732,13 +839,13 @@ impl PackedProperties {
     pub fn stored_bytes(&self) -> usize {
         // Shared large values are conservatively counted for each reference.
         std::mem::size_of::<Self>()
-            + self.small.bytes.as_ref().map_or(0, |bytes| bytes.len())
+            + self.small.bytes().map_or(0, |bytes| bytes.len())
             + self.large.as_ref().map_or(0, |v| {
                 v.iter()
                     .map(|(k, b)| {
                         k.len()
-                            + b.shared_payload.as_ref().map_or_else(
-                                || b.bytes.as_ref().map_or(0, |bytes| bytes.len()),
+                            + b.shared_payload().map_or_else(
+                                || b.bytes().map_or(0, |bytes| bytes.len()),
                                 |p| p.stored_bytes(),
                             )
                             + std::mem::size_of::<PackedValue>()
@@ -760,6 +867,138 @@ impl PackedProperties {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn nested_property_map(tag: usize) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("tag".into(), json!(tag));
+        for index in 0..32 {
+            map.insert(
+                format!("field_{index}"),
+                json!({"$enum":{"type":"Material","name":"Plastic","value":256}}),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn repeated_nested_reads_reuse_exact_compressed_block() {
+        clear_decoded_path_cache();
+        let packed = PackedProperties::new(&nested_property_map(7)).unwrap();
+        assert!(matches!(&packed.small.storage, ValueStorage::Compressed(_)));
+
+        for key in ["field_1", "field_2", "field_3", "field_1"] {
+            assert_eq!(
+                packed.get_path(&[key, "$enum", "name"]),
+                Some(json!("Plastic"))
+            );
+        }
+        DECODED_PATH_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.misses, 1);
+            assert_eq!(cache.hits, 3);
+        });
+    }
+
+    #[test]
+    fn changed_property_content_cannot_hit_stale_decoded_data() {
+        clear_decoded_path_cache();
+        let old = PackedProperties::new(&nested_property_map(7)).unwrap();
+        let mut replacement = nested_property_map(8);
+        replacement.insert(
+            "field_1".into(),
+            json!({"$enum":{"type":"Material","name":"Wood","value":512}}),
+        );
+        let replacement = PackedProperties::new(&replacement).unwrap();
+
+        assert_eq!(old.get_path(&["field_1", "$enum", "name"]), Some(json!("Plastic")));
+        assert_eq!(
+            replacement.get_path(&["field_1", "$enum", "name"]),
+            Some(json!("Wood"))
+        );
+        assert_eq!(old.get_path(&["field_2", "$enum", "name"]), Some(json!("Plastic")));
+        DECODED_PATH_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.misses, 2);
+            assert_eq!(cache.hits, 1);
+        });
+    }
+
+    #[test]
+    fn decoded_path_cache_does_not_retain_property_owners() {
+        clear_decoded_path_cache();
+        let packed = Arc::new(PackedProperties::new(&nested_property_map(7)).unwrap());
+        let owner = Arc::downgrade(&packed);
+        assert_eq!(
+            packed.get_path(&["field_1", "$enum", "name"]),
+            Some(json!("Plastic"))
+        );
+        drop(packed);
+        assert!(owner.upgrade().is_none());
+        assert!(decoded_path_cache_state().1 > 0);
+    }
+
+    #[test]
+    fn decoded_path_cache_obeys_byte_and_entry_limits() {
+        clear_decoded_path_cache();
+        for tag in 0..512 {
+            let packed = PackedProperties::new(&nested_property_map(tag)).unwrap();
+            assert_eq!(
+                packed.get_path(&["field_1", "$enum", "value"]),
+                Some(json!(256))
+            );
+        }
+        let (bytes, entries, _) = decoded_path_cache_state();
+        assert!(bytes <= DECODED_PATH_CACHE_BYTES);
+        assert!(entries <= DECODED_PATH_CACHE_ENTRIES);
+    }
+
+    #[test]
+    #[ignore = "manual microbenchmark for representative repeated graph property reads"]
+    fn bench_repeated_graph_property_reads_cached_vs_decompress_each_time() {
+        use std::time::Instant;
+
+        clear_decoded_path_cache();
+        let graph = (0..512)
+            .map(|tag| PackedProperties::new(&nested_property_map(tag)).unwrap())
+            .collect::<Vec<_>>();
+        let reads = [
+            ("field_1", "$enum", "name"),
+            ("field_2", "$enum", "value"),
+            ("field_3", "$enum", "type"),
+            ("field_4", "$enum", "name"),
+        ];
+        assert_eq!(
+            graph[0].get_path(&["field_1", "$enum", "name"]),
+            Some(json!("Plastic"))
+        );
+        let start = Instant::now();
+        for _ in 0..100 {
+            for properties in &graph {
+                for (key, nested, field) in reads.iter().copied() {
+                    std::hint::black_box(properties.get_path(&[key, nested, field]));
+                }
+            }
+        }
+        let cached = start.elapsed();
+
+        clear_decoded_path_cache();
+        let start = Instant::now();
+        for _ in 0..100 {
+            for properties in &graph {
+                for (key, nested, field) in reads.iter().copied() {
+                    std::hint::black_box(select_path(
+                        &properties.small.raw(),
+                        &[key, nested, field],
+                    ));
+                }
+            }
+        }
+        let uncached = start.elapsed();
+        eprintln!(
+            "512-node graph property reads: cached={cached:?}, decompressed each read={uncached:?}"
+        );
+    }
+
     #[test]
     fn round_trip_and_copy_on_write_preserve_received_values() {
         let source = json!({"bytes":{"$bytes_hex":"00ff".repeat(4096)},"null":null,
@@ -767,8 +1006,8 @@ mod tests {
         let first = PackedProperties::new(source.as_object().unwrap()).unwrap();
         assert!(first.stored_bytes() < first.expanded_bytes() / 2);
         let shared = first.clone();
-        assert!(shared.small.bytes.as_ref().unwrap().shares_backing(
-            first.small.bytes.as_ref().unwrap()
+        assert!(shared.small.bytes().unwrap().shares_backing(
+            first.small.bytes().unwrap()
         ));
         assert_eq!(Value::Object(first.unpack()), source);
         let mut changed = shared.unpack();
@@ -817,7 +1056,7 @@ mod tests {
         let packed = properties.large.as_ref().unwrap();
         let text_value = packed.iter().find(|(key, _)| key == "Text").unwrap();
         assert!(Arc::ptr_eq(
-            text_value.1.shared_payload.as_ref().unwrap(),
+            text_value.1.shared_payload().unwrap(),
             &original
         ));
         assert_eq!(
@@ -845,7 +1084,7 @@ mod tests {
             .find(|(key, _)| key == "Blob")
             .unwrap();
         assert!(Arc::ptr_eq(
-            blob.1.shared_payload.as_ref().unwrap(),
+            blob.1.shared_payload().unwrap(),
             &binary
         ));
         assert_eq!(
@@ -937,8 +1176,7 @@ mod tests {
                 .find(|(key, _)| key == "known_large")
                 .unwrap()
                 .1
-                .shared_payload
-                .as_ref()
+                .shared_payload()
                 .unwrap(),
             &known_large
         ));
@@ -948,8 +1186,7 @@ mod tests {
                 .find(|(key, _)| key == "forced_large")
                 .unwrap()
                 .1
-                .shared_payload
-                .as_ref()
+                .shared_payload()
                 .unwrap(),
             &forced_large
         ));
@@ -959,8 +1196,7 @@ mod tests {
                 .find(|(key, _)| key == "duplicate")
                 .unwrap()
                 .1
-                .shared_payload
-                .as_ref()
+                .shared_payload()
                 .unwrap(),
             &last_duplicate
         ));
@@ -1044,7 +1280,7 @@ mod tests {
         ] {
             let value = shared.iter().find(|(name, _)| name == key).unwrap();
             assert!(Arc::ptr_eq(
-                value.1.shared_payload.as_ref().unwrap(),
+                value.1.shared_payload().unwrap(),
                 expected
             ));
         }
@@ -1071,8 +1307,7 @@ mod tests {
             values.iter().any(|(key, value)| {
                 key == "value"
                     && value
-                        .shared_payload
-                        .as_ref()
+                        .shared_payload()
                         .is_some_and(|payload| Arc::ptr_eq(payload, &large))
             })
         }));
@@ -1141,7 +1376,7 @@ mod tests {
             compressed_source.insert(format!("unused_{index:03}"), json!({"text":"repeat"}));
         }
         let mut compressed = PackedProperties::new(&compressed_source).unwrap();
-        assert!(compressed.small.compressed);
+        assert!(matches!(compressed.small.storage, ValueStorage::Compressed(_)));
         assert_eq!(compressed.get("focus"), Some(json!(123)));
         let old = compressed.clone();
         compressed.set("focus", json!(456)).unwrap();

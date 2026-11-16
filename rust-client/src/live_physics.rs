@@ -11,11 +11,17 @@ use crate::{
 };
 use rove_client_core::{
     physics::{Aabb, BodyState, PhysicsError, PhysicsStepper},
+    session::SessionRecord,
     world::WorldView,
 };
 
 const MAX_DELTA_SECONDS: f64 = 0.25;
-const MAX_WALK_SPEED: f64 = 10_000.0;
+pub(crate) const MAX_WALK_SPEED: f64 = 10_000.0;
+pub(crate) const MAX_LOCAL_GRAVITY: f64 = 1_000_000.0;
+#[path = "prediction_gravity.rs"]
+mod prediction_gravity;
+#[path = "prediction_move_target.rs"]
+mod prediction_move_target;
 const DEFAULT_WORLD_BOUNDS: [f32; 6] = [-1.0e6, -1.0e6, -1.0e6, 1.0e6, 1.0e6, 1.0e6];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +119,7 @@ pub struct ReceivedPhysicsSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MovementIntent {
-    /// World-space requested direction; Y is ignored and X/Z are normalized.
+    /// World-space input; Y is ignored and X/Z strength is capped at one.
     pub direction: [f64; 3],
 }
 
@@ -122,6 +128,7 @@ pub struct PredictionFrame {
     pub binding: OwnBinding,
     pub based_on_received_revision: u64,
     pub position: [f64; 3],
+    pub rotation: [f64; 9],
     pub velocity: [f64; 3],
     pub grounded: bool,
     pub fixed_steps: usize,
@@ -320,6 +327,10 @@ pub struct LivePhysicsSimulator {
     received_revision: u64,
     received_at_monotonic: f64,
     state: BodyState,
+    rotation: [f64; 9],
+    free_motion: bool,
+    state_enabled: u32,
+    velocity_pending: bool,
     gravity: f64,
     walk_speed: f64,
     surfaces: Vec<Aabb>,
@@ -346,6 +357,10 @@ impl LivePhysicsSimulator {
             received_revision: snapshot.revision,
             received_at_monotonic: snapshot.received_at_monotonic,
             state: snapshot.body,
+            rotation: crate::physics_sender::IDENTITY,
+            free_motion: false,
+            state_enabled: u32::MAX,
+            velocity_pending: false,
             gravity: snapshot.gravity,
             walk_speed: snapshot.walk_speed,
             surfaces: snapshot.surfaces,
@@ -386,6 +401,7 @@ impl LivePhysicsSimulator {
         self.received_revision = snapshot.revision;
         self.received_at_monotonic = snapshot.received_at_monotonic;
         self.state = snapshot.body;
+        self.velocity_pending=false;
         self.gravity = snapshot.gravity;
         self.walk_speed = snapshot.walk_speed;
         self.surfaces = snapshot.surfaces;
@@ -445,20 +461,18 @@ impl LivePhysicsSimulator {
                 self.stepper.gravity == self.gravity,
             );
         }
-        let magnitude = intent.direction[0].hypot(intent.direction[2]);
+        let horizontal = crate::movement_math::horizontal_input(intent.direction);
         let mut next_state = self.state;
-        if magnitude > 0.0 {
-            next_state.velocity[0] = intent.direction[0] / magnitude * self.walk_speed;
-            next_state.velocity[2] = intent.direction[2] / magnitude * self.walk_speed;
-        } else {
-            next_state.velocity[0] = 0.0;
-            next_state.velocity[2] = 0.0;
+        if !self.free_motion && !self.velocity_pending {
+            next_state.velocity[0] = horizontal[0] * self.walk_speed;
+            next_state.velocity[2] = horizontal[2] * self.walk_speed;
         }
         let report = self
             .stepper
             .step(&mut next_state, capped_delta, &self.surfaces)
             .map_err(map_physics_error)?;
         self.state = next_state;
+        if report.fixed_steps > 0 { self.velocity_pending=false; }
         self.job_statistics
             .completed(now_monotonic, self.integrity.as_ref());
         self.last_call_at = Some(now_monotonic);
@@ -486,11 +500,29 @@ impl LivePhysicsSimulator {
         Ok(true)
     }
 
+    /// Move only the detached, already-authorized local root. A later received
+    /// correction still wins. Preserve velocity, as a pivot is a transform edit.
+    fn apply_pivot(&mut self, position: [f64; 3], rotation: [f64; 9], now: f64) -> Result<(), LivePhysicsError> {
+        if self.invalidated { return Err(LivePhysicsError::Invalidated); }
+        if position.iter().any(|v|!v.is_finite() || v.abs()>=1e9)
+            || !crate::physics_sender::validate_rotation(rotation)
+            || !now.is_finite() || now<0.
+            || self.last_call_at.is_some_and(|last|now<last)
+        { return Err(LivePhysicsError::InvalidIntent); }
+        self.state.center=position;
+        self.state.grounded=false;
+        self.rotation=rotation;
+        self.stepper=PhysicsStepper::new(self.gravity,512.,1./240.,64).map_err(map_physics_error)?;
+        self.last_frame_at=Some(now);
+        Ok(())
+    }
+
     fn current_frame(&self) -> PredictionFrame {
         PredictionFrame {
             binding: self.binding,
             based_on_received_revision: self.received_revision,
             position: self.state.center,
+            rotation: self.rotation,
             velocity: self.state.velocity,
             grounded: self.state.grounded,
             fixed_steps: 0,
@@ -563,6 +595,7 @@ pub fn received_snapshot(
         now_monotonic,
         None,
         None,
+        None,
     )
 }
 
@@ -575,6 +608,7 @@ fn received_snapshot_cached(
     streaming_region_confirmed: bool,
     now_monotonic: f64,
     humanoid_hint: Option<&str>,
+    character_children: Option<&[String]>,
     cached_surfaces: Option<&[Aabb]>,
 ) -> Option<ReceivedPhysicsSnapshot> {
     if view.class_name(player_id) != Some("Player")
@@ -638,15 +672,19 @@ fn received_snapshot_cached(
             .and_then(|v| v.as_u64().or_else(|| v["$enum"]["value"].as_u64()));
         let mut leg_height = None;
         if rig == Some(0) {
-            view.for_each_node(|node| {
-                if view.parent(node.id()) == Some(character.as_str())
-                    && received::name_is(view, node.id(), "Left Leg")
+            let mut visit = |id: &str| {
+                if view.parent(id) == Some(character.as_str())
+                    && received::name_is(view, id, "Left Leg")
                 {
-                    leg_height =
-                        received_vector(node.property("Size").or_else(|| node.property("size")))
-                            .map(|v| v[1]);
+                    leg_height = received_vector(view.get_property(id, "Size")
+                        .or_else(|| view.get_property(id, "size"))).map(|v| v[1]);
                 }
-            });
+            };
+            if let Some(children) = character_children {
+                for id in children { visit(id); }
+            } else {
+                view.for_each_node(|node| visit(node.id()));
+            }
         }
         if rig == Some(1) || leg_height.is_some() {
             half_size[1] += hip + leg_height.unwrap_or(0.);
@@ -655,14 +693,7 @@ fn received_snapshot_cached(
     let velocity = received_vector(view.get_property(&root, "AssemblyLinearVelocity"))
         .or_else(|| received_vector(frame.get("decoded_velocities")?.get(0).cloned()))
         .unwrap_or([0.0; 3]);
-    let mut workspace = view.parent(&root);
-    for _ in 0..64 {
-        if workspace.is_some_and(|id| view.class_name(id) == Some("Workspace")) {
-            break;
-        }
-        workspace = workspace.and_then(|id| view.parent(id));
-    }
-    let workspace = workspace.filter(|id| view.class_name(id) == Some("Workspace"))?;
+    let workspace = received_workspace_id(view, &root)?;
     let gravity =
         received::property(view, workspace, "Gravity").and_then(|value| value.as_f64())?;
     let walk_speed =
@@ -799,6 +830,16 @@ fn received_surfaces(view: &WorldView, parents: &HashMap<String, String>) -> Vec
     surfaces
 }
 
+fn received_workspace_id<'a>(view: &'a WorldView, root: &str) -> Option<&'a str> {
+    let mut current = view.parent(root);
+    for _ in 0..64 {
+        let id = current?;
+        if view.class_name(id) == Some("Workspace") { return Some(id); }
+        current = view.parent(id);
+    }
+    None
+}
+
 pub fn received_humanoid_id(view: &WorldView, player_id: &str) -> Option<String> {
     let character = received_reference(view.get_property(player_id, "Character"))?;
     let mut result = None;
@@ -810,7 +851,7 @@ pub fn received_humanoid_id(view: &WorldView, player_id: &str) -> Option<String>
     result
 }
 
-fn camera_relative_direction(
+pub(crate) fn camera_relative_direction(
     direction: [f64; 3],
     camera: Option<&serde_json::Value>,
 ) -> Option<[f64; 3]> {
@@ -843,11 +884,21 @@ fn camera_relative_direction(
     if (determinant - 1.0).abs() > 0.001 {
         return None;
     }
-    Some([
-        matrix[0] * direction[0] + matrix[2] * direction[2],
-        0.0,
-        matrix[6] * direction[0] + matrix[8] * direction[2],
-    ])
+    // Use the camera's horizontal heading, not a foreshortened projection:
+    // pitch must not turn a full stick input into a partial one. At a vertical
+    // look direction, its right axis supplies a stable horizontal heading.
+    let (mut cosine, mut sine) = (matrix[8], matrix[2]);
+    let mut length = cosine.hypot(sine);
+    if length < 1e-8 {
+        (cosine, sine) = (matrix[0], -matrix[6]);
+        length = cosine.hypot(sine);
+    }
+    if length < 1e-8 { return None; }
+    cosine /= length;
+    sine /= length;
+    let input = crate::movement_math::horizontal_input(direction);
+    Some([cosine * input[0] + sine * input[2], 0.0,
+        cosine * input[2] - sine * input[0]])
 }
 
 fn jump_speed(settings: &serde_json::Value, gravity: f64) -> Option<f64> {
@@ -888,11 +939,50 @@ fn jump_speed(settings: &serde_json::Value, gravity: f64) -> Option<f64> {
     speed.is_finite().then_some(speed)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MoveToState {
     target: [f64; 3],
+    part: Option<String>,
+    local: Option<prediction_move_target::TargetPose>,
     started_at: f64,
     sequence: u64,
+}
+
+impl MoveToState {
+    fn resolve(&self, view: &WorldView, parents: &HashMap<String, String>, workspace: &str) -> Option<[f64; 3]> {
+        let Some(part) = self.part.as_deref() else { return Some(self.target); };
+        if let Some(local) = self.local.as_ref().filter(|pose| !pose.received) {
+            return (view.class_name(part).is_none() && local.workspace.as_deref()==Some(workspace))
+                .then(|| local.resolve(self.target)).flatten();
+        }
+        let mut class = view.class_name(part)?;
+        for _ in 0..64 {
+            if class == "BasePart" { break; }
+            class = parents.get(class)?;
+        }
+        if class != "BasePart" || received_workspace_id(view, part) != Some(workspace) {
+            return None;
+        }
+        if let Some(local) = self.local.as_ref().filter(|pose| !pose.stale(view,part)) {
+            return (local.workspace.as_deref()==Some(workspace))
+                .then(|| local.resolve(self.target)).flatten();
+        }
+        let frame = received::frame(view, part)?;
+        let position = received_vector(frame.get("position").cloned())?;
+        let rotation = if frame["rotation_id"].as_u64() == Some(2)
+            || frame["rotation"].as_u64() == Some(1) {
+            crate::physics_sender::IDENTITY
+        } else {
+            let values = frame["rotation"].as_array().filter(|r| r.len() == 9)?;
+            let mut rotation = [0.; 9];
+            for (to, from) in rotation.iter_mut().zip(values) { *to = from.as_f64()?; }
+            if !crate::physics_sender::validate_rotation(rotation) { return None; }
+            rotation
+        };
+        let goal = std::array::from_fn(|i| position[i]
+            + (0..3).map(|j| rotation[i * 3 + j] * self.target[j]).sum::<f64>());
+        goal.iter().all(|v| v.is_finite() && v.abs() < 1e9).then_some(goal)
+    }
 }
 
 #[derive(Debug)]
@@ -902,15 +992,28 @@ pub struct LocalPrediction {
     cursor: u64,
     frame: Option<PredictionFrame>,
     rejected_intents: u64,
+    accepted_pivots: u64,
     camera_relative_intents: u64,
-    pending_jump: Option<serde_json::Value>,
+    received_state_dirty: bool,
+    accepted_velocities: u64,
+    accepted_state_changes: u64,
+    accepted_walk_speed_writes: u64,
+    walk_speed_override: Option<f64>,
+    last_received_walk_speed: Option<(f64, u64)>,
+    gravity_setting: prediction_gravity::GravitySetting,
     accepted_jumps: u64,
     rejected_jumps: u64,
     move_to: Option<MoveToState>,
     completed_move_to: u64,
     expired_move_to: u64,
+    move_to_result: Option<(u64, bool)>,
     humanoid: Option<String>,
-    last_received_pose: Option<([f64; 3], [f64; 3])>,
+    last_received_pose: Option<([f64; 3], Option<[f64; 9]>, u64)>,
+    last_received_velocity: Option<([f64; 3], u64)>,
+    received_velocity_revision: u64,
+    received_pose_revision: u64,
+    observed_world_revision: u64,
+    character_children: crate::character_children::CharacterChildren,
     geometry: Vec<Aabb>,
     geometry_sequence: u64,
     geometry_at: Option<f64>,
@@ -931,15 +1034,28 @@ impl Default for LocalPrediction {
             cursor: 0,
             frame: None,
             rejected_intents: 0,
+            accepted_pivots: 0,
             camera_relative_intents: 0,
-            pending_jump: None,
+            received_state_dirty: true,
+            accepted_velocities: 0,
+            accepted_state_changes: 0,
+            accepted_walk_speed_writes: 0,
+            walk_speed_override: None,
+            last_received_walk_speed: None,
+            gravity_setting: prediction_gravity::GravitySetting::default(),
             accepted_jumps: 0,
             rejected_jumps: 0,
             move_to: None,
             completed_move_to: 0,
             expired_move_to: 0,
+            move_to_result: None,
             humanoid: None,
             last_received_pose: None,
+            last_received_velocity: None,
+            received_velocity_revision: 0,
+            received_pose_revision: 0,
+            observed_world_revision: 0,
+            character_children: crate::character_children::CharacterChildren::default(),
             geometry: Vec::new(),
             geometry_sequence: 0,
             geometry_at: None,
@@ -953,6 +1069,48 @@ impl Default for LocalPrediction {
 }
 
 impl LocalPrediction {
+    /// A repeated server pose is still a correction. Watch committed receipts
+    /// for this root without expanding shared payloads or treating unrelated
+    /// world updates as corrections to our local prediction.
+    pub fn observe_replication(&mut self, record: &SessionRecord) {
+        self.character_children.observe(record.world_sequence, record.world_delta.lifecycle_actions());
+        let Some(simulator) = self.simulator.as_ref() else {
+            return;
+        };
+        let root = simulator.binding().root_part_id;
+        let root_key = format!("{}:{}", root >> 32, root as u32);
+        let Some(actions) = record.world_delta.lifecycle_actions() else {
+            return;
+        };
+        let fresh = |action: &serde_json::Value| action["sequence"].as_u64()
+            .unwrap_or(record.world_sequence)>self.observed_world_revision;
+        if actions.iter().any(|action| fresh(action) && action["id"].as_str()==self.humanoid.as_deref()
+            && action["fields"].get("HumanoidStateType").is_some()) {
+            self.received_state_dirty=true;
+        }
+        let changed = actions.iter().any(|action| {
+            if !fresh(action) || action["id"].as_str() != Some(root_key.as_str()) {
+                return false;
+            }
+            match action["kind"].as_str() {
+                Some("create" | "remove") => true,
+                Some("set") => {
+                    action["fields"].get("CFrame").is_some()
+                        || action["fields"].get("ReplicationPV").is_some()
+                }
+                _ => false,
+            }
+        });
+        if actions.iter().any(|action| fresh(action) && action["id"].as_str()==Some(root_key.as_str())
+            && action["fields"].get("AssemblyLinearVelocity").is_some()) {
+            self.received_velocity_revision=self.received_velocity_revision.max(record.world_sequence);
+        }
+        self.observed_world_revision=self.observed_world_revision.max(record.world_sequence);
+        if changed {
+            self.received_pose_revision = self.received_pose_revision.max(record.world_sequence);
+        }
+    }
+
     pub fn advance(
         &mut self,
         view: &WorldView,
@@ -964,9 +1122,17 @@ impl LocalPrediction {
         intents: &[serde_json::Value],
         now_monotonic: f64,
     ) -> Result<Option<PredictionFrame>, LivePhysicsError> {
-        if intents.len() > 256 {
+        if intents.len() > crate::movement_queue::BATCH_LIMIT {
             return Err(LivePhysicsError::InvalidIntent);
         }
+        // Consume ordering even before a character exists; only global settings
+        // survive that interval, never delayed motion for an unowned character.
+        let mut cursor = self.cursor;
+        for intent in intents {
+            cursor = intent["sequence"].as_u64().filter(|sequence| *sequence > cursor)
+                .ok_or(LivePhysicsError::InvalidIntent)?;
+        }
+        self.cursor = cursor;
         let character = received_reference(view.get_property(player_id, "Character"));
         let humanoid = self
             .humanoid
@@ -980,26 +1146,105 @@ impl LocalPrediction {
             .map(str::to_owned)
             .or_else(|| received_humanoid_id(view, player_id));
         let Some(humanoid) = humanoid else {
+            self.move_to_result = None;
             self.simulator = None;
             self.frame = None;
             self.last_received_pose = None;
             self.intent = MovementIntent { direction: [0.; 3] };
             self.move_to = None;
-            self.pending_jump = None;
+            self.received_state_dirty = true;
             self.humanoid = None;
             self.last_reason = "waiting_for_received_character";
+            self.accept_gravity_without_body(view, intents, client_scope)?;
             return Ok(None);
         };
+        if self.simulator.as_ref().is_some_and(|s| {
+            let id=s.binding().character_id;
+            character.as_deref()!=Some(format!("{}:{}",id>>32,id as u32).as_str())
+        }) {
+            self.intent=MovementIntent{direction:[0.;3]};
+            self.move_to=None;
+            self.move_to_result=None;
+        }
+        if self.humanoid.as_deref() != Some(&humanoid) {
+            self.move_to_result = None;
+            self.walk_speed_override = None;
+            self.last_received_walk_speed = None;
+        }
         self.humanoid = Some(humanoid.clone());
+        self.observed_world_revision=view.sequence();
+        let mut pending_pivot = None;
+        let mut controls = Vec::new();
         for intent in intents {
-            let sequence = intent
-                .get("sequence")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|sequence| *sequence > self.cursor)
-                .ok_or(LivePhysicsError::InvalidIntent)?;
-            self.cursor = sequence;
+            let sequence = intent["sequence"].as_u64().unwrap();
             let kind = intent.get("kind").and_then(serde_json::Value::as_str);
-            if kind != Some("Move") && kind != Some("Jump") && kind != Some("MoveTo") {
+            // Isolated received parts have their own authority-checked sender.
+            if matches!(kind,Some("OwnedPartCFrame"|"OwnedPartStop")) { continue; }
+            if kind == Some("Gravity") {
+                controls.push(intent);
+                continue;
+            }
+            if kind == Some("CancelMoveTo") {
+                if intent["instance_id"].as_str() != Some(&humanoid)
+                    || intent["player_id"].as_str() != Some(player_id)
+                    || intent["character_id"].as_str() != character.as_deref()
+                    || !matches!(intent["property"].as_str(), Some("WalkToPoint" | "WalkToPart")) {
+                    self.rejected_intents += 1;
+                    continue;
+                }
+                if self.move_to.take().is_some() {
+                    self.intent = MovementIntent { direction: [0.; 3] };
+                }
+                continue;
+            }
+            if kind == Some("MoveToTarget") {
+                if let Some(target) = self.move_to.as_mut().filter(|target|
+                    intent["instance_id"].as_str()==Some(&humanoid)
+                    && intent["request_sequence"].as_u64()==Some(target.sequence)
+                    && intent["part_id"].as_str()==target.part.as_deref()) {
+                    target.local = prediction_move_target::TargetPose::parse(intent, view)?;
+                }
+                continue;
+            }
+            if kind == Some("PivotTo") {
+                if intent["instance_id"].as_str()!=character.as_deref()
+                    || intent["player_id"].as_str()!=Some(player_id)
+                { self.rejected_intents+=1; continue; }
+                let frame=&intent["cframe"]["$cframe"];
+                let position=received_vector(frame.get("position").cloned()).ok_or(LivePhysicsError::InvalidIntent)?;
+                let rotation=frame["rotation"].as_array().filter(|v|v.len()==9).ok_or(LivePhysicsError::InvalidIntent)?;
+                let mut matrix=[0.;9];
+                for (to,from) in matrix.iter_mut().zip(rotation) { *to=from.as_f64().ok_or(LivePhysicsError::InvalidIntent)?; }
+                if !crate::physics_sender::validate_rotation(matrix) || position.iter().any(|v|v.abs()>=1e9) {
+                    return Err(LivePhysicsError::InvalidIntent);
+                }
+                let root=intent["root_id"].as_str().ok_or(LivePhysicsError::InvalidIntent)?.to_owned();
+                pending_pivot=Some((root,position,matrix,sequence));
+                continue;
+            }
+            if kind == Some("AssemblyLinearVelocity") {
+                let valid = intent["player_id"].as_str()==Some(player_id)
+                    && intent["character_id"].as_str()==character.as_deref()
+                    && intent["instance_id"]==intent["root_id"];
+                if !valid { self.rejected_intents+=1; continue; }
+                let velocity=received_vector(intent.get("vector").cloned()).ok_or(LivePhysicsError::InvalidIntent)?;
+                if velocity.iter().any(|v|v.abs()>1e6) { return Err(LivePhysicsError::InvalidIntent); }
+                controls.push(intent);
+                continue;
+            }
+            if kind == Some("WalkSpeed") {
+                let valid = intent["instance_id"].as_str() == Some(&humanoid)
+                    && intent["player_id"].as_str() == Some(player_id)
+                    && intent["character_id"].as_str() == character.as_deref();
+                if !valid { self.rejected_intents += 1; continue; }
+                intent["value"].as_f64().filter(|v| v.is_finite() && (0.0..=MAX_WALK_SPEED).contains(v))
+                    .ok_or(LivePhysicsError::InvalidIntent)?;
+                intent["received_sequence"].as_u64().ok_or(LivePhysicsError::InvalidIntent)?;
+                controls.push(intent);
+                continue;
+            }
+            if kind != Some("Move") && kind != Some("Jump") && kind != Some("MoveTo")
+                && kind != Some("ChangeState") && kind != Some("SetStateEnabled") {
                 continue;
             }
             let receiver = intent
@@ -1010,19 +1255,22 @@ impl LocalPrediction {
                 self.rejected_intents = self.rejected_intents.saturating_add(1);
                 continue;
             }
-            if kind == Some("Jump") {
-                self.pending_jump = Some(
-                    intent
-                        .get("jump_settings")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({})),
-                );
+            if matches!(kind,Some("Jump" | "ChangeState" | "SetStateEnabled")) {
+                if receiver != humanoid { self.rejected_intents+=1; continue; }
+                controls.push(intent);
                 continue;
             }
             if kind == Some("MoveTo") {
+                let part = match intent.get("part_id") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(value.as_str().filter(|id| !id.is_empty() && id.len() <= 1024)
+                        .ok_or(LivePhysicsError::InvalidIntent)?.to_owned()),
+                };
                 self.move_to = Some(MoveToState {
                     target: received_vector(intent.get("vector").cloned())
                         .ok_or(LivePhysicsError::InvalidIntent)?,
+                    part,
+                    local: None,
                     started_at: now_monotonic,
                     sequence,
                 });
@@ -1061,6 +1309,7 @@ impl LocalPrediction {
             streaming_region_confirmed,
             now_monotonic,
             Some(&humanoid),
+            character.as_deref().and_then(|id| self.character_children.get(view, id)),
             if refresh_geometry {
                 None
             } else {
@@ -1072,8 +1321,9 @@ impl LocalPrediction {
             self.last_received_pose = None;
             self.intent = MovementIntent { direction: [0.; 3] };
             self.move_to = None;
-            self.pending_jump = None;
+            self.received_state_dirty = true;
             self.last_reason = "waiting_for_received_physics_properties";
+            self.accept_gravity_without_body(view, intents, client_scope)?;
             return Ok(None);
         };
         if refresh_geometry {
@@ -1087,7 +1337,7 @@ impl LocalPrediction {
             self.last_received_pose = None;
             self.intent = MovementIntent { direction: [0.; 3] };
             self.move_to = None;
-            self.pending_jump = None;
+            self.received_state_dirty = true;
             self.last_reason = if snapshot.evidence.anchored.is_none() {
                 "anchored_unknown"
             } else if snapshot.evidence.anchored.is_some_and(|v| v.value) {
@@ -1101,9 +1351,36 @@ impl LocalPrediction {
             } else {
                 "received_authority_incomplete"
             };
+            self.accept_gravity_without_body(view, intents, client_scope)?;
             return Ok(None);
         }
-        let received_pose = (snapshot.body.center, snapshot.body.velocity);
+        let root_key=format!("{}:{}",snapshot.evidence.binding.root_part_id>>32,snapshot.evidence.binding.root_part_id as u32);
+        let workspace = received_workspace_id(view, &root_key)
+            .ok_or(LivePhysicsError::InvalidSnapshot)?;
+        let local_gravity = self.gravity_setting.effective(view, workspace, client_scope);
+        let received_rotation=received::frame(view,&root_key).and_then(|frame| {
+            if frame["rotation_id"].as_u64()==Some(2) {
+                return Some(crate::physics_sender::IDENTITY);
+            }
+            let r=frame["rotation"].as_array().filter(|r|r.len()==9)?;
+            let mut matrix=[0.;9];
+            for (to,from) in matrix.iter_mut().zip(r) { *to=from.as_f64()?; }
+            crate::physics_sender::validate_rotation(matrix).then_some(matrix)
+        });
+        let received_pose = (snapshot.body.center, received_rotation, self.received_pose_revision);
+        let received_velocity=(snapshot.body.velocity,self.received_velocity_revision);
+        let walk_speed_revision = view.read_only_node(&humanoid)
+            .and_then(|node| node.metadata_field("property_revisions", "WalkSpeed"))
+            .and_then(|revision| revision.as_u64()).unwrap_or(0);
+        let received_walk_speed = (snapshot.walk_speed, walk_speed_revision);
+        if self.last_received_walk_speed != Some(received_walk_speed)
+            || self.simulator.as_ref().is_none_or(|s| s.binding() != snapshot.evidence.binding)
+        {
+            self.walk_speed_override = None;
+        }
+        self.last_received_walk_speed = Some(received_walk_speed);
+        let reset_rotation=self.last_received_pose!=Some(received_pose)
+            || self.simulator.as_ref().is_none_or(|s|s.binding()!=snapshot.evidence.binding);
         match self.simulator.as_mut() {
             Some(simulator) if simulator.binding() == snapshot.evidence.binding => {
                 if self.last_received_pose != Some(received_pose)
@@ -1117,36 +1394,115 @@ impl LocalPrediction {
                     simulator.walk_speed = snapshot.walk_speed;
                     simulator.surfaces = snapshot.surfaces;
                     simulator.state.half_size = snapshot.body.half_size;
+                    if self.last_received_velocity!=Some(received_velocity) {
+                        // A velocity-only receipt must not teleport the body to
+                        // the last separately received position.
+                        simulator.state.velocity=snapshot.body.velocity;
+                        simulator.velocity_pending=true;
+                        if simulator.state.velocity[1]>0. {simulator.state.grounded=false;}
+                    }
                 }
             }
-            _ => self.simulator = Some(LivePhysicsSimulator::from_received(snapshot)?),
+            _ => {
+                self.simulator = Some(LivePhysicsSimulator::from_received(snapshot)?);
+                self.received_state_dirty=true;
+            },
         }
         self.last_received_pose = Some(received_pose);
+        self.last_received_velocity = Some(received_velocity);
         let simulator = self.simulator.as_mut().unwrap();
-        if let Some(settings) = self.pending_jump.take() {
-            let accepted = match jump_speed(&settings, simulator.gravity) {
-                Some(speed) if speed > 0.0 => simulator.apply_jump(speed)?,
-                _ => false,
-            };
-            if accepted {
-                self.accepted_jumps = self.accepted_jumps.saturating_add(1);
-            } else {
-                self.rejected_jumps = self.rejected_jumps.saturating_add(1);
+        if let Some(speed) = self.walk_speed_override { simulator.walk_speed = speed; }
+        if let Some(gravity) = local_gravity {
+            simulator.gravity = gravity;
+            simulator.stepper.gravity = gravity;
+        }
+        if reset_rotation { if let Some(rotation)=received_rotation { simulator.rotation=rotation; } }
+        if let Some((root,position,rotation,sequence))=pending_pivot {
+            if root==root_key {
+                simulator.apply_pivot(position,rotation,now_monotonic)?;
+                self.accepted_pivots+=1;
+                // A later MoveTo in the same batch belongs to the new pose.
+                if self.move_to.as_ref().is_some_and(|target| target.sequence < sequence) {
+                    self.move_to = None;
+                    self.intent = MovementIntent { direction: [0.; 3] };
+                }
+            } else { self.rejected_intents+=1; }
+        }
+        if self.received_state_dirty {
+            let value=view.get_property(&humanoid,"HumanoidStateType");
+            let state=value.as_ref().and_then(|v|v.as_i64().or_else(||v["$enum"]["value"].as_i64()));
+            simulator.free_motion=state==Some(16);
+            self.received_state_dirty=false;
+        }
+        for control in controls {
+            match control["kind"].as_str() {
+                Some("Gravity") => {
+                    match self.gravity_setting.apply(view, control, client_scope, Some(workspace))? {
+                        Some(gravity) => {
+                            simulator.gravity = gravity;
+                            simulator.stepper.gravity = gravity;
+                        }
+                        None => self.rejected_intents += 1,
+                    }
+                }
+                Some("WalkSpeed") => {
+                    let observed = control["received_sequence"].as_u64().unwrap();
+                    if observed < walk_speed_revision || observed > view.sequence() {
+                        self.rejected_intents += 1;
+                        continue;
+                    }
+                    let speed = control["value"].as_f64().unwrap();
+                    simulator.walk_speed = speed;
+                    self.walk_speed_override = Some(speed);
+                    self.accepted_walk_speed_writes += 1;
+                }
+                Some("AssemblyLinearVelocity") => {
+                    if control["root_id"].as_str()!=Some(root_key.as_str()) { self.rejected_intents+=1;continue; }
+                    simulator.state.velocity=received_vector(control.get("vector").cloned()).ok_or(LivePhysicsError::InvalidIntent)?;
+                    simulator.velocity_pending=true;
+                    if simulator.state.velocity[1]>0. {simulator.state.grounded=false;}
+                    self.accepted_velocities+=1;
+                }
+                Some("ChangeState" | "SetStateEnabled") => {
+                    let state=control["state_value"].as_u64().filter(|v|*v<=18).ok_or(LivePhysicsError::InvalidIntent)?;
+                    let name=match state {16=>"Physics",8=>"Running",5=>"Freefall",_=>{self.rejected_intents+=1;continue;}};
+                    if control["state"].as_str()!=Some(name) { return Err(LivePhysicsError::InvalidIntent); }
+                    let mask=1<<state;
+                    if control["kind"]=="SetStateEnabled" {
+                        let enabled=control["enabled"].as_bool().ok_or(LivePhysicsError::InvalidIntent)?;
+                        if enabled {simulator.state_enabled|=mask;} else {simulator.state_enabled&=!mask;}
+                    } else if simulator.state_enabled&mask!=0 {
+                        simulator.free_motion=state==16;
+                        self.accepted_state_changes+=1;
+                    } else { self.rejected_intents+=1; }
+                }
+                Some("Jump") => {
+                    let empty=serde_json::json!({});
+                    let settings=control.get("jump_settings").unwrap_or(&empty);
+                    let accepted=match jump_speed(settings,simulator.gravity) {
+                        Some(speed) if speed>0. && !simulator.free_motion => simulator.apply_jump(speed)?,
+                        _=>false,
+                    };
+                    if accepted {self.accepted_jumps+=1;} else {self.rejected_jumps+=1;}
+                }
+                _=>unreachable!(),
             }
         }
-        if let Some(target) = self.move_to {
+        if let Some(target) = self.move_to.as_ref() {
+            let sequence = target.sequence;
             if now_monotonic - target.started_at >= 8.0 {
                 self.move_to = None;
                 self.intent = MovementIntent {
                     direction: [0.0; 3],
                 };
                 self.expired_move_to = self.expired_move_to.saturating_add(1);
-            } else {
+                self.move_to_result = Some((sequence, false));
+            } else if let Some(goal) = target.resolve(view, class_parents, workspace) {
                 let position = simulator.position();
                 let direction = [
-                    target.target[0] - position[0],
+                    goal[0] - position[0],
                     0.0,
-                    target.target[2] - position[2],
+                    goal[2] - position[2],
                 ];
                 if direction[0].hypot(direction[2]) <= 1.0 {
                     self.move_to = None;
@@ -1154,9 +1510,14 @@ impl LocalPrediction {
                         direction: [0.0; 3],
                     };
                     self.completed_move_to = self.completed_move_to.saturating_add(1);
+                    self.move_to_result = Some((sequence, true));
                 } else {
                     self.intent = MovementIntent { direction };
                 }
+            } else {
+                // A streamed-out target has no observed goal. Stop steering until
+                // its pose returns or the original MoveTo deadline expires.
+                self.intent = MovementIntent { direction: [0.; 3] };
             }
         }
         let frame = simulator.advance_with_policy(now_monotonic, self.intent, true)?;
@@ -1171,6 +1532,16 @@ impl LocalPrediction {
         Ok(self.frame)
     }
 
+    fn accept_gravity_without_body(&mut self, view: &WorldView,
+        intents: &[serde_json::Value], scope: u64) -> Result<(), LivePhysicsError> {
+        for intent in intents.iter().filter(|intent| intent["kind"] == "Gravity") {
+            if self.gravity_setting.apply(view, intent, scope, None)?.is_none() {
+                self.rejected_intents += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn feedback(&self) -> Option<serde_json::Value> {
         let frame = self.frame?;
         let humanoid = self.humanoid.as_ref()?;
@@ -1179,17 +1550,24 @@ impl LocalPrediction {
             frame.binding.root_part_id >> 32,
             frame.binding.root_part_id as u32
         );
-        Some(serde_json::json!({
+        let free_motion=self.simulator.as_ref().is_some_and(|s|s.free_motion);
+        let mut feedback = serde_json::json!({
             "humanoid_id":humanoid,
-            "state":{"name":if frame.grounded {"Running"} else {"Freefall"},"value":if frame.grounded {8} else {5}},
+            "state":{"name":if free_motion {"Physics"} else if frame.grounded {"Running"} else {"Freefall"},"value":if free_motion {16} else if frame.grounded {8} else {5}},
             "running_speed":frame.velocity[0].hypot(frame.velocity[2]),
+            "move_input":crate::movement_math::horizontal_input(self.intent.direction),
+            "move_sequence":self.cursor,
             "motion":{"root_id":root,"linear_velocity":frame.velocity},
             "engine_poses":{
                 "character_id":format!("{}:{}",frame.binding.character_id >> 32,frame.binding.character_id as u32),
                 "root_id":root,"frames":[{"id":root,"cframe":{"$cframe":{
-                    "position":frame.position,"rotation":[1,0,0,0,1,0,0,0,1]}}}]
+                    "position":frame.position,"rotation":frame.rotation}}}]
             }
-        }))
+        });
+        if let Some((sequence, reached)) = self.move_to_result {
+            feedback["move_to_result"] = serde_json::json!({"sequence":sequence,"reached":reached});
+        }
+        Some(feedback)
     }
 
     pub fn report(&self) -> serde_json::Value {
@@ -1201,20 +1579,29 @@ impl LocalPrediction {
             "dropped_seconds":self.dropped_seconds,
             "ground_contacts":self.ground_contacts,
             "ground_collider_count":self.geometry.len(),
+            "character_header_scans":self.character_children.scans(),
             "collision_model":"static_axis_aligned_basepart_bounds",
             "server_acceptance_confirmed":false,
             "movement_cursor":self.cursor,
             "rejected_intents":self.rejected_intents,
+            "accepted_pivots":self.accepted_pivots,
+            "accepted_velocity_writes":self.accepted_velocities,
+            "accepted_state_changes":self.accepted_state_changes,
+            "accepted_walk_speed_writes":self.accepted_walk_speed_writes,
+            "accepted_gravity_writes":self.gravity_setting.accepted,
+            "gravity":self.simulator.as_ref().map(|s|s.gravity),
+            "walk_speed":self.simulator.as_ref().map(|s|s.walk_speed),
+            "physics_state":self.simulator.as_ref().is_some_and(|s|s.free_motion),
             "camera_relative_intents":self.camera_relative_intents,
             "accepted_jumps":self.accepted_jumps,
             "rejected_jumps":self.rejected_jumps,
             "completed_move_to":self.completed_move_to,
             "expired_move_to":self.expired_move_to,
-            "move_to":self.move_to.map(|target| serde_json::json!({
-                "target":target.target,"sequence":target.sequence,"started_at":target.started_at
+            "move_to":self.move_to.as_ref().map(|target| serde_json::json!({
+                "target":target.target,"part_id":target.part,"sequence":target.sequence,"started_at":target.started_at
             })),
             "frame":self.frame.map(|frame| serde_json::json!({
-                "position":frame.position,"velocity":frame.velocity,"grounded":frame.grounded,
+                "position":frame.position,"rotation":frame.rotation,"velocity":frame.velocity,"grounded":frame.grounded,
                 "based_on_received_revision":frame.based_on_received_revision,
                 "server_acceptance_confirmed":frame.server_acceptance_confirmed
             }))
@@ -1278,6 +1665,25 @@ mod tests {
             ("Part".into(), "BasePart".into()),
             ("SpawnLocation".into(), "Part".into()),
         ])
+    }
+
+    #[test]
+    fn relative_move_to_requires_a_valid_received_part_pose_in_the_same_workspace() {
+        let mut world = received_world(7.);
+        let mut target = MoveToState { target: [2., 3., 4.], part: Some("1:7".into()), local: None, started_at: 1., sequence: 1 };
+        assert_eq!(target.resolve(&world.view(), &test_parents(), "1:4"), Some([2., 2.5, 4.]));
+        assert_eq!(target.resolve(&world.view(), &test_parents(), "other"), None);
+        target.part = Some("1:3".into());
+        assert_eq!(target.resolve(&world.view(), &test_parents(), "1:4"), None);
+        target.part = Some("1:7".into());
+        world.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":11,"actions":[
+            {"kind":"set","sequence":11,"id":"1:7","fields":{"CFrame":{"position":[0,0,0],"rotation":[0,0,0,0,0,0,0,0,0]}}}
+        ]})).unwrap();
+        assert_eq!(target.resolve(&world.view(), &test_parents(), "1:4"), None);
+        world.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":12,"actions":[
+            {"kind":"remove","sequence":12,"id":"1:7"}
+        ]})).unwrap();
+        assert_eq!(target.resolve(&world.view(), &test_parents(), "1:4"), None);
     }
 
     #[test]
@@ -1548,6 +1954,24 @@ mod tests {
                 1.08
             )
             .is_err());
+    }
+
+    #[test]
+    fn camera_pitch_and_vertical_fallback_preserve_partial_input_strength() {
+        let half = 0.5_f64;
+        let vertical = (3.0_f64).sqrt() / 2.0;
+        for rotation in [
+            [0., vertical, half, 0., half, -vertical, -1., 0., 0.],
+            [0., 1., 0., 0., 0., -1., -1., 0., 0.],
+        ] {
+            let camera = serde_json::json!({"rotation":rotation});
+            let output = camera_relative_direction([0., 500., -0.25], Some(&camera)).unwrap();
+            assert!((output[0] + 0.25).abs() < 1e-12);
+            assert_eq!(output[1], 0.);
+            assert!(output[2].abs() < 1e-12);
+            let diagonal = camera_relative_direction([3., 0., -4.], Some(&camera)).unwrap();
+            assert!((diagonal[0].hypot(diagonal[2]) - 1.).abs() < 1e-12);
+        }
     }
 
     #[test]

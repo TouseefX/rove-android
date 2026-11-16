@@ -78,8 +78,8 @@ pub fn build_runtime_snapshot(
     let mut class_property_types: HashMap<String, HashMap<String, u8>> = HashMap::new();
     for class in &schema.classes {
         let fields = class_property_types.entry(class.name.clone()).or_default();
-        for property_id in &class.properties {
-            let property = &schema.properties[*property_id];
+        for property_id in class.properties.iter().copied().chain(class.isr_properties.iter().map(|&id| id as usize)) {
+            let property = &schema.properties[property_id];
             fields.insert(property.name.clone(), property.type_id);
         }
     }
@@ -256,8 +256,8 @@ pub fn build_runtime_snapshot(
             );
         }
         let mut property_types = Map::new();
-        for property_id in &class.properties {
-            let property = &schema.properties[*property_id];
+        for property_id in class.properties.iter().copied().chain(class.isr_properties.iter().map(|&id| id as usize)) {
+            let property = &schema.properties[property_id];
             property_types.insert(property.name.clone(), json!(property.type_id));
         }
         class_events.insert(class.name.clone(), Value::Array(event_names));
@@ -387,7 +387,41 @@ pub fn normalize_node_values(
             set_node_metadata(node, "property_revisions", "Position", json!(revision))?;
         }
     }
+    for key in ["AssemblyLinearVelocity", "Velocity", "AssemblyAngularVelocity", "RotVelocity"] {
+        let derived = node["properties"].get("ReplicationPV")
+            .map(|pv| received_velocity(pv, key)).transpose()?.flatten();
+        if let Some(value) = derived {
+            let revision = node_revision(node, "ReplicationPV")?;
+            if node["properties"].get(key).is_none() || node_revision(node, key)? < revision {
+                node["properties"][key] = value;
+                set_node_metadata(node, "origins", key, json!("derived_received"))?;
+                set_node_metadata(node, "property_revisions", key, json!(revision))?;
+            }
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn received_velocity(pv: &Value, key: &str) -> Result<Option<Value>, String> {
+    let index = match key {
+        "AssemblyLinearVelocity" | "Velocity" => 0,
+        "AssemblyAngularVelocity" | "RotVelocity" => 1,
+        _ => return Ok(None),
+    };
+    let pv = pv.get("$cframe").unwrap_or(pv);
+    let Some(velocities) = pv.get("decoded_velocities").filter(|v| !v.is_null()) else { return Ok(None); };
+    let values = velocities.as_array().filter(|v| v.len() == 2)
+        .ok_or("received PV velocities must contain two vectors")?;
+    validate_vector3(&values[index], "received PV velocity")?;
+    Ok(Some(json!({"$vector3":values[index]})))
+}
+
+fn projected_velocity(node: &ReadOnlyNode, key: &str) -> Result<Option<(Value, u64)>, String> {
+    if !matches!(key, "AssemblyLinearVelocity" | "Velocity" | "AssemblyAngularVelocity" | "RotVelocity") { return Ok(None); }
+    let Some(pv) = node.property("ReplicationPV") else { return Ok(None); };
+    let revision = projected_revision(node, "ReplicationPV")?;
+    if node.property(key).is_some() && projected_revision(node, key)? >= revision { return Ok(None); }
+    Ok(received_velocity(&pv, key)?.map(|value| (value, revision)))
 }
 
 /// Validate the value-dependent parts of runtime normalization directly from
@@ -398,6 +432,11 @@ pub fn validate_normalized_node_values(
     revisions: Option<&Map<String, Value>>,
     default_revision: Option<u64>,
 ) -> Result<(), String> {
+    if let Some(pv) = properties.get("ReplicationPV") {
+        for key in ["AssemblyLinearVelocity", "AssemblyAngularVelocity"] {
+            received_velocity(pv, key)?;
+        }
+    }
     let cframe = properties
         .get("CFrame")
         .filter(|v| frame_position(v).is_some());
@@ -450,6 +489,7 @@ pub fn project_node_property(
     property_types: Option<&HashMap<String, u8>>,
     key: &str,
 ) -> Result<Option<Value>, String> {
+    if let Some((value, _)) = projected_velocity(node, key)? { return Ok(Some(value)); }
     let raw = |name: &str| node.property(name);
     if key == "Size"
         && raw("Size").is_none()
@@ -530,6 +570,7 @@ pub fn project_node_origin(
     property_types: Option<&HashMap<String, u8>>,
     key: &str,
 ) -> Result<Option<Value>, String> {
+    if projected_velocity(node, key)?.is_some() { return Ok(Some(json!("derived_received"))); }
     if key == "Size"
         && node.property("Size").is_none()
         && property_types.and_then(|types| types.get("size")) == Some(&22)
@@ -565,6 +606,7 @@ pub fn project_node_revision(
     property_types: Option<&HashMap<String, u8>>,
     key: &str,
 ) -> Result<Option<Value>, String> {
+    if let Some((_, revision)) = projected_velocity(node, key)? { return Ok(Some(json!(revision))); }
     if key == "Size"
         && node.property("Size").is_none()
         && property_types.and_then(|types| types.get("size")) == Some(&22)
@@ -725,10 +767,10 @@ fn validate_schema_tables(schema: &Schema) -> Result<(), String> {
         }
     }
     for class in &schema.classes {
-        for property_id in &class.properties {
+        for property_id in class.properties.iter().copied().chain(class.isr_properties.iter().map(|&id| id as usize)) {
             let property = schema
                 .properties
-                .get(*property_id)
+                .get(property_id)
                 .ok_or("schema class references a missing property")?;
             if property.class != class.id {
                 return Err("schema class property belongs to a different class".into());

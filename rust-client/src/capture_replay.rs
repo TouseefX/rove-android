@@ -18,7 +18,7 @@ struct Row {
 struct Capture<'a, F> {
     accept: &'a mut F,
     count: usize,
-    kinds: &'a [u8],
+    kinds: &'a [(u32, u8)],
 }
 impl<'de, F: FnMut(&[u8], usize) -> Result<(), String>> Visitor<'de> for Capture<'_, F> {
     type Value = usize;
@@ -29,7 +29,7 @@ impl<'de, F: FnMut(&[u8], usize) -> Result<(), String>> Visitor<'de> for Capture
         while let Some(row) = seq.next_element::<Row>()? {
             if row.direction.as_deref() != Some("received")
                 || row.application != Some(4)
-                || row.channel != Some(1)
+                || !self.kinds.iter().any(|(channel, _)| Some(*channel) == row.channel)
             {
                 continue;
             }
@@ -47,7 +47,7 @@ impl<'de, F: FnMut(&[u8], usize) -> Result<(), String>> Visitor<'de> for Capture
             }
             if !payload
                 .first()
-                .is_some_and(|kind| self.kinds.contains(kind))
+                .is_some_and(|kind| self.kinds.contains(&(row.channel.unwrap(), *kind)))
             {
                 continue;
             }
@@ -68,7 +68,15 @@ pub fn read<R: Read>(
     input: R,
     mut accept: impl FnMut(&[u8], usize) -> Result<(), String>,
 ) -> Result<usize, String> {
-    read_selected(input, &mut accept, &[129, 131, 151])
+    read_selected(input, &mut accept, &[(1,129), (1,131), (1,151)])
+}
+
+/// Replay received configuration, ordinary replication and ISR in capture order.
+pub fn read_instance_state<R: Read>(
+    input: R,
+    mut accept: impl FnMut(&[u8], usize) -> Result<(), String>,
+) -> Result<usize, String> {
+    read_selected(input, &mut accept, &[(1,147), (1,151), (1,129), (1,131), (3,131), (5,161)])
 }
 
 /// Inspection only. Captured checks must never supply replies in a new session.
@@ -76,13 +84,13 @@ pub fn read_program_checks<R: Read>(
     input: R,
     mut accept: impl FnMut(&[u8], usize) -> Result<(), String>,
 ) -> Result<usize, String> {
-    read_selected(input, &mut accept, &[155])
+    read_selected(input, &mut accept, &[(1,155)])
 }
 
 fn read_selected<R: Read>(
     input: R,
     accept: &mut impl FnMut(&[u8], usize) -> Result<(), String>,
-    kinds: &[u8],
+    kinds: &[(u32, u8)],
 ) -> Result<usize, String> {
     let mut de = serde_json::Deserializer::from_reader(input);
     let count = Capture {
@@ -101,6 +109,23 @@ fn read_selected<R: Read>(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn instance_state_replay_preserves_mixed_channel_order_and_excludes_sent_data() {
+        let row = |direction, app, channel, data: &[u8]| json!({"direction":direction,"application":app,"channel":channel,"data_base64":STANDARD.encode(data)});
+        let capture = json!([
+            row("received", 4, 1, &[147]), row("received", 4, 1, &[151]),
+            row("sent", 4, 5, &[161]), row("received", 2, 5, &[161]),
+            row("received", 4, 1, &[161]), row("received", 4, 1, &[129]),
+            row("received", 4, 5, &[161, 1]), row("received", 4, 3, &[131]),
+            row("received", 4, 5, &[161, 2]), row("received", 4, 1, &[155])
+        ]);
+        let mut received = Vec::new();
+        let count = read_instance_state(capture.to_string().as_bytes(), |p, _| {
+            received.push(p.to_vec()); Ok(())
+        }).unwrap();
+        assert_eq!(count, 6);
+        assert_eq!(received, vec![vec![147],vec![151],vec![129],vec![161,1],vec![131],vec![161,2]]);
+    }
     #[test]
     fn selects_only_received_world_packets_in_order() {
         let row = |direction, app, channel, data: &[u8]| json!({"direction":direction,"application":app,"channel":channel,"data_base64":STANDARD.encode(data)});

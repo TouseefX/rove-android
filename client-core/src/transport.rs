@@ -11,6 +11,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(feature = "transport")]
 pub use wtransport::Connection;
 
+#[cfg(feature = "transport")]
+pub mod delivery;
+
 pub const MAX_UDP_DATAGRAM: usize = 65_535;
 pub const DEFAULT_MAX_SESSION_BYTES: u64 = u64::MAX;
 pub const DEFAULT_MAX_SESSION_DATAGRAMS: u64 = u64::MAX;
@@ -594,13 +597,14 @@ pub use quinn_socket::Socket as RuppUdpSocket;
 pub async fn create_quinn_endpoint(
     allocation: &IssuedAllocation,
 ) -> Result<(quinn::Endpoint, std::sync::Arc<RuppUdpSocket>), TransportError> {
-    let (endpoint, socket, _) = build_quinn_endpoint(allocation).await?;
+    let (endpoint, socket, _) = build_quinn_endpoint(allocation, None).await?;
     Ok((endpoint, socket))
 }
 
 #[cfg(feature = "transport")]
 async fn build_quinn_endpoint(
     allocation: &IssuedAllocation,
+    delivery: Option<std::sync::Arc<delivery::DatagramDelivery>>,
 ) -> Result<
     (
         quinn::Endpoint,
@@ -635,9 +639,15 @@ async fn build_quinn_endpoint(
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|_| TransportError::InvalidCertificatePins)?;
     let mut transport = quinn::TransportConfig::default();
+    transport.datagram_observer(delivery.map(|d| d as std::sync::Arc<dyn quinn_proto::DatagramObserver>));
     transport
         .receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024))
         .stream_receive_window(quinn::VarInt::from_u32(1024 * 1024))
+        // Real-time state must not sit behind seconds of obsolete datagrams
+        // while the VM applies reliable world updates. Quinn drops the oldest
+        // unread datagrams at this bound; reliable stream windows are separate.
+        // Still admit the client's full 64 KiB maximum application datagram.
+        .datagram_receive_buffer_size(Some(64 * 1024))
         .max_concurrent_bidi_streams(quinn::VarInt::from_u32(32))
         .max_concurrent_uni_streams(quinn::VarInt::from_u32(256))
         .max_idle_timeout(Some(quinn::VarInt::from_u32(15_000).into()))
@@ -668,7 +678,7 @@ pub async fn connect_quic(
     ),
     TransportError,
 > {
-    let (endpoint, socket, certificate_failure) = build_quinn_endpoint(allocation).await?;
+    let (endpoint, socket, certificate_failure) = build_quinn_endpoint(allocation, None).await?;
     let server_name = allocation.endpoint.ip().to_string();
     let connection = endpoint
         .connect(allocation.endpoint, &server_name)
@@ -699,7 +709,22 @@ pub async fn connect_webtransport(
     ),
     TransportError,
 > {
-    let (endpoint, socket, certificate_failure) = build_quinn_endpoint(allocation).await?;
+    connect_webtransport_with_delivery(allocation, None).await
+}
+
+#[cfg(feature = "transport")]
+pub async fn connect_webtransport_with_delivery(
+    allocation: &IssuedAllocation,
+    delivery: Option<std::sync::Arc<delivery::DatagramDelivery>>,
+) -> Result<
+    (
+        quinn::Endpoint,
+        wtransport::Connection,
+        std::sync::Arc<RuppUdpSocket>,
+    ),
+    TransportError,
+> {
+    let (endpoint, socket, certificate_failure) = build_quinn_endpoint(allocation, delivery).await?;
     let client = wtransport::Endpoint::from_quinn_endpoint(endpoint.clone());
     let capabilities = format!("{:016x}", allocation.capabilities);
     let url = format!(
@@ -1152,7 +1177,8 @@ mod tests {
             certificate_sha256: vec![cert_pin],
             capabilities,
         };
-        let (endpoint, connection, socket) = match connect_webtransport(&allocation).await {
+        let delivery=std::sync::Arc::new(delivery::DatagramDelivery::default());
+        let (endpoint, connection, socket) = match connect_webtransport_with_delivery(&allocation,Some(delivery.clone())).await {
             Ok(connected) => connected,
             Err(error) => {
                 let server_outcome =
@@ -1184,7 +1210,7 @@ mod tests {
             Some(b"client-reliable")
         }).await.unwrap());
         assert!(prepared);
-        send_unreliable(&connection, 14, 3, b"client-datagram").unwrap();
+        delivery::send_tracked(&connection, &delivery, 14, 3, b"client-datagram", 123).unwrap();
 
         let datagram = receive_unreliable(&connection).await.unwrap();
         assert_eq!(datagram.wire_id, 16);
@@ -1209,6 +1235,18 @@ mod tests {
 
         sender.finish(4, 7).await.unwrap();
 
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let outcomes=delivery.drain();
+                if !outcomes.is_empty() {
+                    assert_eq!(outcomes,vec![delivery::Delivery::Acknowledged(123)]);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("real loopback datagram ACK");
+        assert_eq!(delivery.report()["acknowledged"],1);
+        assert_eq!(delivery.report()["lost"],0);
         let _ = release_tx.send(());
         connection.close(wtransport::VarInt::from_u32(0), b"test complete");
         endpoint.close(quinn::VarInt::from_u32(0), b"test complete");

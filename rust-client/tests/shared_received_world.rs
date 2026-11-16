@@ -25,6 +25,9 @@ fn schema() -> Schema {
         "Humanoid",
         "DataModel",
         "SurfaceAppearance",
+        "Attachment",
+        "Actor",
+        "LocalScript",
     ]
     .into_iter()
     .enumerate()
@@ -33,6 +36,8 @@ fn schema() -> Schema {
         name: name.into(),
         properties: if name == "Part" {
             vec![0, 1, 2]
+        } else if name == "Attachment" {
+            vec![3,4,5,6]
         } else {
             vec![]
         },
@@ -71,6 +76,10 @@ fn schema() -> Schema {
                 enum_id: None,
                 lr_type: None,
             },
+            PropertyDesc { id:3, class:9, name:"CFrame".into(),type_id:27,enum_id:None,lr_type:None },
+            PropertyDesc { id:4, class:9, name:"Position".into(),type_id:22,enum_id:None,lr_type:None },
+            PropertyDesc { id:5, class:9, name:"Axis".into(),type_id:22,enum_id:None,lr_type:None },
+            PropertyDesc { id:6, class:9, name:"SecondaryAxis".into(),type_id:22,enum_id:None,lr_type:None },
         ],
         events: vec![],
         strings: vec![],
@@ -131,7 +140,46 @@ fn compact_shared_part(mut snapshot: Value) -> Value {
     part["origins"] = json!({});
     part["property_revisions"] = json!({});
     part["_rust_shared_node"] = json!(true);
+    for node in snapshot["nodes"].as_array_mut().unwrap() {
+        if node["class_name"] == "Attachment" {
+            node["properties"]=json!({});node["origins"]=json!({});
+            node["property_revisions"]=json!({});node["_rust_shared_node"]=json!(true);
+        }
+    }
     snapshot
+}
+
+#[test]
+fn shared_attachment_receipts_preserve_axis_history_and_clone_current_pose() {
+    let mut raw=raw_snapshot();
+    raw["nodes"].as_array_mut().unwrap().push(json!({
+        "id":"scope:attachment","class_name":"Attachment","name":"Point","parent":"scope:root-1",
+        "properties":{"Archivable":true,"CFrame":{"position":[1,2,3],"rotation_id":2}},
+        "origins":{"CFrame":"received"},"property_revisions":{"CFrame":7}
+    }));
+    let mut h=Harness::from_raw(raw);
+    h.run(r#"
+        a=workspace.SharedProbe.Point;expected=Instance.new("Attachment");expected.CFrame=a.CFrame
+        a.CFrame=CFrame.new(90,80,70)
+        function same() local x,y={a.CFrame:GetComponents()},{expected.CFrame:GetComponents()}
+            for i=1,12 do assert(math.abs(x[i]-y[i])<.0001) end
+            local c=a:Clone();assert(c.CFrame==a.CFrame)
+        end
+    "#);
+    let steps=[("Axis",[1,2,3]),("SecondaryAxis",[3,-1,1]),("Axis",[1,-2,1]),("Position",[8,9,10])];
+    for (i,(key,v)) in steps.into_iter().enumerate() {
+        let seq=i as u64+8;
+        let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":seq,"actions":[{
+            "sequence":seq,"kind":"set","id":"scope:attachment","fields":{key:{"$vector3":v}}
+        }]}));
+        h.update_vm(delta,&view);
+        h.run(&format!("expected.{key}=Vector3.new({},{},{});same()",v[0],v[1],v[2]));
+    }
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":12,"actions":[{
+        "sequence":12,"kind":"set","id":"scope:attachment","fields":{"CFrame":{"position":[4,5,6],"rotation_id":2}}
+    }]}));
+    h.update_vm(delta,&view);
+    h.run("expected.CFrame=CFrame.new(4,5,6);same()");
 }
 
 struct Harness {
@@ -159,6 +207,9 @@ impl Harness {
             ..RuntimeSnapshotMetadata::default()
         };
         let mut initial = build_runtime_snapshot(&schema, &raw, &metadata).unwrap();
+        if let Some(sources)=raw.get("script_sources") {
+            initial["script_sources"]=sources.clone();
+        }
         if raw.get("lightweight_assets")==Some(&json!(true)) {
             initial["lightweight_assets"]=json!(true);
         }
@@ -514,4 +565,182 @@ fn same_frame_create_then_set_uses_full_create_and_final_shared_refresh() {
         ),
         json!([6.0, 6.0, 7.0])
     );
+}
+
+#[test]
+fn shared_wire_aliases_notify_public_properties_after_local_override_removal() {
+    let mut raw=raw_snapshot();
+    let part=raw["nodes"].as_array_mut().unwrap().iter_mut().find(|node|node["id"]=="scope:root-1").unwrap();
+    part["properties"]["CollisionGroupReplicate"]=json!({"$bytes_hex":"00"});
+    part["property_revisions"]["CollisionGroupReplicate"]=json!(7);
+    let mut h=Harness::from_raw(raw);
+    h.run(r#"
+        p=workspace.SharedProbe;p.Color=Color3.new(1,0,0);p.CollisionGroup='Local'
+        colors=0;groups=0;names={}
+        p:GetPropertyChangedSignal('Color'):Connect(function(...) assert(select('#',...)==0);colors+=1 end)
+        p:GetPropertyChangedSignal('CollisionGroup'):Connect(function(...) assert(select('#',...)==0);groups+=1 end)
+        p.Changed:Connect(function(name) table.insert(names,name) end)
+    "#);
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":8,"actions":[{
+        "kind":"set","sequence":8,"id":"scope:root-1","fields":{
+            "Color3uint8":{"$color3":[0.25,0.5,0.75]},"CollisionGroupReplicate":{"$bytes_hex":"00"}
+        }
+    }]}));
+    h.update_vm(delta,&view);
+    assert_eq!(h.run("return colors,groups,p.Color.R,p.CollisionGroup,table.concat(names,',')"),json!([1.0,1.0,0.25,"Default","BrickColor,CollisionGroup,Color"]));
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":12,"actions":[
+        {"kind":"set","sequence":9,"id":"scope:root-1","fields":{"Color3uint8":{"$color3":[1,0,0]},"CollisionGroupReplicate":{"$bytes_hex":"0147686f7374"}}},
+        {"kind":"set","sequence":10,"id":"scope:root-1","fields":{"CollisionGroupReplicate":{"$bytes_hex":"0247686f7374"}}},
+        {"kind":"set","sequence":11,"id":"scope:root-1","fields":{"Color3uint8":{"$color3":[0.25,0.5,0.75]}}},
+        {"kind":"set","sequence":12,"id":"scope:root-1","fields":{"CollisionGroupReplicate":{"$bytes_hex":"00"}}}
+    ]}));
+    h.update_vm(delta.clone(),&view);
+    assert_eq!(h.run("return colors,groups,p.Color.R,p.CollisionGroup"),json!([3.0,3.0,0.25,"Default"]));
+    h.update_vm(delta,&view);
+    assert_eq!(h.run("return colors,groups"),json!([3.0,3.0]));
+}
+
+#[test]
+fn shared_transform_receipts_preserve_intermediate_position_notifications() {
+    let mut h=Harness::new();
+    h.run(r#"
+        moves=0;turns=0
+        workspace.SharedProbe:GetPropertyChangedSignal('Position'):Connect(function(...) assert(select('#',...)==0);moves+=1 end)
+        workspace.SharedProbe:GetPropertyChangedSignal('Orientation'):Connect(function() turns+=1 end)
+    "#);
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":10,"actions":[
+        {"kind":"set","id":"scope:root-1","sequence":8,"fields":{"CFrame":{"position":[4,5,6],"rotation_id":2}}},
+        {"kind":"set","id":"scope:root-1","sequence":9,"fields":{"CFrame":{"position":[4,5,6],"rotation_id":2}}},
+        {"kind":"set","id":"scope:root-1","sequence":10,"fields":{"CFrame":{"position":[1,2,3],"rotation_id":2}}}
+    ]}));
+    h.update_vm(delta.clone(),&view);
+    assert_eq!(h.run("return moves,turns,workspace.SharedProbe.Position.X"),json!([2.,0.,1.]));
+    h.update_vm(delta,&view);
+    assert_eq!(h.run("return moves,turns"),json!([2.,0.]));
+}
+
+#[test]
+fn shared_received_pose_and_color_replace_actors_old_script_overlays() {
+    let mut raw=raw_snapshot();
+    raw["nodes"].as_array_mut().unwrap().extend([
+        json!({"id":"scope:actor","class_name":"Actor","name":"Worker","parent":"scope:workspace","properties":{}}),
+        json!({"id":"scope:reader","class_name":"LocalScript","name":"Reader","parent":"scope:actor","properties":{"Enabled":true,"Disabled":false},"attributes_known":true,"attributes":{}})
+    ]);
+    raw["script_sources"]=json!({"scope:reader":{"source":r#"
+        local p=workspace.SharedProbe
+        script.Parent:BindToMessage('sample',function()
+            script:SetAttribute('X',p.Position.X);script:SetAttribute('Red',p.Color.R)
+        end)
+    "#}});
+    let mut h=Harness::from_raw(raw);
+    h.run("p=workspace.SharedProbe;p.CFrame=CFrame.new(50,0,0);p.Color=Color3.new(1,0,0)");
+    h.run("workspace.Worker:SendMessage('sample')");
+    assert_eq!(h.run("return workspace.Worker.Reader:GetAttribute('X'),workspace.Worker.Reader:GetAttribute('Red')"),json!([50.,1.]));
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":8,"actions":[{
+        "kind":"set","sequence":8,"id":"scope:root-1","fields":{
+            "CFrame":{"position":[4,5,6],"rotation_id":2},"Color3uint8":{"$color3":[0.25,0.5,0.75]}
+        }
+    }]}));
+    h.update_vm(delta,&view);
+    h.run("workspace.Worker:SendMessage('sample')");
+    assert_eq!(h.run("return p.Position.X,p.Color.R,workspace.Worker.Reader:GetAttribute('X'),workspace.Worker.Reader:GetAttribute('Red')"),json!([4.,0.25,4.,0.25]));
+}
+
+#[test]
+fn shared_owned_body_feedback_reads_received_authority_and_stops_after_owner_changes() {
+    let mut raw=raw_snapshot();
+    let part=raw["nodes"].as_array_mut().unwrap().iter_mut().find(|n|n["id"]=="scope:root-1").unwrap();
+    part["properties"]["Anchored"]=json!(false);
+    part["properties"]["NetworkOwnerV3"]=json!(7);
+    part["property_revisions"]["Anchored"]=json!(7);
+    part["property_revisions"]["NetworkOwnerV3"]=json!(7);
+    let mut h=Harness::from_raw(raw);
+    h.run("changes=0;workspace.SharedProbe:GetPropertyChangedSignal('Position'):Connect(function() changes+=1 end)");
+    let feedback=|sequence:u64,x:i32|json!({"op":"update","timeout_ms":100,"delta":{
+        "version":1,"delta":true,"sequence":sequence,"actions":[],"engine_owned_part_updates":{
+            "scope":7,"source_revision":sequence,"frames":[{"id":"scope:root-1","cframe":{"$cframe":{"position":[x,2,3],"rotation":[1,0,0,0,1,0,0,0,1]}},"linear_velocity":[3,0,0],"angular_velocity":[0,0,0]}]
+        }
+    }});
+    let reply=h.runtime.call(feedback(7,5)).unwrap();successful(&reply).unwrap();
+    assert_eq!(reply["engine_owned_part_status"],"applied","{reply}");
+    assert_eq!(h.run("return workspace.SharedProbe.Position.X,workspace.SharedProbe.AssemblyLinearVelocity.X,changes"),json!([5.,3.,0.]));
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":8,"actions":[{"kind":"set","sequence":8,"id":"scope:root-1","fields":{"NetworkOwnerV3":8}}]}));
+    h.update_vm(delta,&view);
+    let reply=h.runtime.call(feedback(8,20)).unwrap();successful(&reply).unwrap();
+    assert_eq!(reply["engine_owned_part_status"],"stale_authority","{reply}");
+    assert_eq!(h.run("return workspace.SharedProbe.Position.X,changes"),json!([5.,0.]));
+}
+
+#[test]
+fn shared_point_velocity_reads_current_received_assembly_motion() {
+    let mut raw=raw_snapshot();
+    let part=raw["nodes"].as_array_mut().unwrap().iter_mut().find(|n|n["id"]=="scope:root-1").unwrap();
+    part["properties"]["AssemblyLinearVelocity"]=json!({"$vector3":[1,0,0]});
+    part["properties"]["AssemblyAngularVelocity"]=json!({"$vector3":[0,0,2]});
+    part["properties"]["AssemblyCenterOfMass"]=json!({"$vector3":[1,2,3]});
+    let mut h=Harness::from_raw(raw);
+    assert_eq!(h.run("local v=workspace.SharedProbe:GetVelocityAtPosition(Vector3.new(3,2,3));return v.X,v.Y,v.Z"),json!([1.,4.,0.]));
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":8,"actions":[{"kind":"set","sequence":8,"id":"scope:root-1","fields":{"AssemblyAngularVelocity":{"$vector3":[0,0,0]}}}]}));
+    h.update_vm(delta,&view);
+    assert_eq!(h.run("local v=workspace.SharedProbe:GetVelocityAtPosition(Vector3.new(3,2,3));return v.X,v.Y,v.Z"),json!([1.,0.,0.]));
+}
+
+#[test]
+fn shared_grounding_reads_new_received_anchoring() {
+    let mut raw=raw_snapshot();
+    let part=raw["nodes"].as_array_mut().unwrap().iter_mut().find(|n|n["id"]=="scope:root-1").unwrap();
+    part["properties"]["Anchored"]=json!(false);
+    let mut h=Harness::from_raw(raw);
+    assert_eq!(h.run("return workspace.SharedProbe:IsGrounded()"),json!([false]));
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":8,"actions":[{"kind":"set","sequence":8,"id":"scope:root-1","fields":{"Anchored":true}}]}));
+    h.update_vm(delta,&view);
+    assert_eq!(h.run("return workspace.SharedProbe:IsGrounded()"),json!([true]));
+}
+
+#[test]
+fn shared_humanoid_health_preserves_payloads_and_does_not_author_mutations() {
+    let mut raw=raw_snapshot();
+    raw["nodes"].as_array_mut().unwrap().push(json!({
+        "id":"scope:health-probe","class_name":"Humanoid","name":"HealthProbe","parent":"scope:workspace",
+        "properties":{"Health":100,"MaxHealth":100},"property_revisions":{"Health":7,"MaxHealth":7}
+    }));
+    let mut h=Harness::from_raw(raw);
+    h.run(r#"
+        health={};deaths=0
+        workspace.HealthProbe.HealthChanged:Connect(function(value) table.insert(health,value) end)
+        workspace.HealthProbe.Died:Connect(function() deaths+=1 end)
+    "#);
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":9,"actions":[
+        {"kind":"set","id":"scope:health-probe","sequence":8,"fields":{"Health":60}},
+        {"kind":"set","id":"scope:health-probe","sequence":9,"fields":{"Health":0}}
+    ]}));
+    let reply=h.runtime.call_with_shared_world(json!({"op":"update","timeout_ms":500,"delta":delta}),&view).unwrap();
+    successful(&reply).unwrap();
+    assert!(reply["mutations"].as_array().is_none_or(|rows|rows.is_empty()),"{reply}");
+    assert_eq!(h.run("return table.concat(health,','),deaths,workspace.HealthProbe.Health"),json!(["60,0",1.,0.]));
+}
+
+#[test]
+fn shared_humanoid_state_updates_keep_intermediate_enum_payloads() {
+    let mut raw=raw_snapshot();
+    raw["nodes"].as_array_mut().unwrap().push(json!({
+        "id":"scope:state-probe","class_name":"Humanoid","name":"StateProbe","parent":"scope:workspace",
+        "properties":{"HumanoidStateType":8},"property_revisions":{"HumanoidStateType":7}
+    }));
+    let mut h=Harness::from_raw(raw);
+    h.run(r#"
+        states={}
+        workspace.StateProbe.StateChanged:Connect(function(old,new)
+            assert(old==Enum.HumanoidStateType[old.Name] and new==Enum.HumanoidStateType[new.Name])
+            table.insert(states,old.Name..'>'..new.Name)
+        end)
+    "#);
+    let (delta,view)=h.apply(json!({"version":1,"delta":true,"sequence":9,"actions":[
+        {"kind":"set","id":"scope:state-probe","sequence":8,"fields":{"HumanoidStateType":3}},
+        {"kind":"set","id":"scope:state-probe","sequence":9,"fields":{"HumanoidStateType":8}}
+    ]}));
+    h.update_vm(delta.clone(),&view);
+    assert_eq!(h.run("return table.concat(states,','),workspace.StateProbe:GetState()==Enum.HumanoidStateType.Running"),json!(["Running>Jumping,Jumping>Running",true]));
+    h.update_vm(delta,&view);
+    assert_eq!(h.run("return #states"),json!([2.]));
 }

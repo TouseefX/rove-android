@@ -5,7 +5,7 @@
 //! json is just for the public boundary.
 
 use crate::packed_properties::{
-    packed_value_layout_bytes, CompactSharedProperty, PackedProperties, SharedPayloadResolver,
+    packed_value_layout_bytes, CompactSharedProperty, CompactCreatedProperties, PackedProperties, SharedPayloadResolver,
     SharedPropertyValue,
 };
 use crate::shared_payload::SharedPayload;
@@ -19,14 +19,56 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-const SHARD_COUNT: usize = 256;
+// Smaller shards stay in the allocator's small pages and copy less data
+// when a received update changes just one immutable world-index bucket.
+const SHARD_COUNT: usize = 1024;
 const REQUIRED_VERSION: u64 = 1;
 const MAX_PENDING_EVENTS: usize = 4096;
 // real captures can have around 40k nodes. keep a limit, but do not cut
 // valid worlds off at the old tiny-fixture cap.
 const MAX_NODES: usize = 100_000;
 
-type NodeMap = HashMap<Arc<str>, Arc<NodeRecord>>;
+// The immutable record already owns its ID. Keep one index entry with its
+// receipt-order position instead of two hash maps carrying duplicate ID keys.
+#[derive(Clone, Default)]
+struct NodeMap {
+    entries: hashbrown::HashTable<(Arc<NodeRecord>, usize)>,
+    hashes: std::collections::hash_map::RandomState,
+}
+
+impl NodeMap {
+    fn hash(&self, id: &str) -> u64 {
+        std::hash::BuildHasher::hash_one(&self.hashes, id)
+    }
+    fn get(&self, id: &str) -> Option<&Arc<NodeRecord>> {
+        self.entries.find(self.hash(id), |(node, _)| node.id.as_ref() == id).map(|(node, _)| node)
+    }
+    fn position(&self, id: &str) -> Option<usize> {
+        self.entries.find(self.hash(id), |(node, _)| node.id.as_ref() == id).map(|(_, position)| *position)
+    }
+    fn insert(&mut self, record: Arc<NodeRecord>, position: usize) {
+        let hash = self.hash(&record.id);
+        if let Some(entry) = self.entries.find_mut(hash, |(node, _)| node.id == record.id) {
+            *entry = (record, position);
+        } else {
+            let hashes = &self.hashes;
+            self.entries.insert_unique(hash, (record, position), |(node, _)| {
+                std::hash::BuildHasher::hash_one(hashes, node.id.as_ref())
+            });
+        }
+    }
+    fn remove(&mut self, id: &str) -> Option<(Arc<NodeRecord>, usize)> {
+        let hash = self.hash(id);
+        self.entries.find_entry(hash, |(node, _)| node.id.as_ref() == id).ok().map(|entry| entry.remove().0)
+    }
+    fn values(&self) -> impl Iterator<Item = &Arc<NodeRecord>> {
+        self.entries.iter().map(|(node, _)| node)
+    }
+    fn keys(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.values().map(|node| &node.id)
+    }
+    fn capacity(&self) -> usize { self.entries.capacity() }
+}
 
 const MAX_INTERNED_METADATA_BYTES: usize = 512;
 const MAX_METADATA_INTERN_BUCKETS: usize = 4096;
@@ -41,7 +83,7 @@ const INTERN_SHRINK_MAX_LEN: usize = 16;
 
 #[derive(Default)]
 struct MetadataInterner {
-    buckets: HashMap<u64, Vec<Weak<PackedProperties>>>,
+    buckets: HashMap<u64, Vec<Weak<MetadataBacking>>>,
     skipped_new_keys: usize,
 }
 
@@ -87,10 +129,10 @@ fn bounded_metadata_bytes(map: &Map<String, Value>) -> Option<Vec<u8>> {
     }
 }
 
-fn intern_packed_metadata(map: &Map<String, Value>) -> Result<Arc<PackedProperties>, String> {
+fn intern_packed_metadata(map: &Map<String, Value>) -> Result<Arc<MetadataBacking>, String> {
     PackedProperties::validate_map(map)?;
     let Some(canonical) = bounded_metadata_bytes(map) else {
-        return Ok(Arc::new(PackedProperties::new_validated(map)?));
+        return Ok(Arc::new(MetadataBacking::Packed(PackedProperties::new_validated(map)?)));
     };
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
@@ -100,13 +142,13 @@ fn intern_packed_metadata(map: &Map<String, Value>) -> Result<Arc<PackedProperti
     {
         return Ok(shared);
     }
-    let packed = Arc::new(PackedProperties::new_validated(map)?);
+    let packed = Arc::new(MetadataBacking::Packed(PackedProperties::new_validated(map)?));
     PACKED_METADATA_INTERN.with(|cell| cell.borrow_mut().insert(hash, &packed));
     Ok(packed)
 }
 
 impl MetadataInterner {
-    fn find(&mut self, hash: u64, canonical: &[u8]) -> Option<Arc<PackedProperties>> {
+    fn find(&mut self, hash: u64, canonical: &[u8]) -> Option<Arc<MetadataBacking>> {
         let entries = self.buckets.get_mut(&hash)?;
         entries.retain(|entry| entry.strong_count() > 0);
         entries.iter().filter_map(Weak::upgrade).find(|existing| {
@@ -115,7 +157,7 @@ impl MetadataInterner {
         })
     }
 
-    fn insert(&mut self, hash: u64, packed: &Arc<PackedProperties>) {
+    fn insert(&mut self, hash: u64, packed: &Arc<MetadataBacking>) {
         let has_bucket = self.buckets.contains_key(&hash);
         if !has_bucket && self.buckets.len() >= MAX_METADATA_INTERN_BUCKETS {
             self.skipped_new_keys += 1;
@@ -147,11 +189,11 @@ impl MetadataInterner {
         hash: u64,
         canonical: &[u8],
         packed: PackedProperties,
-    ) -> Arc<PackedProperties> {
+    ) -> Arc<MetadataBacking> {
         if let Some(existing) = self.find(hash, canonical) {
             return existing;
         }
-        let result = Arc::new(packed);
+        let result = Arc::new(MetadataBacking::Packed(packed));
         self.insert(hash, &result);
         result
     }
@@ -162,26 +204,37 @@ impl MetadataInterner {
 /// to the old opaque metadata map. Preserve that edge of the old snapshot API
 /// by retaining only over-depth metadata maps in a shared fallback.
 #[derive(Clone, Debug)]
-enum PackedMetadata {
-    Packed(Arc<PackedProperties>),
-    Deep(Arc<Map<String, Value>>),
+enum MetadataBacking {
+    Packed(PackedProperties),
+    Deep(Map<String, Value>),
 }
+
+#[derive(Clone, Debug)]
+struct PackedMetadata(Arc<MetadataBacking>);
 
 impl PackedMetadata {
     fn new(map: &Map<String, Value>) -> Result<Self, String> {
         match intern_packed_metadata(map) {
-            Ok(value) => Ok(Self::Packed(value)),
-            Err(error) if error == "property nesting exceeds storage limit" => {
-                Ok(Self::Deep(Arc::new(map.clone())))
-            }
+            Ok(value) => Ok(Self(value)),
+            Err(error) if error == "property nesting exceeds storage limit" =>
+                Ok(Self(Arc::new(MetadataBacking::Deep(map.clone())))),
             Err(error) => Err(error),
         }
     }
+    fn unpack(&self) -> Map<String, Value> { self.0.unpack() }
+    fn get(&self, key: &str) -> Option<Value> { self.0.get(key) }
+    fn get_path(&self, path: &[&str]) -> Option<Value> { self.0.get_path(path) }
+    fn stored_bytes(&self) -> usize { self.0.stored_bytes() }
+    fn packed_backing(&self) -> Option<&Arc<MetadataBacking>> {
+        matches!(self.0.as_ref(), MetadataBacking::Packed(_)).then_some(&self.0)
+    }
+}
 
+impl MetadataBacking {
     fn unpack(&self) -> Map<String, Value> {
         match self {
             Self::Packed(value) => value.unpack(),
-            Self::Deep(value) => value.as_ref().clone(),
+            Self::Deep(value) => value.clone(),
         }
     }
 
@@ -224,12 +277,7 @@ impl PackedMetadata {
         }
     }
 
-    fn packed_backing(&self) -> Option<&Arc<PackedProperties>> {
-        match self {
-            Self::Packed(value) => Some(value),
-            Self::Deep(_) => None,
-        }
-    }
+
 }
 
 /// The three JSON states needed by snapshot fields: omitted, explicit null,
@@ -245,20 +293,49 @@ enum Slot<T> {
 struct NodeRecord {
     id: Arc<str>,
     class_name: Arc<str>,
-    name: Slot<Arc<str>>,
-    parent: Slot<Arc<str>>,
-    properties_present: bool,
-    properties_null: bool,
+    name: Option<Arc<str>>,
+    parent: Option<Arc<str>>,
+    flags: u8,
     properties: PackedProperties,
     // Encodes the received metadata object into the same compact COW backing
     // used for properties. Large per-node origin and attribute maps otherwise
     // allocate a separate JSON tree for every replicated instance.
     metadata: PackedMetadata,
     // Internal provenance for runtime projection; intentionally not serialized.
-    created_sequence: Option<u64>,
+    created_sequence: u64,
+}
+
+const NAME_PRESENT: u8 = 1;
+const PARENT_PRESENT: u8 = 2;
+const PROPERTIES_PRESENT: u8 = 4;
+const PROPERTIES_NULL: u8 = 8;
+const CREATED_SEQUENCE_PRESENT: u8 = 16;
+
+impl<T> Slot<T> {
+    fn into_value(self) -> Option<T> { if let Self::Value(value) = self { Some(value) } else { None } }
 }
 
 impl NodeRecord {
+    fn name_slot(&self) -> Slot<&Arc<str>> {
+        match self.name.as_ref() {
+            Some(value) => Slot::Value(value),
+            None if self.flags & NAME_PRESENT != 0 => Slot::Null,
+            None => Slot::Missing,
+        }
+    }
+    fn parent_slot(&self) -> Slot<&Arc<str>> {
+        match self.parent.as_ref() {
+            Some(value) => Slot::Value(value),
+            None if self.flags & PARENT_PRESENT != 0 => Slot::Null,
+            None => Slot::Missing,
+        }
+    }
+    fn set_name(&mut self, name: Slot<Arc<str>>) {
+        if matches!(name, Slot::Missing) { self.flags &= !NAME_PRESENT; }
+        else { self.flags |= NAME_PRESENT; }
+        self.name = name.into_value();
+    }
+
     fn parse(value: &Value, pool: &mut InternPool) -> Result<Self, String> {
         Self::parse_with_shared(value, pool, None)
     }
@@ -308,15 +385,20 @@ impl NodeRecord {
             metadata.insert(key.clone(), value);
         }
         Ok(Self {
-            id: pool.get(&id),
+            // Node IDs are unique. Sharing the record/order Arc is enough;
+            // a weak interner bucket per leaf costs more than it can save.
+            // Parent strings, class names and names still use the interner.
+            id: Arc::from(id.as_str()),
             class_name: pool.get(&class_name),
-            name,
-            parent,
-            properties_present,
-            properties_null,
+            flags: u8::from(!matches!(name, Slot::Missing)) * NAME_PRESENT
+                | u8::from(!matches!(parent, Slot::Missing)) * PARENT_PRESENT
+                | u8::from(properties_present) * PROPERTIES_PRESENT
+                | u8::from(properties_null) * PROPERTIES_NULL,
+            name: name.into_value(),
+            parent: parent.into_value(),
             properties,
             metadata: PackedMetadata::new(&metadata)?,
-            created_sequence: None,
+            created_sequence: 0,
         })
     }
 
@@ -329,10 +411,7 @@ impl NodeRecord {
     }
 
     fn parent_id(&self) -> Option<&str> {
-        match &self.parent {
-            Slot::Value(id) => Some(id),
-            _ => None,
-        }
+        self.parent.as_deref()
     }
 
     fn set_property(&mut self, key: &str, value: Value) -> Result<(), String> {
@@ -346,8 +425,7 @@ impl NodeRecord {
         shared: Option<&SharedPayloadResolver<'_>>,
     ) -> Result<(), String> {
         self.properties.set_with_shared(key, value, shared)?;
-        self.properties_present = true;
-        self.properties_null = false;
+        self.flags = (self.flags | PROPERTIES_PRESENT) & !PROPERTIES_NULL;
         Ok(())
     }
 
@@ -358,8 +436,7 @@ impl NodeRecord {
         shared: Option<&SharedPayloadResolver<'_>>,
     ) -> Result<(), String> {
         self.properties.set_ref_with_shared(key, value, shared)?;
-        self.properties_present = true;
-        self.properties_null = false;
+        self.flags = (self.flags | PROPERTIES_PRESENT) & !PROPERTIES_NULL;
         Ok(())
     }
 
@@ -371,8 +448,7 @@ impl NodeRecord {
     ) -> Result<(), String> {
         self.properties
             .set_shared_payload(key, payload, force_bytes)?;
-        self.properties_present = true;
-        self.properties_null = false;
+        self.flags = (self.flags | PROPERTIES_PRESENT) & !PROPERTIES_NULL;
         Ok(())
     }
 
@@ -381,13 +457,14 @@ impl NodeRecord {
             return Ok(());
         }
         self.properties.set_shared_payloads(values)?;
-        self.properties_present = true;
-        self.properties_null = false;
+        self.flags = (self.flags | PROPERTIES_PRESENT) & !PROPERTIES_NULL;
         Ok(())
     }
 
     fn set_parent(&mut self, parent: Slot<Arc<str>>) {
-        self.parent = parent;
+        if matches!(parent, Slot::Missing) { self.flags &= !PARENT_PRESENT; }
+        else { self.flags |= PARENT_PRESENT; }
+        self.parent = parent.into_value();
     }
 
     fn to_json(&self) -> Value {
@@ -397,7 +474,7 @@ impl NodeRecord {
             "class_name".into(),
             Value::String(self.class_name.to_string()),
         );
-        match &self.name {
+        match self.name_slot() {
             Slot::Missing => {}
             Slot::Null => {
                 object.insert("name".into(), Value::Null);
@@ -406,7 +483,7 @@ impl NodeRecord {
                 object.insert("name".into(), Value::String(name.to_string()));
             }
         }
-        match &self.parent {
+        match self.parent_slot() {
             Slot::Missing => {}
             Slot::Null => {
                 object.insert("parent".into(), Value::Null);
@@ -415,8 +492,8 @@ impl NodeRecord {
                 object.insert("parent".into(), Value::String(parent.to_string()));
             }
         }
-        if self.properties_present {
-            if self.properties_null {
+        if self.flags & PROPERTIES_PRESENT != 0 {
+            if self.flags & PROPERTIES_NULL != 0 {
                 object.insert("properties".into(), Value::Null);
             } else {
                 let values = self.properties.unpack();
@@ -451,9 +528,9 @@ fn interned_string_bytes(value: &Arc<str>, seen: &mut HashSet<*const ()>) -> usi
     }
 }
 
-fn slot_string_bytes(value: &Slot<Arc<str>>, seen: &mut HashSet<*const ()>) -> usize {
+fn slot_string_bytes(value: &Option<Arc<str>>, seen: &mut HashSet<*const ()>) -> usize {
     match value {
-        Slot::Value(value) => interned_string_bytes(value, seen),
+        Some(value) => interned_string_bytes(value, seen),
         _ => 0,
     }
 }
@@ -470,7 +547,7 @@ struct InternPool {
 
 #[derive(Default)]
 struct InternPoolState {
-    buckets: HashMap<u64, VecDeque<InternedString>>,
+    buckets: HashMap<u64, InternBucket>,
     // Round-robin hash queue contains each current bucket once. This avoids a
     // full HashMap sweep during ordinary lookups.
     prune_order: VecDeque<u64>,
@@ -483,6 +560,48 @@ struct InternedString {
     // Logical payload length lets the scheduler react to a few large transient
     // strings without dereferencing an expired weak pointer.
     payload_bytes: usize,
+}
+
+// A hash normally has one string. Keep that weak entry inline; allocate a
+// collision queue only when there are actually two different strings.
+#[derive(Default)]
+struct InternBucket {
+    first: Option<InternedString>,
+    rest: Option<Box<VecDeque<InternedString>>>,
+}
+impl InternBucket {
+    fn len(&self) -> usize { usize::from(self.first.is_some()) + self.rest.as_ref().map_or(0, |v| v.len()) }
+    fn is_empty(&self) -> bool { self.first.is_none() }
+    fn capacity(&self) -> usize { usize::from(self.first.is_some()) + self.rest.as_ref().map_or(0, |v| v.capacity()) }
+    fn iter(&self) -> impl Iterator<Item = &InternedString> { self.first.iter().chain(self.rest.iter().flat_map(|v| v.iter())) }
+    fn push_back(&mut self, entry: InternedString) {
+        if self.first.is_none() { self.first = Some(entry); }
+        else { self.rest.get_or_insert_with(|| Box::new(VecDeque::new())).push_back(entry); }
+    }
+    fn pop_front(&mut self) -> Option<InternedString> {
+        let result = self.first.take();
+        if let Some(rest) = self.rest.as_mut() { self.first = rest.pop_front(); }
+        self.drop_empty_tail();
+        result
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&InternedString) -> bool) {
+        if self.first.as_ref().is_some_and(|entry| !keep(entry)) { self.first = None; }
+        if let Some(rest) = self.rest.as_mut() {
+            rest.retain(&mut keep);
+            if self.first.is_none() { self.first = rest.pop_front(); }
+        }
+        self.drop_empty_tail();
+    }
+    fn drop_empty_tail(&mut self) {
+        if self.rest.as_ref().is_some_and(|rest| rest.is_empty()) { self.rest = None; }
+    }
+    fn shrink_to_fit(&mut self) {
+        if let Some(rest) = self.rest.as_mut() { rest.shrink_to_fit(); }
+        self.drop_empty_tail();
+    }
+    fn heap_bytes(&self) -> usize {
+        self.rest.as_ref().map_or(0, |rest| size_of::<VecDeque<InternedString>>() + rest.capacity() * size_of::<InternedString>())
+    }
 }
 
 impl InternPool {
@@ -521,7 +640,7 @@ impl InternPool {
         state
             .buckets
             .entry(hash)
-            .or_insert_with(|| VecDeque::with_capacity(1))
+            .or_default()
             .push_back(InternedString {
                 weak: Arc::downgrade(&value),
                 payload_bytes: value.len(),
@@ -597,7 +716,7 @@ impl InternPoolState {
 
     #[cfg(test)]
     fn weak_stats(&self) -> (usize, usize, usize, usize) {
-        let total = self.buckets.values().map(VecDeque::len).sum();
+        let total = self.buckets.values().map(InternBucket::len).sum();
         let expired_entries = self
             .buckets
             .values()
@@ -613,13 +732,46 @@ impl InternPoolState {
     }
 }
 
+// Copy-on-write in small chunks: receipt of one node must not copy a full
+// world's ordering vector while VM/Actor views retain an earlier revision.
+#[derive(Clone, Default)]
+struct ReceiptOrder {
+    chunks: Vec<Arc<Vec<Option<Arc<str>>>>>,
+    len: usize,
+}
+impl ReceiptOrder {
+    const CHUNK: usize = 256;
+    fn len(&self) -> usize { self.len }
+    fn iter(&self) -> impl Iterator<Item = &Option<Arc<str>>> {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+    fn push(&mut self, id: Option<Arc<str>>) {
+        if self.len % Self::CHUNK == 0 {
+            self.chunks.push(Arc::new(Vec::with_capacity(Self::CHUNK)));
+        }
+        let chunk = Arc::make_mut(self.chunks.last_mut().expect("receipt chunk exists"));
+        // Vec::clone preserves length rather than spare capacity. Reserve once
+        // so subsequent appends do not repeatedly grow a just-copied chunk.
+        if chunk.capacity() < Self::CHUNK { chunk.reserve_exact(Self::CHUNK - chunk.len()); }
+        chunk.push(id);
+        self.len += 1;
+    }
+    fn get_mut(&mut self, position: usize) -> Option<&mut Option<Arc<str>>> {
+        if position >= self.len { return None; }
+        Arc::make_mut(&mut self.chunks[position / Self::CHUNK]).get_mut(position % Self::CHUNK)
+    }
+    fn storage_bytes(&self) -> usize {
+        self.chunks.capacity() * size_of::<Arc<Vec<Option<Arc<str>>>>>()
+            + self.chunks.iter().map(|chunk| size_of::<Vec<Option<Arc<str>>>>() + 2 * size_of::<usize>() + chunk.capacity() * size_of::<Option<Arc<str>>>()).sum::<usize>()
+    }
+}
+
 #[derive(Clone)]
 struct WorldData {
     sequence: u64,
     metadata: Arc<BTreeMap<Arc<str>, Arc<Value>>>,
     shards: Vec<Arc<NodeMap>>,
-    order: Arc<Vec<Option<Arc<str>>>>,
-    order_positions: Vec<Arc<HashMap<Arc<str>, usize>>>,
+    order: Arc<ReceiptOrder>,
     events: Arc<Vec<Arc<Value>>>,
     node_count: usize,
 }
@@ -629,9 +781,8 @@ impl WorldData {
         Self {
             sequence: 0,
             metadata: Arc::new(BTreeMap::new()),
-            shards: (0..SHARD_COUNT).map(|_| Arc::new(HashMap::new())).collect(),
-            order: Arc::new(Vec::new()),
-            order_positions: (0..SHARD_COUNT).map(|_| Arc::new(HashMap::new())).collect(),
+            shards: (0..SHARD_COUNT).map(|_| Arc::new(NodeMap::default())).collect(),
+            order: Arc::new(ReceiptOrder::default()),
             events: Arc::new(Vec::new()),
             node_count: 0,
         }
@@ -649,31 +800,31 @@ impl WorldData {
 
     fn insert(&mut self, node: NodeRecord) {
         let index = Self::shard_index(&node.id);
-        let is_new = self.get(&node.id).is_none();
-        let shard = Arc::make_mut(&mut self.shards[index]);
-        if is_new {
+        let existing = self.shards[index].position(&node.id);
+        let position = if let Some(position) = existing {
+            position
+        } else {
             self.node_count += 1;
             let position = self.order.len();
             Arc::make_mut(&mut self.order).push(Some(node.id.clone()));
-            Arc::make_mut(&mut self.order_positions[index]).insert(node.id.clone(), position);
-        }
-        shard.insert(node.id.clone(), Arc::new(node));
+            position
+        };
+        Arc::make_mut(&mut self.shards[index]).insert(Arc::new(node), position);
     }
 
     fn replace_record(&mut self, record: NodeRecord) {
         let index = Self::shard_index(&record.id);
-        Arc::make_mut(&mut self.shards[index]).insert(record.id.clone(), Arc::new(record));
+        let position = self.shards[index].position(&record.id).expect("replaced world record exists");
+        Arc::make_mut(&mut self.shards[index]).insert(Arc::new(record), position);
     }
 
     fn remove(&mut self, id: &str) -> bool {
         let index = Self::shard_index(id);
         let removed = Arc::make_mut(&mut self.shards[index]).remove(id);
-        let Some(record) = removed else { return false };
+        let Some((record, position)) = removed else { return false };
         self.node_count = self.node_count.saturating_sub(1);
-        if let Some(position) = Arc::make_mut(&mut self.order_positions[index]).remove(id) {
-            if let Some(slot) = Arc::make_mut(&mut self.order).get_mut(position) {
-                *slot = None;
-            }
+        if let Some(slot) = Arc::make_mut(&mut self.order).get_mut(position) {
+            *slot = None;
         }
         drop(record);
         true
@@ -685,7 +836,7 @@ impl WorldData {
             .shards
             .iter()
             .map(|shard| {
-                shard.capacity() * size_of::<(Arc<str>, Arc<NodeRecord>)>()
+                shard.capacity() * size_of::<(Arc<NodeRecord>, usize)>()
                     + shard
                         .values()
                         .map(|node| {
@@ -705,12 +856,7 @@ impl WorldData {
             .sum::<usize>();
         size_of::<Self>()
             + self.shards.len() * size_of::<Arc<NodeMap>>()
-            + self.order.capacity() * size_of::<Option<Arc<str>>>()
-            + self
-                .order_positions
-                .iter()
-                .map(|shard| shard.capacity() * size_of::<(Arc<str>, usize)>())
-                .sum::<usize>()
+            + self.order.storage_bytes()
             + self.events.capacity() * size_of::<Arc<Value>>()
             + nodes
             + metadata
@@ -786,7 +932,7 @@ impl WorldStore {
         delta: &Value,
         shared: Option<&SharedPayloadResolver<'_>>,
     ) -> Result<(), String> {
-        self.apply_delta_internal(delta, shared, &[])
+        self.apply_delta_internal(delta, shared, &[], &[])
     }
 
     pub(crate) fn apply_compact_delta(
@@ -795,7 +941,14 @@ impl WorldStore {
         shared: Option<&SharedPayloadResolver<'_>>,
         compact_properties: &[CompactSharedProperty],
     ) -> Result<(), String> {
-        self.apply_delta_internal(delta, shared, compact_properties)
+        self.apply_delta_internal(delta, shared, compact_properties, &[])
+    }
+
+    pub(crate) fn apply_compact_delta_with_creates(
+        &mut self, delta: &Value, shared: Option<&SharedPayloadResolver<'_>>,
+        properties: &[CompactSharedProperty], creates: &[CompactCreatedProperties],
+    ) -> Result<(), String> {
+        self.apply_delta_internal(delta, shared, properties, creates)
     }
 
     fn apply_delta_internal(
@@ -803,6 +956,7 @@ impl WorldStore {
         delta: &Value,
         shared: Option<&SharedPayloadResolver<'_>>,
         compact_properties: &[CompactSharedProperty],
+        created_properties: &[CompactCreatedProperties],
     ) -> Result<(), String> {
         let envelope = delta.as_object().ok_or("world delta must be an object")?;
         if envelope.get("version").and_then(Value::as_u64) != Some(REQUIRED_VERSION)
@@ -837,6 +991,12 @@ impl WorldStore {
                 return Err("duplicate compact shared-property binding".into());
             }
         }
+        let mut creates = HashMap::with_capacity(created_properties.len());
+        for binding in created_properties {
+            if creates.insert(binding.action_index, binding).is_some() {
+                return Err("duplicate compact create binding".into());
+            }
+        }
         let mut last_action_sequence = self.data.sequence;
         for (action_index, action) in actions.iter().enumerate() {
             let object = action
@@ -848,6 +1008,7 @@ impl WorldStore {
                 .ok_or("world delta action sequence must be an unsigned integer")?;
             if sequence <= self.data.sequence {
                 compact_by_action.retain(|(index, _), _| *index != action_index);
+                creates.remove(&action_index);
                 continue;
             }
             if sequence <= last_action_sequence || sequence > target_sequence {
@@ -865,6 +1026,19 @@ impl WorldStore {
                     let node_value = object.get("node").ok_or("create action node is missing")?;
                     let mut node =
                         NodeRecord::parse_with_shared(node_value, &mut self.pool, shared)?;
+                    if let Some(binding) = creates.remove(&action_index) {
+                        let headers = node_value.get("properties").and_then(Value::as_object)
+                            .ok_or("compact create properties header must be an object")?;
+                        for (key,value) in headers {
+                            if binding.properties.get(key).as_ref() != Some(value) {
+                                return Err("compact create property header differs from backing".into());
+                            }
+                        }
+                        node.properties = if crate::lightweight::enabled() {
+                            PackedProperties::new(&crate::lightweight::filter_map(&binding.properties.unpack()))?
+                        } else { binding.properties.as_ref().clone() };
+                        node.flags = (node.flags | PROPERTIES_PRESENT) & !PROPERTIES_NULL;
+                    }
                     if let Some(properties) =
                         node_value.get("properties").and_then(Value::as_object)
                     {
@@ -883,7 +1057,8 @@ impl WorldStore {
                         }
                         node.set_shared_properties(shared_values)?;
                     }
-                    node.created_sequence = Some(sequence);
+                    node.created_sequence = sequence;
+                    node.flags |= CREATED_SEQUENCE_PRESENT;
                     let action_id = match object.get("id") {
                         Some(value) => {
                             let id = required_string(Some(value), "create id")?;
@@ -898,6 +1073,25 @@ impl WorldStore {
                         if existing.class_name != node.class_name {
                             return Err(format!("replicated instance {action_id:?} changed class"));
                         }
+                    }
+                    let attributes = crate::received_attributes::creation(
+                        node.property("AttributesReplicate").as_ref(),
+                        next.get(&action_id).is_none()
+                            && node_value.get("attributes_known").is_none()
+                            && node_value["received_creation_complete"] == Value::Bool(true),
+                    );
+                    let tags = crate::received_tags::creation(
+                        node.property("Tags").as_ref(),
+                        next.get(&action_id).is_none()
+                            && node_value.get("collection_tags_known").is_none()
+                            && node_value.get("collection_tags").is_none()
+                            && node_value["received_creation_complete"] == Value::Bool(true),
+                    );
+                    if !attributes.is_empty() || !tags.is_empty() {
+                        let mut metadata = node.metadata.unpack();
+                        metadata.extend(attributes);
+                        metadata.extend(tags);
+                        node.metadata = PackedMetadata::new(&metadata)?;
                     }
                     next.insert(node);
                     if next.node_count > MAX_NODES {
@@ -924,7 +1118,7 @@ impl WorldStore {
                             "Parent" => {
                                 changed.set_parent(parse_parent_slot(value, &mut self.pool)?)
                             }
-                            "Name" => changed.name = parse_name_slot(value, &mut self.pool)?,
+                            "Name" => changed.set_name(parse_name_slot(value, &mut self.pool)?),
                             _ => {
                                 if let Some((payload, force_bytes)) =
                                     compact_by_action.remove(&(action_index, key.as_str()))
@@ -936,10 +1130,33 @@ impl WorldStore {
                             }
                         }
                     }
+                    // Motion and mass projections need input revisions to
+                    // expire old observations. Stamp only these dependencies;
+                    // unrelated properties need no new per-field metadata.
+                    let revision_keys: Vec<_> = fields.keys().filter(|key| matches!(key.as_str(),
+                        "CFrame" | "ReplicationPV" | "Position" | "Orientation" | "Rotation"
+                        | "AssemblyLinearVelocity" | "Velocity" | "AssemblyAngularVelocity" | "RotVelocity"
+                        | "Mass" | "Size" | "size" | "Shape" | "Material" | "MaterialVariant"
+                        | "CustomPhysicalProperties" | "CurrentPhysicalProperties"
+                        | "CenterOfMass" | "AssemblyMass" | "AssemblyCenterOfMass"
+                        | "Anchored" | "Massless" | "RootPriority" | "Name" | "WalkSpeed" | "Gravity"
+                        | "Parent" | "NetworkOwnerV3" | "PhysicsRepRootPart" | "PhysicsRepRootRef" | "AssemblyRootPart"
+                    )).collect();
                     if object.contains_key("attribute_snapshot")
+                        || fields.contains_key("AttributesReplicate")
+                        || fields.contains_key("Tags")
                         || object.contains_key("tag_snapshot")
+                        || !revision_keys.is_empty()
                     {
                         let mut metadata = changed.metadata.unpack();
+                        if fields.contains_key("AttributesReplicate") {
+                            metadata.extend(crate::received_attributes::snapshot(
+                                &changed.property("AttributesReplicate").unwrap_or(Value::Null)));
+                        }
+                        if fields.contains_key("Tags") {
+                            metadata.extend(crate::received_tags::snapshot(
+                                &changed.property("Tags").unwrap_or(Value::Null)));
+                        }
                         if let Some(value) = object.get("attribute_snapshot") {
                             let fields = value
                                 .as_object()
@@ -953,6 +1170,16 @@ impl WorldStore {
                                 value.as_object().ok_or("tag snapshot must be an object")?;
                             for (key, value) in fields {
                                 metadata.insert(key.clone(), value.clone());
+                            }
+                        }
+                        if !revision_keys.is_empty() {
+                            let revisions = metadata.entry("property_revisions")
+                                .or_insert_with(|| Value::Object(Map::new()));
+                            if revisions.is_null() { *revisions = Value::Object(Map::new()); }
+                            let revisions = revisions.as_object_mut()
+                                .ok_or("property_revisions must be an object")?;
+                            for key in revision_keys {
+                                revisions.insert(key.clone(), Value::from(sequence));
                             }
                         }
                         changed.metadata = PackedMetadata::new(&metadata)?;
@@ -1013,6 +1240,9 @@ impl WorldStore {
         }
         if !compact_by_action.is_empty() {
             return Err("compact shared-property binding did not match an action field".into());
+        }
+        if !creates.is_empty() {
+            return Err("compact create binding did not match an action".into());
         }
         next.sequence = target_sequence;
         self.data = Arc::new(next);
@@ -1147,7 +1377,7 @@ impl WorldStore {
             "layout_packed_value_bytes":packed_value_layout_bytes(),
             "layout_packed_metadata_bytes":size_of::<PackedMetadata>(),
             "layout_node_record_bytes":size_of::<NodeRecord>(),
-            "layout_metadata_backing_arc_bytes":size_of::<Arc<PackedProperties>>(),
+            "layout_metadata_backing_arc_bytes":size_of::<Arc<MetadataBacking>>(),
             "metadata_intern_max_canonical_bytes":MAX_INTERNED_METADATA_BYTES})
     }
 
@@ -1272,10 +1502,7 @@ impl WorldView {
         self.node(id)?.property(key)
     }
     pub fn name(&self, id: &str) -> Option<&str> {
-        match &self.node(id)?.name {
-            Slot::Value(name) => Some(name),
-            _ => None,
-        }
+        self.node(id)?.name.as_deref()
     }
     pub fn parent(&self, id: &str) -> Option<&str> {
         self.node(id)?.parent_id()
@@ -1301,7 +1528,7 @@ impl WorldView {
         if key == "Name" {
             let name = parse_name_slot(&value, &mut InternPool::default())?;
             let mut record = self.node(id).ok_or("view node not found")?.clone();
-            record.name = name;
+            record.set_name(name);
             self.overlay.insert(record.id.clone(), Arc::new(record));
             return Ok(());
         }
@@ -1314,7 +1541,7 @@ impl WorldView {
     fn reparent_value(&mut self, id: &str, value: &Value) -> Result<(), String> {
         let parent = parse_parent_slot(value, &mut InternPool::default())?;
         let mut record = self.node(id).ok_or("view node not found")?.clone();
-        record.parent = parent;
+        record.set_parent(parent);
         self.overlay.insert(record.id.clone(), Arc::new(record));
         Ok(())
     }
@@ -1444,6 +1671,9 @@ pub enum ReadOnlyField<T> {
 pub struct ReadOnlyNode(Arc<NodeRecord>);
 
 impl ReadOnlyNode {
+    /// Share the immutable identity without allocating another string.
+    pub fn shared_id(&self) -> Arc<str> { self.0.id.clone() }
+
     pub fn id(&self) -> &str {
         &self.0.id
     }
@@ -1454,11 +1684,11 @@ impl ReadOnlyNode {
 
     /// Receipt sequence of the create action, or None for initial snapshot nodes.
     pub fn created_sequence(&self) -> Option<u64> {
-        self.0.created_sequence
+        (self.0.flags & CREATED_SEQUENCE_PRESENT != 0).then_some(self.0.created_sequence)
     }
 
     pub fn name(&self) -> ReadOnlyField<&str> {
-        match &self.0.name {
+        match self.0.name_slot() {
             Slot::Missing => ReadOnlyField::Missing,
             Slot::Null => ReadOnlyField::Null,
             Slot::Value(value) => ReadOnlyField::Value(value),
@@ -1466,7 +1696,7 @@ impl ReadOnlyNode {
     }
 
     pub fn parent(&self) -> ReadOnlyField<&str> {
-        match &self.0.parent {
+        match self.0.parent_slot() {
             Slot::Missing => ReadOnlyField::Missing,
             Slot::Null => ReadOnlyField::Null,
             Slot::Value(value) => ReadOnlyField::Value(value),
@@ -1474,9 +1704,9 @@ impl ReadOnlyNode {
     }
 
     pub fn properties(&self) -> ReadOnlyField<Map<String, Value>> {
-        if !self.0.properties_present {
+        if self.0.flags & PROPERTIES_PRESENT == 0 {
             ReadOnlyField::Missing
-        } else if self.0.properties_null {
+        } else if self.0.flags & PROPERTIES_NULL != 0 {
             ReadOnlyField::Null
         } else {
             ReadOnlyField::Value(self.0.properties.unpack())
@@ -1484,9 +1714,9 @@ impl ReadOnlyNode {
     }
 
     pub fn properties_len(&self) -> ReadOnlyField<usize> {
-        if !self.0.properties_present {
+        if self.0.flags & PROPERTIES_PRESENT == 0 {
             ReadOnlyField::Missing
-        } else if self.0.properties_null {
+        } else if self.0.flags & PROPERTIES_NULL != 0 {
             ReadOnlyField::Null
         } else {
             ReadOnlyField::Value(self.0.properties.len())
@@ -1642,10 +1872,10 @@ fn estimate_value(value: &Value) -> usize {
 fn collect_strings(node: &NodeRecord, seen: &mut HashSet<*const ()>) {
     seen.insert(Arc::as_ptr(&node.id) as *const ());
     seen.insert(Arc::as_ptr(&node.class_name) as *const ());
-    if let Slot::Value(value) = &node.name {
+    if let Some(value) = &node.name {
         seen.insert(Arc::as_ptr(value) as *const ());
     }
-    if let Slot::Value(value) = &node.parent {
+    if let Some(value) = &node.parent {
         seen.insert(Arc::as_ptr(value) as *const ());
     }
     // Metadata keys now live in the compact per-node packed buffer, not the
@@ -1660,21 +1890,12 @@ impl InternPool {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state
-            .buckets
-            .values()
-            .flat_map(|entries| entries.iter())
-            .map(|entry| {
-                size_of::<InternedString>()
-                    + if entry.weak.strong_count() == 0 {
-                        entry.payload_bytes
-                    } else {
-                        0
-                    }
-            })
-            .sum::<usize>()
-            + state.buckets.len() * size_of::<(u64, VecDeque<InternedString>)>()
-            + state.prune_order.len() * size_of::<u64>()
+        state.buckets.values().map(|bucket| {
+            bucket.heap_bytes() + bucket.iter().filter(|entry| entry.weak.strong_count() == 0)
+                .map(|entry| entry.payload_bytes).sum::<usize>()
+        }).sum::<usize>()
+            + state.buckets.capacity() * size_of::<(u64, InternBucket)>()
+            + state.prune_order.capacity() * size_of::<u64>()
     }
 }
 
@@ -1684,6 +1905,36 @@ mod tests {
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../../tests/fixtures/world_snapshot.json")).unwrap()
+    }
+
+    #[test]
+    fn receipt_order_keeps_old_views_stable_across_chunks_and_recreation() {
+        let nodes: Vec<Value> = (0..1025).map(|i| serde_json::json!({"id":format!("item-{i}"),"class_name":"Folder","name":format!("Item {i}"),"parent":null,"properties":{}})).collect();
+        let mut store = WorldStore::from_snapshot(&serde_json::json!({"version":1,"sequence":0,"nodes":nodes})).unwrap();
+        let old = store.view();
+        let original = old.to_snapshot();
+        store.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":4,"actions":[
+            {"kind":"remove","sequence":1,"id":"item-255"},
+            {"kind":"remove","sequence":2,"id":"item-256"},
+            {"kind":"create","sequence":3,"node":{"id":"item-255","class_name":"Folder","name":"recreated","parent":null,"properties":{}}},
+            {"kind":"set","sequence":4,"id":"item-1024","fields":{"Name":"last"}}
+        ]})).unwrap();
+        let current = store.to_snapshot();
+        let ids: Vec<&str> = current["nodes"].as_array().unwrap().iter().map(|n|n["id"].as_str().unwrap()).collect();
+        let mut expected: Vec<String> = (0..1025).filter(|i|*i!=255 && *i!=256).map(|i|format!("item-{i}")).collect();
+        expected.push("item-255".into());
+        assert_eq!(ids, expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(old.to_snapshot(), original);
+        assert_eq!(store.view().name("item-1024"), Some("last"));
+        assert_eq!(store.view().name("item-255"), Some("recreated"));
+        // A staged edit followed by an invalid action must not leak into either revision.
+        let before = store.to_snapshot();
+        assert!(store.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":6,"actions":[
+            {"kind":"remove","sequence":5,"id":"item-512"},
+            {"kind":"unsupported","sequence":6}
+        ]})).is_err());
+        assert_eq!(store.to_snapshot(), before);
+        assert_eq!(old.to_snapshot(), original);
     }
 
     #[test]
@@ -2296,7 +2547,7 @@ mod tests {
             serde_json::json!({"Null":null,"Large":"x".repeat(512)}),
         )]);
         let packed = PackedMetadata::new(&packed_map).unwrap();
-        assert!(matches!(&packed, PackedMetadata::Packed(_)));
+        assert!(matches!(packed.0.as_ref(), MetadataBacking::Packed(_)));
         assert_eq!(packed.get_path(&["origins", "Null"]), Some(Value::Null));
         assert_eq!(
             packed.get_path(&["origins", "Large"]),
@@ -2317,7 +2568,7 @@ mod tests {
             ),
         ]);
         let deep = PackedMetadata::new(&deep_map).unwrap();
-        assert!(matches!(&deep, PackedMetadata::Deep(_)));
+        assert!(matches!(deep.0.as_ref(), MetadataBacking::Deep(_)));
         assert_eq!(deep.get_path(&["origins", "Null"]), Some(Value::Null));
         assert_eq!(
             deep.get_path(&["origins", "Count"]),
@@ -2334,10 +2585,7 @@ mod tests {
         let mut duplicate_map = negative_zero.as_object().unwrap().clone();
         let first = PackedMetadata::new(negative_zero.as_object().unwrap()).unwrap();
         let second = PackedMetadata::new(&duplicate_map).unwrap();
-        let (first_backing, second_backing) = match (&first, &second) {
-            (PackedMetadata::Packed(first), PackedMetadata::Packed(second)) => (first, second),
-            _ => panic!("small metadata should use packed backing"),
-        };
+        let (first_backing, second_backing) = (first.packed_backing().unwrap(), second.packed_backing().unwrap());
         assert!(Arc::ptr_eq(first_backing, second_backing));
         assert_eq!(
             first.get_path(&["origins", "Value"]),
@@ -2530,7 +2778,7 @@ mod tests {
         assert_eq!(profile["layout_node_record_bytes"], size_of::<NodeRecord>());
         assert_eq!(
             profile["layout_metadata_backing_arc_bytes"],
-            size_of::<Arc<PackedProperties>>()
+            size_of::<Arc<MetadataBacking>>()
         );
         assert_eq!(profile["metadata_duplicate_backing_references"], 1);
         assert!(profile["metadata_unique_backing_stored_bytes"]
@@ -2705,10 +2953,9 @@ mod tests {
             updated["nodes"][0]["origins"],
             before["nodes"][0]["origins"]
         );
-        assert_eq!(
-            updated["nodes"][0]["property_revisions"],
-            before["nodes"][0]["property_revisions"]
-        );
+        let mut revisions = before["nodes"][0]["property_revisions"].clone();
+        revisions["Anchored"] = serde_json::json!(3);
+        assert_eq!(updated["nodes"][0]["property_revisions"], revisions);
         assert_eq!(
             updated["nodes"][0]["attributes"],
             serde_json::json!({"new":7})
@@ -2874,4 +3121,50 @@ mod tests {
             .unwrap();
         assert_eq!(store.len(), 1);
     }
+    #[test]
+    fn equal_walk_speed_receipts_advance_only_the_speed_revision() {
+        let mut store = WorldStore::from_snapshot(&serde_json::json!({"version":1,"sequence":1,"nodes":[
+            {"id":"h","class_name":"Humanoid","name":"Humanoid","properties":{"WalkSpeed":16}}
+        ]})).unwrap();
+        let before = store.view();
+        store.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":3,"actions":[
+            {"kind":"set","id":"h","sequence":2,"fields":{"WalkSpeed":16}},
+            {"kind":"set","id":"h","sequence":3,"fields":{"Health":90}}
+        ]})).unwrap();
+        let node = store.view().read_only_node("h").unwrap();
+        assert_eq!(node.metadata_field("property_revisions","WalkSpeed"), Some(serde_json::json!(2)));
+        assert!(node.metadata_field("property_revisions","Health").is_none());
+        assert!(before.read_only_node("h").unwrap().metadata_field("property_revisions","WalkSpeed").is_none());
+        let committed = store.to_snapshot();
+        assert!(store.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":5,"actions":[
+            {"kind":"set","id":"h","sequence":4,"fields":{"WalkSpeed":30}},
+            {"kind":"invalid","sequence":5}
+        ]})).is_err());
+        assert_eq!(store.to_snapshot(), committed);
+    }
+
+    #[test]
+    fn assembly_dependency_revisions_are_sparse_ordered_and_atomic() {
+        let mut store=WorldStore::from_snapshot(&serde_json::json!({"version":1,"sequence":0,"nodes":[
+            {"id":"p","class_name":"Part","name":"p","properties":{}}
+        ]})).unwrap();
+        let before=store.view();
+        store.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":3,"actions":[
+            {"kind":"set","id":"p","sequence":1,"fields":{"Size":{"$vector3":[2,2,2]},"Anchored":false,"Massless":false,"RootPriority":0,"Name":"Body","Transparency":0.5}},
+            {"kind":"set","id":"p","sequence":2,"fields":{"Mass":8,"CenterOfMass":{"$vector3":[0,0,0]},"AssemblyMass":8,"AssemblyCenterOfMass":{"$vector3":[0,0,0]}}},
+            {"kind":"set","id":"p","sequence":3,"fields":{"Transparency":0.75}}
+        ]})).unwrap();
+        let snapshot=store.to_snapshot();
+        let revisions=&snapshot["nodes"][0]["property_revisions"];
+        for key in ["Size","Anchored","Massless","RootPriority","Name"] {assert_eq!(revisions[key],1);}
+        for key in ["Mass","CenterOfMass","AssemblyMass","AssemblyCenterOfMass"] {assert_eq!(revisions[key],2);}
+        assert!(revisions.get("Transparency").is_none());
+        assert!(before.read_only_node("p").unwrap().metadata_field("property_revisions","Size").is_none());
+        assert!(store.apply_delta(&serde_json::json!({"version":1,"delta":true,"sequence":5,"actions":[
+            {"kind":"set","id":"p","sequence":4,"fields":{"AssemblyMass":9}},
+            {"kind":"invalid","sequence":5}
+        ]})).is_err());
+        assert_eq!(store.to_snapshot(),snapshot);
+    }
+
 }

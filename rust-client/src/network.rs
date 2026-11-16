@@ -496,7 +496,7 @@ fn connect_socket_with_timeout(raw: &str, deadline_budget: Duration) -> Result<S
     }
     unreachable!()
 }
-fn operation(v: Value) -> Result<Value, String> {
+pub(crate) fn operation(v: Value) -> Result<Value, String> {
     operation_with_ws_timeout(v, WEBSOCKET_CONNECT_TIMEOUT)
 }
 
@@ -606,7 +606,7 @@ fn operation_with_ws_timeout(v: Value, websocket_timeout: Duration) -> Result<Va
                 .build();
             let mut request = agent
                 .request(method, url)
-                .set("User-Agent", "RobloxClientResearch/local");
+                .set("User-Agent", crate::EXECUTOR_USER_AGENT);
             if let Some(headers) = v["Headers"].as_object() {
                 if headers.len() > 64 {
                     return Err("too many HTTP headers".into());
@@ -1525,9 +1525,18 @@ mod tests {
                 .unwrap(),
             b"hi".to_vec()
         );
-        assert!(values
+        // A later poll has no messages of its own, so it reports `error`;
+        // only a batch containing both the message and failure uses
+        // `transport_error`. Both must retain the actual protocol failure.
+        let error = values
             .iter()
-            .any(|value| value["transport_error"].as_str().is_some()));
+            .find_map(|value| {
+                value["transport_error"]
+                    .as_str()
+                    .or_else(|| value["error"].as_str())
+            })
+            .expect("terminal protocol error was not delivered");
+        assert!(error.to_lowercase().contains("invalid opcode"), "{error}");
         assert!(!sockets().lock().unwrap().sockets.contains_key(&id));
 
         let (id, results) = poll_ready_after_frames(vec![0x83, 0x00]);

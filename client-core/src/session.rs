@@ -23,6 +23,7 @@ use std::{
 pub struct SessionDelta {
     compact: Value,
     shared: Vec<crate::packed_properties::CompactSharedProperty>,
+    creates: Vec<crate::packed_properties::CompactCreatedProperties>,
     eager: OnceLock<Value>,
 }
 
@@ -31,6 +32,7 @@ impl From<Value> for SessionDelta {
         Self {
             compact,
             shared: Vec::new(),
+            creates: Vec::new(),
             eager: OnceLock::new(),
         }
     }
@@ -61,6 +63,10 @@ impl SessionDelta {
             .and_then(|actions| actions.get(index))
             .ok_or("journal action missing")?
             .clone();
+        if let Some(binding) = self.creates.iter().find(|binding| binding.action_index == index) {
+            crate::replication::materialize_created_properties(&mut action, binding)
+                .map_err(|error| error.to_string())?;
+        }
         for binding in self
             .shared
             .iter()
@@ -78,7 +84,7 @@ impl SessionDelta {
         // Reserve for eager readers too, without expanding all values at once.
         self.shared
             .iter()
-            .fold(estimate_value(&self.compact), |bytes, binding| {
+            .fold(estimate_value(&self.compact).saturating_add(self.creates.iter().map(|binding| binding.eager_bytes.saturating_add(binding.properties.stored_bytes())).sum::<usize>()), |bytes, binding| {
                 bytes
                     .saturating_add(size_of::<crate::packed_properties::CompactSharedProperty>())
                     .saturating_add(binding.property.len())
@@ -92,7 +98,7 @@ impl SessionDelta {
 impl Deref for SessionDelta {
     type Target = Value;
     fn deref(&self) -> &Value {
-        if self.shared.is_empty() {
+        if self.shared.is_empty() && self.creates.is_empty() {
             return &self.compact;
         }
         self.eager.get_or_init(|| {
@@ -101,6 +107,10 @@ impl Deref for SessionDelta {
                 .get_mut("actions")
                 .and_then(Value::as_array_mut)
                 .expect("committed journal action array");
+            for binding in &self.creates {
+                crate::replication::materialize_created_properties(&mut actions[binding.action_index], binding)
+                    .expect("committed compact create binding");
+            }
             for binding in &self.shared {
                 crate::replication::materialize_shared_property(
                     &mut actions[binding.action_index],
@@ -121,9 +131,10 @@ impl serde::Serialize for SessionDelta {
 
 impl DerefMut for SessionDelta {
     fn deref_mut(&mut self) -> &mut Value {
-        if !self.shared.is_empty() {
+        if !self.shared.is_empty() || !self.creates.is_empty() {
             self.compact = <Self as Deref>::deref(self).clone();
             self.shared.clear();
+            self.creates.clear();
             self.eager = OnceLock::new();
         }
         &mut self.compact
@@ -210,6 +221,7 @@ impl From<JournalError> for SessionError {
 /// Mutable owner for a single local data-replication session.
 pub struct SessionCore {
     decoder: Option<ReplicationDecoder>,
+    instance_state: crate::instance_state::Receiver,
     world: Option<WorldStore>,
     journal: ReplayJournal<SessionRecord>,
     next_packet_sequence: u64,
@@ -225,6 +237,7 @@ impl SessionCore {
     pub fn with_limits(max_records: usize, max_bytes: usize) -> Result<Self, JournalError> {
         Ok(Self {
             decoder: None,
+            instance_state: crate::instance_state::Receiver::default(),
             world: None,
             journal: ReplayJournal::with_limits(max_records, max_bytes)?,
             next_packet_sequence: 1,
@@ -335,6 +348,36 @@ impl SessionCore {
         })
     }
 
+    pub fn set_instance_state_legacy_pv(&mut self, enabled: bool) {
+        self.instance_state.configure(enabled);
+    }
+
+    pub fn instance_state_report(&self) -> Value {
+        self.instance_state.report()
+    }
+
+    /// Unreliable movement shares the ordinary world's transaction sequence.
+    /// Malformed or stale datagrams are counted without ending the connection.
+    /// Journal failures leave both the world and timestamp fences unchanged.
+    pub fn ingest_instance_state(&mut self, payload: &[u8]) -> Result<Option<IngestOutcome>, SessionError> {
+        let (Some(decoder), Some(world)) = (self.decoder.as_ref(), self.world.clone()) else {
+            self.instance_state.unavailable();
+            return Ok(None);
+        };
+        let Some(mut prepared) = self.instance_state.prepare(payload, &decoder.schema, &world.view()) else {
+            self.rejected_packets = self.rejected_packets.saturating_add(1);
+            return Ok(None);
+        };
+        if prepared.records.is_empty() { return Ok(None); }
+        let transaction = decoder.instance_state_transaction(std::mem::take(&mut prepared.records))
+            .map_err(|error| SessionError::InvalidPacket(error.to_string()))?;
+        decoder.validate_commit(&transaction.packet)
+            .map_err(|error| SessionError::InvalidPacket(error.to_string()))?;
+        let outcome = self.commit_compact_transaction(161, transaction, &world)?;
+        self.instance_state.committed(prepared);
+        Ok(Some(outcome))
+    }
+
     fn ingest_replication(&mut self, payload: &[u8]) -> Result<IngestOutcome, SessionError> {
         let decoder = self.decoder.as_ref().ok_or(SessionError::SchemaRequired)?;
         let world = self.world.clone().ok_or(SessionError::GlobalsRequired)?;
@@ -358,10 +401,9 @@ impl SessionCore {
             let decoder = self.decoder.as_ref().ok_or(SessionError::SchemaRequired)?;
             let shared = decoder.shared_payload_resolver(&compact.packet);
             staged_world
-                .apply_compact_delta(
-                    &compact.packet.world_delta,
-                    Some(&shared),
-                    &compact.shared_properties,
+                .apply_compact_delta_with_creates(
+                    &compact.packet.world_delta, Some(&shared),
+                    &compact.shared_properties, &compact.created_properties,
                 )
                 .map_err(SessionError::InvalidWorld)?;
         }
@@ -369,6 +411,7 @@ impl SessionCore {
         // The staged apply has validated every placeholder and action index.
         let mut transaction = compact.packet;
         let shared = compact.shared_properties;
+        let creates = compact.created_properties;
         let packet_sequence = self.next_packet_sequence;
         let next_packet_sequence = packet_sequence
             .checked_add(1)
@@ -380,6 +423,7 @@ impl SessionCore {
             world_delta: SessionDelta {
                 compact: std::mem::take(&mut transaction.world_delta),
                 shared,
+                creates,
                 eager: OnceLock::new(),
             },
             events: std::mem::take(&mut transaction.events),
@@ -508,7 +552,7 @@ fn estimate_record(record: &SessionRecord) -> usize {
         .saturating_add(record.tags.len().saturating_mul(size_of::<i32>()))
 }
 
-fn estimate_value(value: &Value) -> usize {
+pub(crate) fn estimate_value(value: &Value) -> usize {
     match value {
         Value::Null => size_of::<Value>(),
         Value::Bool(_) => size_of::<Value>(),

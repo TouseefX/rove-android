@@ -5,7 +5,7 @@
 use crate::schema::Schema;
 use crate::wire::{decompress_bytes, decompress_stream, Reader, WireError};
 use crate::{
-    packed_properties::CompactSharedProperty,
+    packed_properties::{CompactSharedProperty, CompactCreatedProperties, PackedProperties},
     shared_payload::{digest_raw, SharedPayload},
 };
 use serde_json::{json, Map, Value};
@@ -50,6 +50,7 @@ pub struct PacketTransaction {
 pub(crate) struct CompactPacketTransaction {
     pub(crate) packet: PacketTransaction,
     pub(crate) shared_properties: Vec<CompactSharedProperty>,
+    pub(crate) created_properties: Vec<CompactCreatedProperties>,
 }
 
 impl CompactPacketTransaction {
@@ -60,6 +61,11 @@ impl CompactPacketTransaction {
             .get_mut("actions")
             .and_then(Value::as_array_mut)
             .ok_or_else(|| WireError::new("Compact transaction actions are invalid"))?;
+        for binding in self.created_properties {
+            let action = actions.get_mut(binding.action_index)
+                .ok_or_else(|| WireError::new("Compact create action is missing"))?;
+            materialize_created_properties(action, &binding)?;
+        }
         for binding in self.shared_properties {
             let action = actions
                 .get_mut(binding.action_index)
@@ -67,6 +73,27 @@ impl CompactPacketTransaction {
             materialize_shared_property(action, &binding)?;
         }
         Ok(self.packet)
+    }
+}
+
+pub(crate) fn materialize_created_properties(
+    action: &mut Value, binding: &CompactCreatedProperties,
+) -> Result<(), WireError> {
+    if action.get("kind").and_then(Value::as_str) != Some("create") {
+        return Err(WireError::new("Compact create binding has a different action kind"));
+    }
+    let properties = action.get_mut("node").and_then(|node| node.get_mut("properties"))
+        .filter(|properties| properties.is_object())
+        .ok_or_else(|| WireError::new("Compact create properties are missing"))?;
+    *properties = Value::Object(binding.properties.unpack());
+    Ok(())
+}
+
+fn has_pending_shared(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => values.contains_key("$shared_string") || values.values().any(has_pending_shared),
+        Value::Array(values) => values.iter().any(has_pending_shared),
+        _ => false,
     }
 }
 
@@ -184,6 +211,30 @@ impl ReplicationDecoder {
     }
     pub fn client_scope(&self) -> Option<u64> {
         self.client_scope
+    }
+
+    pub(crate) fn instance_state_transaction(
+        &self,
+        records: Vec<crate::instance_state::Record>,
+    ) -> Result<CompactPacketTransaction, WireError> {
+        let mut sequence = self.sequence;
+        let mut actions = Vec::with_capacity(records.len());
+        for record in records {
+            sequence = sequence.checked_add(1)
+                .ok_or_else(|| WireError::new("Replication sequence overflow"))?;
+            actions.push(json!({"kind":"set","sequence":sequence,
+                "id":record.id.ok_or_else(|| WireError::new("ISR target is null"))?,"fields":record.fields}));
+        }
+        Ok(CompactPacketTransaction {
+            packet: PacketTransaction {
+                world_delta: json!({"version":1,"delta":true,"sequence":sequence,"actions":actions}),
+                events: vec![], pings: vec![], tags: vec![], regions: vec![], metadata: vec![],
+                shared_additions: vec![], property_changes: vec![],
+                next_sequence: sequence, base_sequence: self.sequence,
+                base_generation: self.generation, next_region: self.last_region,
+            },
+            shared_properties: vec![], created_properties: vec![],
+        })
     }
     pub fn global_flags(&self) -> Option<&[bool]> {
         self.global_flags.as_deref()
@@ -368,6 +419,7 @@ impl ReplicationDecoder {
             shared_bytes: 0,
             compact_direct_properties,
             compact_property_keys: Vec::new(),
+            created_properties: Vec::new(),
         };
         let mut terminated = false;
         let mut items = 0usize;
@@ -497,6 +549,7 @@ impl ReplicationDecoder {
         Ok(CompactPacketTransaction {
             packet,
             shared_properties,
+            created_properties: decoder.created_properties,
         })
     }
 
@@ -540,6 +593,7 @@ struct PacketParser<'a> {
     shared_bytes: usize,
     compact_direct_properties: bool,
     compact_property_keys: Vec<CompactPropertyKey>,
+    created_properties: Vec<CompactCreatedProperties>,
 }
 
 struct CompactPropertyKey {
@@ -628,6 +682,31 @@ impl PacketParser<'_> {
         }
         let parent = key_to_value(read_key(r)?);
         let id = key_to_string(&Some(key));
+        // Packing one completed node avoids retaining an entire packet's
+        // expanded property trees. Forward nested shared values use the
+        // existing eager path until their bytes have been received.
+        let eager_bytes = std::mem::size_of::<Value>() + properties.iter()
+            .map(|(key,value)| key.len() + crate::session::estimate_value(value)).sum::<usize>();
+        if self.compact_direct_properties && eager_bytes >= 512
+            && !properties.values().any(has_pending_shared) {
+            let sequence = self.next_sequence.checked_add(1)
+                .ok_or_else(|| WireError::new("Replication sequence overflow"))?;
+            crate::runtime_snapshot::validate_normalized_node_values(&properties, None, Some(sequence))
+                .map_err(WireError::new)?;
+            let resolver = |bytes: &[u8]| {
+                let digest = digest_raw(bytes);
+                self.newly_shared.get(&digest).or_else(|| self.known_shared.get(&digest))
+                    .filter(|payload| payload.matches_exact(bytes)).cloned()
+            };
+            let packed = PackedProperties::new_with_shared(&properties, Some(&resolver))
+                .map_err(WireError::new)?;
+            self.created_properties.push(CompactCreatedProperties {
+                action_index: self.actions.len(), properties: Arc::new(packed), eager_bytes,
+            });
+            // Name is needed for header normalization. Shared placeholders
+            // keep their keys so staged binding validation remains exact.
+            properties.retain(|name,_| name == "Name" || pending_compact.contains_key(name));
+        }
         let node = json!({"id":id,"class_name":class.name,
             "parent":parent,"properties":Value::Object(properties),"origins":{},
             "received_creation_complete":true,
@@ -1721,7 +1800,7 @@ impl PacketParser<'_> {
     }
 }
 
-fn read_key(r: &mut Reader<'_>) -> Result<Option<(u64, u32)>, WireError> {
+pub(crate) fn read_key(r: &mut Reader<'_>) -> Result<Option<(u64, u32)>, WireError> {
     let scope = r.varuint(32)?;
     if scope == 0 {
         Ok(None)
@@ -1736,7 +1815,7 @@ fn read_key(r: &mut Reader<'_>) -> Result<Option<(u64, u32)>, WireError> {
         )))
     }
 }
-fn compact_position(r: &mut Reader<'_>) -> Result<[Value; 3], WireError> {
+pub(crate) fn compact_position(r: &mut Reader<'_>) -> Result<[Value; 3], WireError> {
     let b = r.u8()?;
     let sx = b & 4 != 0;
     let sy = b & 2 != 0;
@@ -1826,17 +1905,27 @@ fn decode_received_attribute(data: &[u8]) -> Result<Value, WireError> {
         return Ok(Value::Null);
     }
     let mut r = Reader::new(data);
+    let result = read_attribute_value(&mut r)?;
+    r.finish()?;
+    Ok(result)
+}
+
+pub(crate) fn read_attribute_value(r: &mut Reader<'_>) -> Result<Value, WireError> {
     let kind = r.u8()?;
     let result = match kind {
         2 => {
-            let size = r.count(65_536)?;
+            // Attribute strings use a fixed u32, unlike replication strings.
+            let size = r.u32()? as usize;
+            if size > 65_536 {
+                return Err(WireError::new("Attribute string exceeds limit"));
+            }
             let bytes = r.take(size)?;
             match std::str::from_utf8(bytes) {
                 Ok(text) => json!(text),
                 Err(_) => bytes_value(bytes),
             }
         }
-        3 => json!(read_bool(&mut r)?),
+        3 => json!(read_bool(r)?),
         4 => json!(r.i32()?),
         5 => {
             let n = r.f32()?;
@@ -1960,7 +2049,6 @@ fn decode_received_attribute(data: &[u8]) -> Result<Value, WireError> {
         }
         _ => return Err(WireError::new("Unsupported received attribute type")),
     };
-    r.finish()?;
     Ok(result)
 }
 fn key_to_value(key: Option<(u64, u32)>) -> Value {
@@ -2082,6 +2170,7 @@ mod tests {
             shared_bytes: 0,
             compact_direct_properties: false,
             compact_property_keys: Vec::new(),
+            created_properties: Vec::new(),
         }
     }
 
@@ -2113,6 +2202,70 @@ mod tests {
         bytes.push(0); // null parent scope
         bytes.push(0); // packet terminator
         bytes
+    }
+
+    #[test]
+    fn packed_create_properties_preserve_wire_journal_projection_and_rollback() {
+        use crate::{world::WorldStore,session::SessionCore};
+        let mut schema=schema(false);
+        for id in 0..33 {
+            schema.classes[0].properties.push(id);
+            schema.properties.push(PropertyDesc { id, class:0, name:if id==32 {"Source".into()} else {format!("Field{id}")},
+                type_id:if id==32 {46} else {11}, enum_id:None, lr_type:None });
+        }
+        schema.parent_property_id=33;
+        let shared=b"unchanged shared source bytes".repeat(100);
+        let digest=digest_raw(&shared);
+        let mut packet=vec![131,2,1];
+        packet.extend_from_slice(&7u32.to_le_bytes());
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        for id in 0..32u8 {
+            packet.push(id);
+            let value=if id==0 {-0.0f32} else if id==1 {f32::NAN} else {f32::from(id)/3.0};
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        packet.push(32);packet.extend_from_slice(&digest);packet.extend_from_slice(&[255,255]);
+        packet.extend_from_slice(&digest);packet.push(0);
+        append_varuint(shared.len() as u64,&mut packet);packet.extend_from_slice(&shared);
+        packet.extend_from_slice(&[0,0]);
+        let decoder=ReplicationDecoder::new(schema.clone());
+        let eager=decoder.packet(&packet).unwrap();
+        let compact=decoder.packet_compact(&packet).unwrap();
+        assert_eq!(compact.created_properties.len(),1);
+        assert_eq!(compact.shared_properties.len(),1);
+        assert_eq!(compact.packet.world_delta["actions"][0]["node"]["properties"].as_object().unwrap().len(),1);
+        assert_eq!(compact.clone().into_eager().unwrap().world_delta,eager.world_delta);
+        let empty=json!({"version":1,"sequence":0,"nodes":[]});
+        let mut expected=WorldStore::from_snapshot(&empty).unwrap();
+        expected.apply_delta(&eager.world_delta).unwrap();
+        let mut actual=WorldStore::from_snapshot(&empty).unwrap();
+        actual.apply_compact_delta_with_creates(&compact.packet.world_delta,None,
+            &compact.shared_properties,&compact.created_properties).unwrap();
+        assert_eq!(actual.to_snapshot(),expected.to_snapshot());
+        let before=actual.to_snapshot();
+        let mut bad=compact.created_properties.clone();bad.push(bad[0].clone());
+        assert!(actual.apply_compact_delta_with_creates(&compact.packet.world_delta,None,&compact.shared_properties,&bad).is_err());
+        assert_eq!(actual.to_snapshot(),before);
+        let mut session=SessionCore::with_schema(schema,32,1024*1024).unwrap();
+        session.ingest(&[129,0,0,0,0,0,0,0,1,0]).unwrap();
+        let view_before=session.world_view().unwrap();
+        session.ingest(&packet).unwrap();
+        let reader=session.retain(0).unwrap();
+        let rows=session.read_after(reader,0,8).unwrap();
+        let receipt=&rows[1].value;
+        assert_eq!(receipt.world_delta.lifecycle_actions().unwrap()[0]["node"]["properties"].as_object().unwrap().len(),1);
+        assert_eq!(*receipt.world_delta,eager.world_delta);
+        assert_eq!(serde_json::to_value(&receipt.world_delta).unwrap(),eager.world_delta);
+        assert_eq!(receipt.world_delta["actions"][0]["node"]["properties"]["Field0"].as_f64().unwrap().to_bits(),(-0.0f64).to_bits());
+        let mut normalizer=crate::runtime_delta::RuntimeDeltaNormalizer::new(session.schema().unwrap()).unwrap();
+        let post=session.world_view().unwrap();
+        let normalized=normalizer.normalize_for_shared_view_worker(&view_before,&post,receipt,false).unwrap();
+        assert_eq!(normalized.compact_create_ids,vec!["1:7"]);
+        assert_eq!(post.get_property("1:7","Field31"),expected.view().get_property("1:7","Field31"));
+        let mut editable=receipt.world_delta.clone();
+        editable["actions"][0]["node"]["properties"]["Field31"]=json!(999);
+        assert_eq!(receipt.world_delta["actions"][0]["node"]["properties"]["Field31"],eager.world_delta["actions"][0]["node"]["properties"]["Field31"]);
+        session.release(reader).unwrap();
     }
 
     fn append_varuint(mut value: u64, out: &mut Vec<u8>) {
@@ -2515,10 +2668,9 @@ mod tests {
         {
             let resolver = decoder.shared_payload_resolver(&compact.packet);
             compact_world
-                .apply_compact_delta(
-                    &compact.packet.world_delta,
-                    Some(&resolver),
-                    &compact.shared_properties,
+                .apply_compact_delta_with_creates(
+                    &compact.packet.world_delta, Some(&resolver),
+                    &compact.shared_properties, &compact.created_properties,
                 )
                 .unwrap();
         }
@@ -2635,10 +2787,9 @@ mod tests {
         let mut world = WorldStore::from_snapshot(&empty).unwrap();
         let resolver = decoder.shared_payload_resolver(&compact.packet);
         world
-            .apply_compact_delta(
-                &compact.packet.world_delta,
-                Some(&resolver),
-                &compact.shared_properties,
+            .apply_compact_delta_with_creates(
+                &compact.packet.world_delta, Some(&resolver),
+                &compact.shared_properties, &compact.created_properties,
             )
             .unwrap();
         assert_eq!(
@@ -2753,6 +2904,18 @@ mod tests {
                 "Python reference vector type {kind}"
             );
         }
+    }
+
+    #[test]
+    fn item_21_attribute_strings_use_fixed_u32_lengths() {
+        let mut decoder = ReplicationDecoder::new(schema(false));
+        let mut packet = vec![131,21,1];
+        packet.extend_from_slice(&7u32.to_le_bytes());
+        packet.extend_from_slice(&[1,b'x',8,2,3,0,0,0,b'h',b'e',b'y',0]);
+        let tx = decoder.packet(&packet).unwrap();
+        assert_eq!(tx.world_delta["actions"][0]["attribute_update"],json!({"name":"x","known":true,"value":"hey"}));
+        assert!(decode_received_attribute(&[2,3,b'h',b'e',b'y']).is_err());
+        assert!(decode_received_attribute(&[2,0,0,1,0,0]).is_err());
     }
 
     #[test]

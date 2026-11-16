@@ -13,6 +13,13 @@ const MAX_STEP_SECONDS: f64 = 0.25;
 const MAX_CATCH_UP_STEPS: usize = 256;
 const STEP_EPSILON: f64 = 1.0e-12;
 
+/// Callers validate finite, bounded components first. Preserve analog strength
+/// below one and cap diagonal/oversized input at the full horizontal speed.
+pub(crate) fn horizontal_input(direction: [f64; 3]) -> [f64; 3] {
+    let divisor = direction[0].hypot(direction[2]).max(1.0);
+    [direction[0] / divisor, 0.0, direction[2] / divisor]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec3 {
     x: f64,
@@ -149,7 +156,8 @@ impl MovementIntegrator {
     }
 
     pub fn set_direction(&mut self, direction: Vec3) {
-        self.direction = direction.horizontal_unit();
+        let [x, y, z] = horizontal_input(direction.components());
+        self.direction = Vec3 { x, y, z };
     }
 
     pub fn stop(&mut self) {
@@ -208,6 +216,21 @@ mod tests {
 
     fn integrator(speed: f64, step: f64, cap: usize) -> MovementIntegrator {
         MovementIntegrator::new(Vec3::zero(), speed, step, cap).unwrap()
+    }
+
+    #[test]
+    fn fractional_input_preserves_strength_through_fixed_step_integration() {
+        let mut movement = integrator(16.0, 0.01, 16);
+        movement.set_direction(vec3(0.3, 100.0, -0.4));
+        let velocity = movement.velocity().components();
+        assert!((velocity[0] - 4.8).abs() < 1e-12);
+        assert_eq!(velocity[1], 0.0);
+        assert!((velocity[2] + 6.4).abs() < 1e-12);
+        let report = movement.advance(0.1).unwrap();
+        assert!((report.position.components()[0] - 0.48).abs() < 1e-12);
+        assert!((report.position.components()[2] + 0.64).abs() < 1e-12);
+        movement.set_direction(vec3(0.0, 100.0, 0.0));
+        assert_eq!(movement.velocity(), Vec3::zero());
     }
 
     #[test]

@@ -17,9 +17,9 @@ use std::{
     fs::File,
     io::Read,
     path::Path,
-    sync::{Arc, Condvar, Mutex},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_SOURCE: usize = 100 * 1024 * 1024;
@@ -32,17 +32,24 @@ const QUEUE_RECORDS: usize = 256;
 // JSON. Bound that version backlog independently of the JSON byte allowance.
 const SHARED_QUEUE_RECORDS: usize = 4;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
+const LARGE_SHARED_BYTES: usize = 256 * 1024;
 
 pub struct RuntimeConfig {
     source: String,
     memory: u32,
+    pub(crate) pinned_session_code: bool,
+    animation_backend: Option<Arc<dyn crate::animation_assets::AnimationBackend>>,
+    pub(crate) dashboard: Option<crate::dashboard::DashboardControl>,
 }
 impl RuntimeConfig {
     #[cfg(test)]
     pub(crate) fn owned_fixture(source: &str) -> Self {
         Self {
             source: source.into(),
+            pinned_session_code: false,
             memory: 32,
+            animation_backend: None,
+            dashboard: None,
         }
     }
     pub fn from_file(path: &Path, memory: u32) -> Result<Self, String> {
@@ -62,7 +69,15 @@ impl RuntimeConfig {
             return Err("script exceeds 100 MiB".into());
         }
         let source = String::from_utf8(bytes).map_err(|_| "script must be UTF-8")?;
-        Ok(Self { source, memory })
+        Ok(Self { source, memory, pinned_session_code: false, animation_backend: None, dashboard: None })
+    }
+    pub fn interactive(memory: u32, dashboard: crate::dashboard::DashboardControl) -> Result<Self, String> {
+        if !(8..=512).contains(&memory) { return Err("Lua memory limit must be 8..512 MiB".into()); }
+        Ok(Self { source: String::new(), memory, pinned_session_code: false, animation_backend: None, dashboard: Some(dashboard) })
+    }
+    pub fn with_animation_backend(mut self, backend: Arc<dyn crate::animation_assets::AnimationBackend>) -> Self {
+        self.animation_backend = Some(backend);
+        self
     }
 }
 
@@ -71,23 +86,41 @@ enum Frame {
     Delta(Value),
     SharedInit(Value, SharedProjectedWorldView),
     SharedDelta(Value, SharedProjectedWorldView),
+    PackedShared { initialization: bool, bytes: Vec<u8>, view: SharedProjectedWorldView, charge: usize },
 }
 impl Frame {
-    fn value(&self) -> &Value {
+    fn charge(&self) -> usize {
         match self {
-            Self::Init(v) | Self::Delta(v) | Self::SharedInit(v, _) | Self::SharedDelta(v, _) => v,
+            Self::Init(v) | Self::Delta(v) | Self::SharedInit(v, _) | Self::SharedDelta(v, _) => estimated_bytes(v),
+            Self::PackedShared { charge, .. } => *charge,
         }
     }
     fn shared(&self) -> bool {
-        matches!(self, Self::SharedInit(..) | Self::SharedDelta(..))
+        matches!(self, Self::SharedInit(..) | Self::SharedDelta(..) | Self::PackedShared { .. })
     }
-    fn into_parts(self) -> (bool, Value, Option<SharedProjectedWorldView>) {
-        match self {
+    // Large queued headers do not need thousands of allocated JSON maps. Keep
+    // their exact JSON bytes until the VM owner is ready to apply the record.
+    fn pack(self, charge: usize) -> Result<Self, String> {
+        if charge < LARGE_SHARED_BYTES { return Ok(self); }
+        let (initialization, value, view) = match self {
+            Self::SharedInit(value, view) => (true, value, view),
+            Self::SharedDelta(value, view) => (false, value, view),
+            other => return Ok(other),
+        };
+        let bytes = serde_json::to_vec(&value).map_err(|_| "VM header encoding failed")?;
+        Ok(Self::PackedShared { initialization, bytes, view, charge })
+    }
+    fn into_parts(self) -> Result<(bool, Value, Option<SharedProjectedWorldView>), String> {
+        Ok(match self {
             Self::Init(value) => (true, value, None),
             Self::Delta(value) => (false, value, None),
             Self::SharedInit(value, view) => (true, value, Some(view)),
             Self::SharedDelta(value, view) => (false, value, Some(view)),
-        }
+            Self::PackedShared { initialization, bytes, view, .. } => {
+                let value = serde_json::from_slice(&bytes).map_err(|_| "VM header decoding failed")?;
+                (initialization, value, Some(view))
+            }
+        })
     }
 }
 struct Queued {
@@ -99,6 +132,7 @@ struct QueueState {
     records: VecDeque<Queued>,
     bytes: usize,
     peak_bytes: usize,
+    large_shared_inflight: bool,
     closed: bool,
     failed: bool,
 }
@@ -109,7 +143,7 @@ struct Mailbox {
 }
 impl Mailbox {
     fn push(&self, frame: Frame) -> Result<(), String> {
-        let charge = estimated_bytes(frame.value());
+        let charge = frame.charge();
         let record_limit = if frame.shared() {
             SHARED_QUEUE_RECORDS
         } else {
@@ -118,6 +152,7 @@ impl Mailbox {
         if charge > MAX_RECORD_BYTES {
             return Err("VM update exceeds bounded queue capacity".into());
         }
+        let frame = frame.pack(charge)?;
         let mut state = self.state.lock().map_err(|_| "VM queue poisoned")?;
         while !state.closed
             && !state.failed
@@ -152,13 +187,14 @@ impl Mailbox {
             return Ok(if state.closed { None } else { Some(vec![]) });
         }
         let first = state.records.pop_front().unwrap();
+        state.large_shared_inflight = first.frame.shared() && first.charge >= LARGE_SHARED_BYTES;
         state.bytes -= first.charge;
         let mut bytes = first.charge;
         let mut batch = vec![first.frame];
         while let Some(next) = state.records.front() {
             if batch.len() >= 64
                 || next.charge > BATCH_BYTES.saturating_sub(bytes)
-                || !mergeable(batch.last().unwrap(), &next.frame)
+                || !batchable(batch.last().unwrap(), &next.frame)
             {
                 break;
             }
@@ -169,6 +205,31 @@ impl Mailbox {
         }
         self.changed.notify_all();
         Ok(Some(batch))
+    }
+    fn next_shared_compatible(&self, delta: &Value) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|_| "VM queue poisoned")?;
+        Ok(!state.failed && delta.get("local_player").is_none()
+            && state.records.front().is_some_and(|next| {
+                matches!(&next.frame, Frame::SharedDelta(value, _)
+                    if value.get("local_player").is_none()
+                        && value.get("initial_replication_complete") == delta.get("initial_replication_complete"))
+            }))
+    }
+
+    fn wait_for_large_update(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| "VM queue poisoned")?;
+        while !state.closed && !state.failed && (state.large_shared_inflight
+            || state.records.iter().any(|record| record.frame.shared() && record.charge >= LARGE_SHARED_BYTES)) {
+            state = self.changed.wait(state).map_err(|_| "VM queue poisoned")?;
+        }
+        if state.closed || state.failed { return Err("VM owner stopped".into()); }
+        Ok(())
+    }
+    fn release_batch(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.large_shared_inflight = false;
+            self.changed.notify_all();
+        }
     }
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -187,6 +248,33 @@ impl Mailbox {
         result
     }
 }
+// Drain already queued receipts before another expensive Actor/frame step.
+// Only four immutable views remain queued; this does not enlarge that backlog.
+// The host separately bounds deferred notifications to 2048 rows / 4 MiB.
+#[derive(Default)]
+struct SharedDrainBudget {
+    started: Option<Instant>,
+    deferred: usize,
+}
+impl SharedDrainBudget {
+    fn permits(&self, now: Instant) -> bool {
+        self.deferred < 31 && self.started.is_none_or(|start| now.duration_since(start) < Duration::from_millis(32))
+    }
+    fn observe(&mut self, deferred: bool, now: Instant) {
+        if deferred {
+            self.started.get_or_insert(now);
+            self.deferred += 1;
+        } else {
+            *self = Self::default();
+        }
+    }
+}
+
+struct BatchCompletion<'a>(&'a Mailbox);
+impl Drop for BatchCompletion<'_> {
+    fn drop(&mut self) { self.0.release_batch(); }
+}
+
 fn estimated_bytes(value: &Value) -> usize {
     // Conservative queue accounting, not process RSS. No serialization copy.
     128 + match value {
@@ -212,6 +300,16 @@ fn mergeable(left: &Frame, right: &Frame) -> bool {
             .as_object()
             .is_some_and(|v| v.contains_key("local_player"))
         && a.get("initial_replication_complete") == b.get("initial_replication_complete")
+}
+fn batchable(left: &Frame, right: &Frame) -> bool {
+    if cfg!(feature = "rust-host") {
+        if let (Frame::SharedDelta(a, _), Frame::SharedDelta(b, _)) = (left, right) {
+            // Never combine identity/load barriers or a large packed receipt.
+            return a.get("local_player").is_none() && b.get("local_player").is_none()
+                && a.get("initial_replication_complete") == b.get("initial_replication_complete");
+        }
+    }
+    mergeable(left, right)
 }
 fn merge(frames: Vec<Frame>) -> Result<(Frame, usize), String> {
     let count = frames.len();
@@ -276,6 +374,14 @@ pub fn compact_snapshot(
 ) -> Result<usize, String> {
     if snapshot.get("sequence").and_then(Value::as_u64) != Some(view.sequence()) {
         return Err("VM snapshot and shared world revisions differ".into());
+    }
+    #[cfg(feature = "rust-host")]
+    if let Some(metadata) = snapshot.as_object_mut() {
+        // The shared projection already retains property types. These legacy
+        // C++ catalogs have no Rust host consumer; keep event signatures,
+        // which Rust interactions actually use, in the startup document.
+        metadata.remove("class_property_types");
+        metadata.remove("class_events");
     }
     let nodes = snapshot
         .get_mut("nodes")
@@ -393,9 +499,28 @@ struct PhysicsFeedbackQueue {
     coalesced: u64,
     deferred: u64,
     stale_character: u64,
+    move_to_events: VecDeque<(u64, String, Value)>,
+    move_to_cursor: u64,
 }
 impl PhysicsFeedbackQueue {
-    fn push(&mut self, sequence: u64, feedback: Value) {
+    fn push(&mut self, sequence: u64, mut feedback: Value) -> Result<(), String> {
+        if let Some(result) = feedback.get("move_to_result") {
+            let command = result["sequence"].as_u64().filter(|n| *n > 0)
+                .ok_or("Invalid physics MoveTo result sequence")?;
+            if !result["reached"].is_boolean() {
+                return Err("Invalid physics MoveTo result".into());
+            }
+            let humanoid = feedback["humanoid_id"].as_str().filter(|id| id.len() <= 1024)
+                .ok_or("Invalid physics MoveTo Humanoid")?;
+            if command > self.move_to_cursor {
+                if self.move_to_events.len() >= 256 {
+                    return Err("Physics completion event queue limit exceeded".into());
+                }
+                self.move_to_events.push_back((sequence, humanoid.into(), result.clone()));
+                self.move_to_cursor = command;
+            }
+            feedback.as_object_mut().unwrap().remove("move_to_result");
+        }
         self.submitted += 1;
         if self.next.is_none() {
             self.next = Some((sequence, feedback));
@@ -408,24 +533,58 @@ impl PhysicsFeedbackQueue {
             self.coalesced += u64::from(self.latest.is_some());
             self.latest = Some((sequence, feedback));
         }
+        Ok(())
     }
     fn take_ready(&mut self, sequence: u64) -> Option<Value> {
-        if self.latest.as_ref().is_some_and(|(minimum, _)| *minimum <= sequence) {
+        let item = if self.latest.as_ref().is_some_and(|(minimum, _)| *minimum <= sequence) {
             // Both updates are visible; only the newest full pose is needed.
             self.coalesced += u64::from(self.next.take().is_some());
-            return self.latest.take().map(|(_, feedback)| feedback);
-        }
-        if self.next.as_ref().is_some_and(|(minimum, _)| *minimum <= sequence) {
-            let item = self.next.take().map(|(_, feedback)| feedback);
+            self.latest.take()
+        } else if self.next.as_ref().is_some_and(|(minimum, _)| *minimum <= sequence) {
+            let item = self.next.take();
             self.next = self.latest.take();
-            return item;
+            item
+        } else {
+            self.deferred += u64::from(self.next.is_some());
+            None
+        };
+        let (revision, mut feedback) = item?;
+        let mut events = Vec::new();
+        while self.move_to_events.front().is_some_and(|(minimum, _, _)| *minimum <= revision) {
+            let (_, humanoid, result) = self.move_to_events.pop_front().unwrap();
+            // A replaced character must not receive its predecessor's event.
+            if feedback["humanoid_id"].as_str() == Some(humanoid.as_str()) {
+                events.push(result);
+            }
         }
-        self.deferred += u64::from(self.next.is_some());
-        None
+        if !events.is_empty() {
+            feedback["move_to_finished"] = Value::Array(events);
+        }
+        Some(feedback)
+    }
+}
+
+/// One session's latest validated time-sync echo. NaN means no measurement;
+/// cloning shares the current session, while a fresh default starts unknown.
+#[derive(Clone)]
+pub(crate) struct SessionRtt(Arc<AtomicU64>);
+impl Default for SessionRtt {
+    fn default() -> Self { Self(Arc::new(AtomicU64::new(f64::NAN.to_bits()))) }
+}
+impl SessionRtt {
+    pub(crate) fn observe(&self, millis: f64) {
+        if millis.is_finite() && millis >= 0.0 {
+            self.0.store(millis.to_bits(), Ordering::Relaxed);
+        }
+    }
+    fn statistics(&self) -> Option<Value> {
+        let millis = f64::from_bits(self.0.load(Ordering::Relaxed));
+        millis.is_finite().then(|| json!({"network_rtt_ms":millis,"source":"session_time_sync_echo"}))
     }
 }
 
 pub struct LiveRuntime {
+    stage_timings: std::collections::BTreeMap<&'static str, crate::stage_timing::StageTiming>,
     mailbox: Arc<Mailbox>,
     owner: Option<JoinHandle<Value>>,
     normalizer: Option<RuntimeDeltaNormalizer>,
@@ -445,8 +604,16 @@ pub struct LiveRuntime {
     physics_feedback: Arc<Mutex<PhysicsFeedbackQueue>>,
     remote_server: Arc<Mutex<RemoteServerState>>,
     integrity: Arc<Mutex<Option<SessionIntegrityObserver>>>,
+    session_rtt: SessionRtt,
+    last_session_stats: Option<Value>,
 }
 impl LiveRuntime {
+    /// Backpressure before decoding the next packet prevents two large JSON
+    /// transactions from overlapping across the world and VM owner threads.
+    pub(crate) fn wait_for_update_capacity(&self) -> Result<(), String> {
+        self.mailbox.wait_for_large_update()
+    }
+
     pub fn new(config: RuntimeConfig, job_id: String) -> Result<Self, String> {
         Self::with_optional_integrity(config, job_id, None)
     }
@@ -504,6 +671,7 @@ impl LiveRuntime {
             })
             .map_err(|_| "VM owner thread unavailable")?;
         Ok(Self {
+            stage_timings: Default::default(),
             mailbox,
             owner: Some(owner),
             normalizer: None,
@@ -523,8 +691,11 @@ impl LiveRuntime {
             physics_feedback,
             remote_server,
             integrity,
+            session_rtt: SessionRtt::default(),
+            last_session_stats: None,
         })
     }
+    pub(crate) fn session_rtt(&self) -> SessionRtt { self.session_rtt.clone() }
     pub fn set_integrity(&mut self, observer: SessionIntegrityObserver) {
         if let Ok(mut slot) = self.integrity.lock() {
             *slot = Some(observer);
@@ -551,14 +722,13 @@ impl LiveRuntime {
             .map_err(|_| "Physics feedback queue poisoned")?;
         // Transport-only receipts advance the raw world sequence without a
         // VM delta. Waiting for that skipped sequence would strand feedback.
-        pending.push(sequence.min(self.last_submitted_sequence), feedback);
-        Ok(())
+        pending.push(sequence.min(self.last_submitted_sequence), feedback)
     }
 
     pub fn take_movement_intents(&mut self) -> Result<Vec<Value>, String> {
         self.movement_intents
             .lock()
-            .map(|mut intents| std::mem::take(&mut *intents))
+            .map(|mut intents| crate::movement_queue::take_batch(&mut intents))
             .map_err(|_| "Movement intent queue poisoned".into())
     }
     pub fn take_remote_server_calls(&mut self) -> Result<Vec<Value>, String> {
@@ -595,6 +765,8 @@ impl LiveRuntime {
         ready: bool,
         local_player: Option<String>,
     ) -> Result<(), String> {
+        let ready = ready && local_player.is_some();
+        let session_stats = self.session_rtt.statistics();
         if !self.initialized {
             if record.packet_kind != 129 {
                 return Err("first VM world record must be globals".into());
@@ -610,6 +782,7 @@ impl LiveRuntime {
                     class_parents: Some(&self.class_parents),
                     local_player: local_player.as_deref(),
                     initial_replication_complete: Some(ready),
+                    session_stats: session_stats.as_ref(),
                     ..Default::default()
                 },
             )?;
@@ -635,6 +808,7 @@ impl LiveRuntime {
             let post_view = core
                 .world_view()
                 .ok_or("updated shared world unavailable")?;
+            let stage = Instant::now();
             let normalized = self
                 .normalizer
                 .as_mut()
@@ -645,10 +819,15 @@ impl LiveRuntime {
                     record,
                     ready,
                 )?;
+            self.stage_timings.entry("normalize").or_default().observe(stage);
             // The delta and post-view own everything the VM needs. Release
             // the old root before compaction or a bounded mailbox wait.
             drop(previous);
             let mut delta = normalized.worker_delta;
+            let stats_changed = session_stats != self.last_session_stats;
+            if stats_changed {
+                if let Some(stats) = &session_stats { delta["session_stats"] = stats.clone(); }
+            }
             if self.local_player != local_player {
                 delta["local_player"] = json!(local_player);
             }
@@ -661,6 +840,7 @@ impl LiveRuntime {
             if delta["actions"].as_array().is_some_and(Vec::is_empty)
                 && ready == self.initial_ready
                 && self.local_player == local_player
+                && !stats_changed
             {
                 self.no_op_receipts += 1;
                 return Ok(());
@@ -678,10 +858,13 @@ impl LiveRuntime {
             let sequence = delta["sequence"]
                 .as_u64()
                 .ok_or("VM delta sequence missing")?;
+            let stage = Instant::now();
             self.mailbox.push(Frame::SharedDelta(delta, view))?;
+            self.stage_timings.entry("mailbox_push").or_default().observe(stage);
             self.last_submitted_sequence = sequence;
         }
         self.local_player = local_player;
+        self.last_session_stats = session_stats;
         self.initial_ready = ready;
         self.submitted += 1;
         Ok(())
@@ -695,6 +878,7 @@ impl LiveRuntime {
             .join()
             .unwrap_or_else(|_| json!({"ok":false,"error":"VM owner join failed"}));
         report["updates_submitted"] = json!(self.submitted);
+        report["delivery_stage_timings"] = json!(self.stage_timings);
         report["no_op_receipts"] = json!(self.no_op_receipts);
         report["compacted_received_nodes"] = json!(self.compacted_nodes);
         report
@@ -784,12 +968,14 @@ fn forward_movement_intents(
     vm: &mut Runtime,
     movement_intents: &Arc<Mutex<Vec<Value>>>,
 ) -> Result<(), String> {
-    forward_remote_values(
-        vm,
-        movement_intents,
-        "movement intent",
-        Runtime::take_movement_intents,
-    )
+    let mut pending = movement_intents
+        .lock()
+        .map_err(|_| "Movement intent queue poisoned")?;
+    // Leave overflow on the VM owner until the physics thread makes room.
+    // Draining first and then checking capacity would lose accepted commands.
+    let available = crate::movement_queue::PENDING_LIMIT.saturating_sub(pending.len());
+    pending.extend(vm.take_movement_intents_up_to(available));
+    Ok(())
 }
 
 fn forward_remote_server_calls(
@@ -886,8 +1072,11 @@ fn vm_loop(
     // otherwise terminates legitimate work such as cloning a live Instance.
     // This VM thread remains separate from the network receive owner.
     const VM_SLICE_MS: u32 = 50;
+    let mut dashboard = config.dashboard.clone().map(crate::dashboard::DashboardPump::new);
     let source_hash = format!("{:x}", Sha256::digest(config.source.as_bytes()));
     let mut source = Some(config.source);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut script_catalog = crate::script_catalog::Catalog::new(root, config.pinned_session_code);
     let mut vm = None::<Runtime>;
     let mut job = None;
     let mut submission_error = None;
@@ -899,12 +1088,20 @@ fn vm_loop(
     let mut shared_frames = 0;
     let mut physics_feedback_applied = 0u64;
     let mut sequence = 0u64;
+    let mut shared_drain = SharedDrainBudget::default();
+    let mut stage_timings = std::collections::BTreeMap::<&'static str, crate::stage_timing::StageTiming>::new();
     let result = (|| -> Result<(), String> {
         while let Some(batch) = queue.next()? {
+            crate::memory_maintenance::between_batches();
+            let _completion = (!batch.is_empty()).then(|| BatchCompletion(queue));
             if let Some(vm) = vm.as_mut() {
+                if let Some(dashboard) = dashboard.as_mut() {
+                    dashboard.poll(vm, ready && bound)?;
+                }
                 if let Some(response) =
                     deliver_remote_server_results(vm, remote_server, VM_SLICE_MS)?
                 {
+                    shared_drain.observe(false, Instant::now());
                     observe_integrity_response(integrity, &response);
                     forward_remote_io(
                         vm,
@@ -921,6 +1118,7 @@ fn vm_loop(
                     physics_feedback_applied +=
                         u64::from(deliver_physics_feedback(vm, physics_feedback, sequence)?);
                     let response = vm.poll_with_budget(VM_SLICE_MS)?;
+                    shared_drain.observe(false, Instant::now());
                     observe_integrity_response(integrity, &response);
                     forward_remote_io(
                         vm,
@@ -933,8 +1131,23 @@ fn vm_loop(
                 }
                 continue;
             }
-            let (frame, count) = merge(batch)?;
-            let (initialization, value, view) = frame.into_parts();
+            let frames = if batch.first().is_some_and(|f| matches!(f, Frame::SharedDelta(..))) {
+                batch.into_iter().map(|frame| (frame, 1)).collect::<Vec<_>>()
+            } else { vec![merge(batch)?] };
+            let frame_count = frames.len();
+            for (frame_index, (frame, count)) in frames.into_iter().enumerate() {
+            let final_frame = frame_index + 1 == frame_count;
+            let continuable_shared = matches!(&frame, Frame::SharedDelta(..));
+            let (initialization, mut value, view) = frame.into_parts()?;
+            if let Some(view) = view.as_ref() {
+                if let Some(catalog) = script_catalog.update(view, &value, initialization)? {
+                    value["script_sources"] = catalog;
+                }
+            }
+            if initialization && config.pinned_session_code {
+                value["builtin_player_scripts"] = crate::runtime_sources::load_builtin_player_scripts(root)
+                    .map_err(|e|e.to_string())?;
+            }
             shared_frames += usize::from(view.is_some());
             if initialization {
                 let snapshot = value;
@@ -944,10 +1157,8 @@ fn vm_loop(
                 ready = snapshot["initial_replication_complete"] == true;
                 bound = snapshot["local_player"].is_string();
                 sequence = snapshot["sequence"].as_u64().unwrap_or(0);
-                vm = Some(match view.as_ref() {
-                    Some(view) => Runtime::new_with_shared_world(snapshot, config.memory, view)?,
-                    None => Runtime::new(snapshot, config.memory)?,
-                });
+                vm = Some(Runtime::with_animation_backend(snapshot, config.memory,
+                    config.animation_backend.clone().unwrap_or_else(crate::animation_assets::default_backend), view.as_ref())?);
                 initializations += 1;
             } else {
                 let delta = value;
@@ -959,13 +1170,23 @@ fn vm_loop(
                     .as_u64()
                     .ok_or("VM delta sequence missing")?;
                 let mut command = json!({"op":"update","timeout_ms":VM_SLICE_MS});
+                let more_shared = continuable_shared && delta.get("local_player").is_none()
+                    && (!final_frame || queue.next_shared_compatible(&delta)?);
+                if cfg!(feature = "rust-host") && more_shared && shared_drain.permits(Instant::now()) {
+                    command["defer_script_step"] = json!(true);
+                }
                 command["delta"] = delta;
                 let runtime = vm.as_mut().ok_or("VM update before initialization")?;
+                let stage = Instant::now();
                 let response = match view.as_ref() {
                     Some(view) => runtime.call_with_shared_world(command, view)?,
                     None => runtime.call(command)?,
                 };
-                observe_integrity_response(integrity, &response);
+                stage_timings.entry("vm_update").or_default().observe(stage);
+                shared_drain.observe(response["script_step_deferred"] == true, stage);
+                if response["script_step_deferred"] != true {
+                    observe_integrity_response(integrity, &response);
+                }
                 forward_remote_io(
                     vm.as_mut().unwrap(),
                     remote_client_replies,
@@ -982,12 +1203,13 @@ fn vm_loop(
                 physics_feedback,
                 sequence,
             )?);
-            if ready && bound {
+            if final_frame && ready && bound {
                 if let Some(source) = source.take() {
                     let mut command = json!({"op":"execute","timeout_ms":VM_SLICE_MS,
                         "resume_across_frames":true});
                     command["source"] = json!(source);
                     let response = vm.as_mut().unwrap().call(command)?;
+                    shared_drain.observe(false, Instant::now());
                     observe_integrity_response(integrity, &response);
                     forward_remote_io(
                         vm.as_mut().unwrap(),
@@ -1009,6 +1231,25 @@ fn vm_loop(
                     }
                 }
             }
+            }
+        }
+        // The last delta may leave the authored coroutine ready after its
+        // slice ends. Closing the receive queue must not discard that work.
+        // Drain only runnable work, with a bounded grace period; don't wait
+        // for timers, user input, or a server reply after the queue closes.
+        if let (Some(vm), Some(job)) = (vm.as_mut(), job) {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline
+                && vm.status(job).ok().is_some_and(|status| {
+                    status["completed"] != true && status["scheduler_state"] == "ready"
+                })
+            {
+                let response = vm.poll_with_budget(5)?;
+                successful(&response)?;
+                observe_integrity_response(integrity, &response);
+                forward_remote_io(vm, remote_client_replies, remote_server_events,
+                    movement_intents, remote_server)?;
+            }
         }
         Ok(())
     })();
@@ -1017,12 +1258,16 @@ fn vm_loop(
         "source_submitted":job.is_some(),"snapshot_initializations":initializations,"updates_applied":packets_applied,
         "shared_world_frames_applied":shared_frames,"physics_feedback_applied":physics_feedback_applied,
         "update_batches":batches,"last_applied_sequence":sequence,"initial_replication_complete":ready,
-        "local_player_bound":bound,"engine_logic_still_native":true});
+        "local_player_bound":bound,"engine_logic_still_native":!cfg!(feature = "rust-host"),
+        "engine_host":if cfg!(feature = "rust-host") { "rust" } else { "legacy_cpp" }});
+    report["script_catalog"] = script_catalog.report();
+    report["vm_stage_timings"] = json!(stage_timings);
     if let Ok(queue) = physics_feedback.lock() {
         report["physics_feedback_submitted"] = json!(queue.submitted);
         report["physics_feedback_coalesced"] = json!(queue.coalesced);
         report["physics_feedback_deferred"] = json!(queue.deferred);
         report["physics_feedback_stale_character"] = json!(queue.stale_character);
+        report["physics_move_to_events_pending"] = json!(queue.move_to_events.len());
         report["physics_feedback_pending"] = json!(usize::from(queue.next.is_some()) + usize::from(queue.latest.is_some()));
     }
     if let Some(vm) = vm.as_mut() {
@@ -1037,6 +1282,9 @@ fn vm_loop(
             report["script_result"] = error;
         }
         report["runtime"] = vm.summary();
+        // Preserve the bounded event history, including actual script test
+        // output. Process completion alone is not a compatibility result.
+        report["events"] = vm.events(0);
         report["remote_client_replies"] = json!(remote_client_replies.lock().unwrap().clone());
         vm.close();
     }
@@ -1050,7 +1298,135 @@ fn vm_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_echo_statistics_reach_luau_without_invented_defaults() {
+        use super::*;
+        let sample = SessionRtt::default();
+        let other_session = SessionRtt::default();
+        assert!(sample.statistics().is_none());
+        sample.observe(f64::NAN);
+        sample.observe(-1.0);
+        assert!(sample.statistics().is_none());
+        let mut vm = Runtime::new(json!({"version":1,"sequence":0,"nodes":[],"services":{}}),32).unwrap();
+        let initial = vm.execute_control("local s=stats(); ping=s.Network.ServerStatsItem['Data Ping']; assert(s.Network==s.Network); assert(ping:IsA('StatsItem')); assert(#s:GetChildren()==1); assert(not pcall(Instance.new,'StatsItem')); return pcall(function() return ping:GetValue() end)".into(),100).unwrap();
+        assert_eq!(initial["values"][0],false);
+        for millis in [28.375, 41.25] {
+            sample.observe(millis);
+            let delta = json!({"version":1,"delta":true,"sequence":0,"actions":[],"session_stats":sample.statistics().unwrap()});
+            successful(&vm.call(json!({"op":"update","timeout_ms":100,"delta":delta})).unwrap()).unwrap();
+            let result = vm.execute_control("return ping:GetValue(),ping:GetValueString(),#stats().Network.ServerStatsItem:GetChildren()".into(),100).unwrap();
+            assert_eq!(result["values"],json!([millis,format!("{millis:.3} ms"),1.]));
+        }
+        assert!(other_session.statistics().is_none());
+        assert_eq!(sample.clone().statistics(),sample.statistics());
+    }
+
+    #[test]
+    fn shared_drain_has_time_and_record_limits() {
+        use super::*;
+        let now = Instant::now();
+        let mut budget = SharedDrainBudget::default();
+        assert!(budget.permits(now));
+        for _ in 0..31 { budget.observe(true, now); }
+        assert!(!budget.permits(now));
+        budget.observe(false, now);
+        budget.observe(true, now);
+        assert!(budget.permits(now + Duration::from_millis(31)));
+        assert!(!budget.permits(now + Duration::from_millis(32)));
+        budget.observe(false, now + Duration::from_millis(32));
+        assert!(budget.permits(now + Duration::from_millis(32)));
+    }
+
+    #[test]
+    fn continuing_receive_drain_keeps_binding_barriers() {
+        use super::*;
+        let queue = Mailbox::default();
+        // An ordinary/non-shared record cannot continue a shared drain.
+        queue.push(Frame::Delta(json!({"sequence":2}))).unwrap();
+        assert!(!queue.next_shared_compatible(&json!({"sequence":1})).unwrap());
+        assert!(!queue.next_shared_compatible(&json!({"local_player":"1:2"})).unwrap());
+        queue.next().unwrap();
+        let view = fixture_shared_view(&json!({"version":1,"sequence":0,"nodes":[]}));
+        queue.push(Frame::SharedDelta(json!({"sequence":2,"actions":[]}),view.clone())).unwrap();
+        assert!(queue.next_shared_compatible(&json!({"sequence":1})).unwrap());
+        assert!(!queue.next_shared_compatible(&json!({"sequence":1,"initial_replication_complete":true})).unwrap());
+        queue.next().unwrap();
+        queue.push(Frame::SharedDelta(json!({"sequence":3,"local_player":"1:2"}),view.clone())).unwrap();
+        assert!(!queue.next_shared_compatible(&json!({"sequence":2})).unwrap());
+        queue.next().unwrap();
+        queue.push(Frame::SharedDelta(json!({"sequence":4,"large":"x".repeat(LARGE_SHARED_BYTES)}),view)).unwrap();
+        assert!(!queue.next_shared_compatible(&json!({"sequence":3})).unwrap());
+    }
+
     use super::*;
+    #[test]
+    fn movement_backpressure_preserves_commands_until_physics_drains_them() {
+        let snapshot = json!({"version":1,"sequence":0,
+            "services":{"Workspace":"workspace"},"nodes":[
+                {"id":"game","class_name":"DataModel","name":"Game","properties":{}},
+                {"id":"workspace","class_name":"Workspace","name":"Workspace","parent":"game","properties":{}},
+                {"id":"hum","class_name":"Humanoid","name":"Humanoid","parent":"workspace","properties":{}}
+            ]});
+        let view = fixture_shared_view(&snapshot);
+        let mut vm = Runtime::new_with_shared_world(snapshot, 32, &view).unwrap();
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..3 {
+            let result = vm.execute_control(
+                "local h=workspace.Humanoid; for i=1,200 do h:Move(Vector3.new(1,0,0)) end".into(),
+                100,
+            ).unwrap();
+            successful(&result).unwrap();
+            forward_movement_intents(&mut vm, &queue).unwrap();
+        }
+        assert_eq!(queue.lock().unwrap().len(), 512);
+        // This call used to drain the VM before reporting an overflow error.
+        forward_movement_intents(&mut vm, &queue).unwrap();
+        assert_eq!(queue.lock().unwrap().len(), 512);
+        let mut observed = crate::movement_queue::take_batch(&mut queue.lock().unwrap());
+        assert_eq!(observed.len(), 256);
+        forward_movement_intents(&mut vm, &queue).unwrap();
+        assert_eq!(queue.lock().unwrap().len(), 344);
+        let next = crate::movement_queue::take_batch(&mut queue.lock().unwrap());
+        assert_eq!(next.len(), 256);
+        observed.extend(next);
+        let last = crate::movement_queue::take_batch(&mut queue.lock().unwrap());
+        assert_eq!(last.len(), 88);
+        observed.extend(last);
+        assert_eq!(observed.len(), 600);
+        for (index, intent) in observed.iter().enumerate() {
+            assert_eq!(intent["sequence"], index + 1);
+            assert_eq!(intent["kind"], "Move");
+        }
+        assert!(vm.take_movement_intents().is_empty());
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dashboard_commands_reach_the_live_vm_owner() {
+        let control = crate::dashboard::DashboardControl::new();
+        let config = RuntimeConfig::interactive(32, control.clone()).unwrap();
+        let engine = LiveRuntime::new(config, "dashboard-fixture".into()).unwrap();
+        let mut snapshot: Value = serde_json::from_str(include_str!(
+            "../../tools/fixtures/rust-rewrite/compact/snapshot.json")).unwrap();
+        snapshot["initial_replication_complete"] = json!(true);
+        engine.mailbox.push(Frame::Init(snapshot)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !control.ready() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(control.ready(), "live VM did not accept dashboard commands");
+        control.execute("return 6*7, game:GetService('Players').LocalPlayer ~= nil".into()).unwrap();
+        let mut observed = false;
+        while !observed && Instant::now() < deadline {
+            observed = control.drain_events().iter().any(|event|
+                event["reply"]["values"] == json!([42.0, true]));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let report = engine.finish();
+        assert!(observed, "dashboard job never completed: {report}");
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(!control.ready());
+    }
     fn fixture_shared_view(snapshot: &Value) -> SharedProjectedWorldView {
         fixture_shared_store(&rove_client_core::world::WorldStore::from_snapshot(snapshot).unwrap())
     }
@@ -1163,18 +1539,61 @@ mod tests {
             done_tx.send(sender.push(next)).unwrap();
         });
         assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
-        assert_eq!(queue.next().unwrap().unwrap().len(), 1);
+        let applied = queue.next().unwrap().unwrap().len();
+        assert_eq!(applied, if cfg!(feature="rust-host") { SHARED_QUEUE_RECORDS } else {1});
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
             .unwrap();
         thread.join().unwrap();
         queue.close();
-        for _ in 0..SHARED_QUEUE_RECORDS {
+        for _ in 0..SHARED_QUEUE_RECORDS + 1 - applied {
             assert_eq!(queue.next().unwrap().unwrap().len(), 1);
         }
         assert!(queue.next().unwrap().is_none());
     }
+    #[test]
+    fn packed_headers_preserve_values_and_backpressure_until_application_finishes() {
+        let view = fixture_shared_view(&json!({"version":1,"sequence":1,"nodes":[]}));
+        let value = json!({"version":1,"delta":true,"sequence":1,"actions":[],
+            "text":"héllo\n\u{0000}".repeat(LARGE_SHARED_BYTES / 4),
+            "values":[-0.0,1.2345678901234567,u64::MAX,null,{"nested":[true,false]}]});
+        for initialization in [false, true] {
+            let frame = if initialization { Frame::SharedInit(value.clone(),view.clone()) }
+                else { Frame::SharedDelta(value.clone(),view.clone()) };
+            let charge = frame.charge();
+            let packed = frame.pack(charge).unwrap();
+            assert!(matches!(&packed, Frame::PackedShared { .. }));
+            assert_eq!(packed.charge(), charge, "packing must preserve conservative queue accounting");
+            let (initial, decoded, pinned) = packed.into_parts().unwrap();
+            assert_eq!(initial,initialization);
+            assert_eq!(decoded,value);
+            assert_eq!(decoded["values"][0].as_f64().unwrap().to_bits(),(-0.0f64).to_bits());
+            assert_eq!(pinned.unwrap().sequence(),1);
+        }
+        let queue = Arc::new(Mailbox::default());
+        queue.push(Frame::SharedDelta(value.clone(),view.clone())).unwrap();
+        let waiter = queue.clone();
+        let (tx,rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || { tx.send(waiter.wait_for_large_update()).unwrap(); });
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        let mut batch = queue.next().unwrap().unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err(), "popping a frame must not release the in-flight budget");
+        assert_eq!(batch.pop().unwrap().into_parts().unwrap().1,value);
+        drop(BatchCompletion(&queue));
+        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        worker.join().unwrap();
+        queue.push(Frame::SharedDelta(value,view)).unwrap();
+        let waiter = queue.clone();
+        let (tx,rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || { tx.send(waiter.wait_for_large_update()).unwrap(); });
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        queue.close();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        worker.join().unwrap();
+        assert_eq!(queue.next().unwrap().unwrap().len(),1,"close must preserve accepted frames");
+    }
+
     fn delta(sequence: u64) -> Frame {
         Frame::Delta(json!({"version":1,"delta":true,"sequence":sequence,
         "actions":[{"sequence":sequence,"kind":"set","id":"p","fields":{"Transparency":sequence}}]}))
@@ -1302,11 +1721,105 @@ mod tests {
     }
 
     #[test]
+    fn real_luau_move_to_arrival_and_timeout_flow_through_prediction_and_feedback() {
+        let snapshot = json!({"version":1,"sequence":1,"local_player":"1:2",
+            "services":{"Players":"1:1","Workspace":"1:4"},"nodes":[
+            {"id":"game","class_name":"DataModel","name":"Game","properties":{}},
+            {"id":"1:1","class_name":"Players","name":"Players","parent":"game","properties":{}},
+            {"id":"1:2","class_name":"Player","name":"Runner","parent":"1:1","properties":{"UserId":42,"Character":{"$ref":"1:3"}}},
+            {"id":"1:3","class_name":"Model","name":"Runner","parent":"1:4","properties":{"PrimaryPart":{"$ref":"1:6"}}},
+            {"id":"1:4","class_name":"Workspace","name":"Workspace","parent":"game","properties":{"Gravity":10}},
+            {"id":"1:5","class_name":"Humanoid","name":"Humanoid","parent":"1:3","properties":{"WalkSpeed":16,"RootPart":{"$ref":"1:6"}}},
+            {"id":"1:6","class_name":"Part","name":"HumanoidRootPart","parent":"1:3","received_creation_complete":true,"properties":{
+                "CFrame":{"$cframe":{"position":[0,2,0],"rotation":[1,0,0,0,1,0,0,0,1]}},
+                "Size":{"$vector3":[2,4,2]},"Anchored":false,"NetworkOwnerV3":7,"AssemblyRootPart":{"$ref":"1:6"}}}
+        ]});
+        let world = rove_client_core::world::WorldStore::from_snapshot(&snapshot).unwrap();
+        let view = fixture_shared_view(&snapshot);
+        let mut vm = Runtime::new_with_shared_world(snapshot, 32, &view).unwrap();
+        let pending = Arc::new(Mutex::new(PhysicsFeedbackQueue::default()));
+        let mut prediction = crate::live_physics::LocalPrediction::default();
+        let parents = HashMap::from([("Part".into(), "BasePart".into())]);
+        let result = vm.execute_control(
+            "h=game:GetService('Players').LocalPlayer.Character.Humanoid; results={}; h.MoveToFinished:Connect(function(reached) table.insert(results,tostring(reached)) end); task.spawn(function() waited=h.MoveToFinished:Wait() end); h:MoveTo(Vector3.new(0,2,0))".into(),100).unwrap();
+        successful(&result).unwrap();
+        successful(&vm.poll_with_budget(100).unwrap()).unwrap();
+        prediction.advance(&world.view(), &parents, "1:2", 42, 7, true,
+            &vm.take_movement_intents(), 1.).unwrap().unwrap();
+        pending.lock().unwrap().push(1, prediction.feedback().unwrap()).unwrap();
+        assert!(deliver_physics_feedback(&mut vm, &pending, 1).unwrap());
+        successful(&vm.poll_with_budget(100).unwrap()).unwrap();
+        let result = vm.execute_control("return table.concat(results,','),waited".into(),100).unwrap();
+        assert_eq!(result["values"], json!(["true",true]));
+        successful(&vm.execute_control("h:MoveTo(Vector3.new(1000,2,0))".into(),100).unwrap()).unwrap();
+        prediction.advance(&world.view(), &parents, "1:2", 42, 7, true,
+            &vm.take_movement_intents(), 2.).unwrap().unwrap();
+        prediction.advance(&world.view(), &parents, "1:2", 42, 7, true,
+            &[], 10.).unwrap().unwrap();
+        let feedback = prediction.feedback().unwrap();
+        assert_eq!(feedback["move_to_result"]["reached"], false);
+        pending.lock().unwrap().push(1, feedback.clone()).unwrap();
+        pending.lock().unwrap().push(1, feedback).unwrap();
+        assert!(deliver_physics_feedback(&mut vm, &pending, 1).unwrap());
+        successful(&vm.poll_with_budget(100).unwrap()).unwrap();
+        let result = vm.execute_control("return table.concat(results,',')".into(),100).unwrap();
+        assert_eq!(result["values"], json!(["true,false"]));
+        assert_eq!(prediction.report()["completed_move_to"], 1);
+        assert_eq!(prediction.report()["expired_move_to"], 1);
+    }
+
+    #[test]
+    fn move_to_events_survive_pose_coalescing_and_respect_revision_and_character() {
+        let mut queue = PhysicsFeedbackQueue::default();
+        let observation = |humanoid: &str, sequence, reached| json!({
+            "humanoid_id":humanoid,"move_to_result":{"sequence":sequence,"reached":reached}
+        });
+        queue.push(10, observation("old", 1, true)).unwrap();
+        queue.push(11, observation("old", 2, false)).unwrap();
+        queue.push(12, observation("old", 3, true)).unwrap();
+        assert!(queue.take_ready(9).is_none());
+        assert_eq!(queue.take_ready(10).unwrap()["move_to_finished"],
+            json!([{"sequence":1,"reached":true}]));
+        assert!(queue.take_ready(11).is_none());
+        assert_eq!(queue.take_ready(12).unwrap()["move_to_finished"],
+            json!([{"sequence":2,"reached":false},{"sequence":3,"reached":true}]));
+        queue.push(12, observation("old", 3, true)).unwrap();
+        assert!(queue.take_ready(12).unwrap().get("move_to_finished").is_none());
+        queue.push(13, observation("old", 4, true)).unwrap();
+        queue.push(14, observation("new", 5, false)).unwrap();
+        let feedback = queue.take_ready(14).unwrap();
+        assert_eq!(feedback["humanoid_id"], "new");
+        assert_eq!(feedback["move_to_finished"], json!([{"sequence":5,"reached":false}]));
+        assert!(queue.move_to_events.is_empty());
+    }
+
+    #[test]
+    fn move_to_event_backlog_is_bounded_and_overflow_preserves_accepted_results() {
+        let mut queue = PhysicsFeedbackQueue::default();
+        let observation = |sequence| json!({"humanoid_id":"h",
+            "move_to_result":{"sequence":sequence,"reached":true}});
+        for sequence in 1..=256 {
+            queue.push(1, observation(sequence)).unwrap();
+        }
+        assert!(queue.push(1, observation(257)).is_err());
+        assert_eq!(queue.move_to_cursor, 256);
+        let results = queue.take_ready(1).unwrap();
+        let results = results["move_to_finished"].as_array().unwrap();
+        assert_eq!(results.len(), 256);
+        for (index, event) in results.iter().enumerate() {
+            assert_eq!(event["sequence"], index + 1);
+        }
+        queue.push(1, observation(257)).unwrap();
+        assert_eq!(queue.take_ready(1).unwrap()["move_to_finished"],
+            json!([{"sequence":257,"reached":true}]));
+    }
+
+    #[test]
     fn physics_feedback_does_not_starve_when_producer_stays_a_revision_ahead() {
         let mut queue = PhysicsFeedbackQueue::default();
-        queue.push(10, json!({"x":10}));
+        queue.push(10, json!({"x":10})).unwrap();
         for sequence in 11..100 {
-            queue.push(sequence, json!({"x":sequence}));
+            queue.push(sequence, json!({"x":sequence})).unwrap();
             assert_eq!(queue.take_ready(sequence - 1), Some(json!({"x":sequence - 1})));
         }
         assert_eq!(queue.take_ready(99), Some(json!({"x":99})));
@@ -1317,7 +1830,7 @@ mod tests {
     fn physics_feedback_coalesces_bounded_backlog_without_exposing_future_pose() {
         let mut queue = PhysicsFeedbackQueue::default();
         for sequence in 10..1000 {
-            queue.push(sequence, json!({"x":sequence}));
+            queue.push(sequence, json!({"x":sequence})).unwrap();
         }
         assert_eq!(queue.take_ready(9), None);
         assert_eq!(queue.take_ready(10), Some(json!({"x":10})));
@@ -1352,7 +1865,7 @@ mod tests {
             "motion":{"root_id":"root","linear_velocity":[3,-4,4]},
             "engine_poses":{"character_id":"character","root_id":"root","frames":[
                 {"id":"root","cframe":{"$cframe":{"position":[10,6,20],"rotation":[1,0,0,0,1,0,0,0,1]}}}]}}),
-        );
+        ).unwrap();
         assert!(!deliver_physics_feedback(&mut vm, &pending, 9).unwrap());
         assert!(pending.lock().unwrap().next.is_some());
         assert!(deliver_physics_feedback(&mut vm, &pending, 10).unwrap());

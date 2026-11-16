@@ -1,0 +1,272 @@
+{
+  "reference": "scripts/owned_part_dynamics.py",
+  "cases": [
+    {
+      "name": "freefall",
+      "position": [
+        0.0,
+        10.0,
+        0.0
+      ],
+      "velocity": [
+        1.0,
+        0.0,
+        2.0
+      ],
+      "size": [
+        2.0,
+        2.0,
+        2.0
+      ],
+      "dt": 0.2,
+      "gravity": 196.2,
+      "boxes": [],
+      "servo": null,
+      "mass": 6.72,
+      "expected_position": [
+        0.2,
+        6.076000000000008,
+        0.4
+      ],
+      "expected_velocity": [
+        1.0,
+        -39.23999999999996,
+        2.0
+      ],
+      "unsupported_reason": null
+    },
+    {
+      "name": "resting",
+      "position": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        2.0,
+        2.0,
+        2.0
+      ],
+      "dt": 0.2,
+      "gravity": 196.2,
+      "boxes": [
+        [
+          [
+            0.0,
+            -1.0,
+            0.0
+          ],
+          [
+            10.0,
+            1.0,
+            10.0
+          ]
+        ]
+      ],
+      "servo": null,
+      "mass": 6.72,
+      "expected_position": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "expected_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "unsupported_reason": null
+    },
+    {
+      "name": "cross_floor",
+      "position": [
+        0.0,
+        2.0,
+        0.0
+      ],
+      "velocity": [
+        0.0,
+        -10.0,
+        0.0
+      ],
+      "size": [
+        2.0,
+        2.0,
+        2.0
+      ],
+      "dt": 0.2,
+      "gravity": 196.2,
+      "boxes": [
+        [
+          [
+            0.0,
+            -1.0,
+            0.0
+          ],
+          [
+            10.0,
+            1.0,
+            10.0
+          ]
+        ]
+      ],
+      "servo": null,
+      "mass": 6.72,
+      "expected_position": [
+        0.0,
+        0.9999999999999998,
+        0.0
+      ],
+      "expected_velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "unsupported_reason": null
+    },
+    {
+      "name": "centered_overlap",
+      "position": [
+        20.0,
+        420.0,
+        67.0
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        4.0,
+        1.2,
+        2.0
+      ],
+      "dt": 0.016666666666666666,
+      "gravity": 196.2,
+      "boxes": [
+        [
+          [
+            20.0,
+            420.0,
+            67.0
+          ],
+          [
+            2.0,
+            0.5,
+            1.0
+          ]
+        ]
+      ],
+      "servo": null,
+      "mass": 6.72,
+      "expected_position": [
+        20.0,
+        418.87275,
+        67.0
+      ],
+      "expected_velocity": [
+        0.0,
+        -3.2699999999999996,
+        0.0
+      ],
+      "unsupported_reason": null
+    },
+    {
+      "name": "velocity_hold",
+      "position": [
+        0.0,
+        10.0,
+        0.0
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        2.0,
+        2.0,
+        2.0
+      ],
+      "dt": 0.2,
+      "gravity": 196.2,
+      "boxes": [],
+      "servo": {
+        "target_velocity": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "max_force": [
+          4000.0,
+          4000.0,
+          4000.0
+        ],
+        "gain": 1250.0
+      },
+      "mass": 6.72,
+      "expected_position": [
+        0.0,
+        9.796913649971197,
+        0.0
+      ],
+      "expected_velocity": [
+        0.0,
+        -1.054771199998849,
+        0.0
+      ],
+      "unsupported_reason": null
+    },
+    {
+      "name": "capped_force",
+      "position": [
+        0.0,
+        10.0,
+        0.0
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "size": [
+        2.0,
+        2.0,
+        2.0
+      ],
+      "dt": 0.2,
+      "gravity": 196.2,
+      "boxes": [],
+      "servo": {
+        "target_velocity": [
+          12.0,
+          8.0,
+          0.0
+        ],
+        "max_force": [
+          4.0,
+          0.0,
+          2.0
+        ],
+        "gain": 1000.0
+      },
+      "mass": 6.72,
+      "expected_position": [
+        0.011904761904761882,
+        6.076000000000008,
+        0.0
+      ],
+      "expected_velocity": [
+        0.11904761904761901,
+        -39.23999999999996,
+        0.0
+      ],
+      "unsupported_reason": null
+    }
+  ]
+}

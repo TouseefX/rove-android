@@ -2,7 +2,9 @@
 //! no vm or account credentials here, and nothing connects on its own.
 pub mod channels;
 pub mod console;
+pub mod entropy;
 pub mod journal;
+pub mod instance_state;
 pub mod lightweight;
 pub mod memory;
 mod packed_properties;
@@ -12,6 +14,8 @@ pub mod property_acknowledgments;
 pub mod replication;
 pub mod shared_payload;
 pub mod received_store;
+mod received_attributes;
+mod received_tags;
 pub mod replication_out;
 pub mod rpc;
 pub mod runtime_delta;
@@ -24,3 +28,5 @@ pub mod timing;
 pub mod transport;
 pub mod wire;
 pub mod world;
+#[cfg(windows)]
+pub mod windows_private;

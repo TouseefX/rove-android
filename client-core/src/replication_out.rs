@@ -52,18 +52,46 @@ pub fn guid(key: Option<Guid>) -> Result<Vec<u8>, WireError> {
 /// Encode a bounded batch of explicit touch transitions on reliable channel 7.
 pub fn contact_batch(records: &[(Guid, Guid, bool)]) -> Result<Vec<u8>, WireError> {
     if records.is_empty() || records.len() > MAX_CONTACT_TRANSITIONS {
+        return Err(WireError::new("Contact batch must contain 1..64 transitions"));
+    }
+    encode_contact_states(&records.iter().map(|&(a,b,began)| (a,b,if began {0}else{3})).collect::<Vec<_>>())
+}
+
+/// Native 1040D28E0 represents begin/end within one physical update as state 4
+/// (and end/begin as state 1). Preserve both events in one pair record. Do not
+/// combine across another pair, reorder events, or synthesize transitions.
+pub fn contact_step_batch(records: &[(Guid, Guid, bool)]) -> Result<Vec<u8>, WireError> {
+    if records.is_empty() || records.len() > MAX_CONTACT_TRANSITIONS {
+        return Err(WireError::new("Contact batch must contain 1..64 transitions"));
+    }
+    let mut states = Vec::with_capacity(records.len());
+    let mut at = 0;
+    while at < records.len() {
+        let (a,b,began) = records[at];
+        let state = if records.get(at+1).is_some_and(|&(c,d,next)| a==c && b==d && began!=next) {
+            at += 1;
+            if began {4} else {1}
+        } else if began {0} else {3};
+        states.push((a,b,state));
+        at += 1;
+    }
+    encode_contact_states(&states)
+}
+
+fn encode_contact_states(records: &[(Guid, Guid, u8)]) -> Result<Vec<u8>, WireError> {
+    if records.is_empty() || records.len() > MAX_CONTACT_TRANSITIONS {
         return Err(WireError::new(
             "Contact batch must contain 1..64 transitions",
         ));
     }
     let mut payload = vec![134];
-    for &(first, second, began) in records {
+    for &(first, second, state) in records {
         if first == second {
             return Err(WireError::new("Contact participants must be distinct"));
         }
         payload.extend(guid(Some(first))?);
         payload.extend(guid(Some(second))?);
-        payload.push(if began { 0 } else { 3 });
+        payload.push(state);
     }
     payload.extend(guid(None)?);
     Ok(payload)
@@ -229,6 +257,23 @@ mod tests {
         assert_eq!(drained.len(), MAX_PENDING_MARKERS);
         assert_eq!(drained[0], [131, 4, 0, 0, 0, 0, 0]);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn physical_step_contacts_use_native_compound_states_without_reordering() {
+        let a=(1,7); let b=(1,8); let c=(1,9);
+        // Literal state bytes from the pinned receiver: 4 calls Touched then
+        // TouchEnded; 1 calls TouchEnded then Touched on each participant.
+        assert_eq!(contact_step_batch(&[(a,b,true),(a,b,false)]).unwrap(),
+            vec![134,1,7,0,0,0,1,8,0,0,0,4,0]);
+        assert_eq!(contact_step_batch(&[(a,b,false),(a,b,true)]).unwrap(),
+            vec![134,1,7,0,0,0,1,8,0,0,0,1,0]);
+        for rows in [vec![(a,b,true),(a,c,false),(a,b,false)],vec![(a,b,true),(a,b,true)]] {
+            assert_eq!(contact_step_batch(&rows).unwrap(),contact_batch(&rows).unwrap());
+        }
+        assert!(contact_step_batch(&[]).is_err());
+        assert!(contact_step_batch(&vec![(a,b,true);65]).is_err());
+        assert!(contact_step_batch(&[(a,a,true),(a,a,false)]).is_err());
     }
 
     #[test]

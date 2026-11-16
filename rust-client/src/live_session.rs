@@ -1,6 +1,6 @@
 //! Rust-owned live transport, authenticated-program dispatch and received world.
 //!
-//! Replicated game scripts are not connected. Optional own-character physics
+//! Received scripts run through the session catalog. Optional own-character physics
 //! runs on the world owner and hands its newest frame to the network owner.
 //! Ping delivery and the available per-session observations are connected;
 //! incomplete integrity coverage blocks replies. Reports distinguish this receiver
@@ -31,7 +31,7 @@ use rove_client_core::{
     timing::{SessionWireClock, TimeSyncProbe},
     transport::session::{receive_unreliable, send_unreliable, ReliableReceiver, ReliableSender},
     transport::{
-        close_metadata, connect_webtransport, current_close_metadata, Connection, TransportError,
+        close_metadata, current_close_metadata, Connection, TransportError,
     },
     wire::Reader,
 };
@@ -108,7 +108,17 @@ enum Effect {
         _budget: OwnedSemaphorePermit,
     },
     RpcOutbound {
+        callback_outcomes: (u64, u64, Option<String>),
+        pending_report: Value,
         payloads: Vec<EncodedRpcPacket>,
+        _budget: OwnedSemaphorePermit,
+    },
+    OwnedParts {
+        records: Vec<Vec<u8>>,
+        remote_step: Option<u32>,
+        step: u32,
+        contacts: Vec<Vec<u8>>,
+        prepared_at: Instant,
         _budget: OwnedSemaphorePermit,
     },
     Failed(&'static str),
@@ -219,7 +229,12 @@ impl PingCounts {
 
 /// The sole owner of this session's received world. An optional VM consumer
 /// receives one initial globals snapshot followed by bounded ordered deltas.
+use crate::stage_timing::StageTiming;
+
 struct ReceivedWorld {
+    stage_timings: BTreeMap<&'static str, StageTiming>,
+    attribute_receipts: crate::attribute_receipts::AttributeReceipts,
+    archivable_receipts: crate::attribute_receipts::ArchivableReceipts,
     core: SessionCore,
     reader: ReaderId,
     acknowledged: u64,
@@ -244,9 +259,16 @@ struct ReceivedWorld {
     rpc_class_parents: HashMap<String, String>,
     ready_rpc_outbound: Vec<EncodedRpcPacket>,
     remote_server_results_received: u64,
+    remote_client_callback_successes: u64,
+    remote_client_callback_errors: u64,
+    last_client_callback_error: Option<String>,
     remote_server_errors_received: u64,
     remote_receive_error: Option<String>,
     prediction: LocalPrediction,
+    owned_parts: crate::owned_part_poses::OwnedPartPoses,
+    ready_owned_parts: Vec<(u64, Vec<u8>, u32)>,
+    ready_physics_contacts: Vec<Vec<u8>>,
+    owned_part_clock: SimulationStepClock,
     prediction_started: Instant,
     physics_enabled: bool,
     physics_error: Option<&'static str>,
@@ -265,11 +287,16 @@ impl ReceivedWorld {
     ) -> Result<Self, &'static str> {
         let mut world = Self::new(user_id)?;
         world.property_acks = property_acks;
+        world.owned_parts.python_submitted_model = std::env::var("ROVE_OWNED_PART_MODEL")
+            .ok().as_deref() == Some("python-submitted");
         Ok(world)
     }
     fn with_core(mut core: SessionCore, user_id: u64) -> Result<Self, &'static str> {
         let reader = core.retain(0).map_err(|_| "world-reader-init-failed")?;
         Ok(Self {
+            stage_timings: BTreeMap::new(),
+            attribute_receipts: Default::default(),
+            archivable_receipts: Default::default(),
             core,
             reader,
             acknowledged: 0,
@@ -294,9 +321,16 @@ impl ReceivedWorld {
             rpc_class_parents: HashMap::new(),
             ready_rpc_outbound: Vec::new(),
             remote_server_results_received: 0,
+            remote_client_callback_successes: 0,
+            remote_client_callback_errors: 0,
+            last_client_callback_error: None,
             remote_server_errors_received: 0,
             remote_receive_error: None,
             prediction: LocalPrediction::default(),
+            owned_parts: crate::owned_part_poses::OwnedPartPoses::default(),
+            ready_owned_parts: Vec::new(),
+            ready_physics_contacts: Vec::new(),
+            owned_part_clock: SimulationStepClock::new(),
             prediction_started: Instant::now(),
             physics_enabled: false,
             physics_error: None,
@@ -308,19 +342,37 @@ impl ReceivedWorld {
         let now = self.simulation_clock.last_ms.unwrap_or(0);
         self.ingest_at(payload, now)
     }
+    fn ingest_received(&mut self, message: &Incoming) -> Result<Vec<Vec<u8>>, &'static str> {
+        // Receive timestamps describe separate network queues, not the order
+        // in which this world owner processes them. Python samples its local
+        // simulation clock for property ACKs; preserve receive time for pings.
+        let local_clock_word = self.prediction_started.elapsed().as_millis() as u32;
+        self.ingest_at(&message.payload, local_clock_word)
+    }
     fn ingest_at(
         &mut self,
         payload: &[u8],
-        received_clock_word: u32,
+        local_clock_word: u32,
     ) -> Result<Vec<Vec<u8>>, &'static str> {
         self.ready_property_ack = None;
         self.ready_streaming_resume = None;
         self.ready_rpc_outbound.clear();
+        let stage = Instant::now();
+        if let Some(engine) = self.engine.as_ref() {
+            engine.wait_for_update_capacity().map_err(|_| "engine-update-owner-stopped")?;
+        }
+        self.stage_timings.entry("vm_capacity").or_default().observe(stage);
+        let stage = Instant::now();
         let previous = self.engine.as_ref().and_then(|_| self.core.world_view());
-        let accepted = self
-            .core
-            .ingest(payload)
-            .map_err(|_| "world-packet-rejected")?;
+        let accepted = if payload.first() == Some(&161) {
+            let Some(accepted) = self.core.ingest_instance_state(payload)
+                .map_err(|_| "instance-state-commit-failed")? else { return Ok(vec![]); };
+            accepted
+        } else {
+            self.core.ingest(payload).map_err(|_| "world-packet-rejected")?
+        };
+        self.stage_timings.entry("decode_commit").or_default().observe(stage);
+        let stage = Instant::now();
         let sequence = match accepted {
             IngestOutcome::SchemaInstalled { .. } => return Ok(vec![]),
             IngestOutcome::GlobalsCommitted {
@@ -346,7 +398,7 @@ impl ReceivedWorld {
             .filter(|entry| entry.sequence == sequence)
             .ok_or("world-receipt-order-invalid")?;
         self.observe(&entry.value)?;
-        self.simulation_clock.advance(received_clock_word)?;
+        self.simulation_clock.advance(local_clock_word)?;
         let schema = self.core.schema().ok_or("world-schema-unavailable")?;
         let view = self.core.world_view().ok_or("world-view-unavailable")?;
         self.property_acks
@@ -362,6 +414,8 @@ impl ReceivedWorld {
             .prepare(&view)
             .map_err(|_| "property-acknowledgement-prepare-failed")?;
         self.ready_streaming_resume = self.prepare_streaming_resume()?;
+        self.stage_timings.entry("receipt_observers").or_default().observe(stage);
+        let stage = Instant::now();
         if self.engine.is_some() {
             let local_player = self.local_player()?;
             if let Err(error) = self.engine.as_mut().unwrap().observe(
@@ -375,7 +429,10 @@ impl ReceivedWorld {
                 return Err("engine-update-rejected");
             }
         }
+        self.stage_timings.entry("vm_enqueue").or_default().observe(stage);
+        let stage = Instant::now();
         self.process_remote(&entry.value)?;
+        self.stage_timings.entry("remote_dispatch").or_default().observe(stage);
         // Acknowledgement releases the canonical receipt only after the
         // optional VM mailbox owns its normalized ordered update.
         self.core
@@ -384,6 +441,7 @@ impl ReceivedWorld {
         self.acknowledged = sequence;
         // Session consumers and VM delivery have completed successfully.
         drop(entries);
+        crate::memory_maintenance::between_batches();
         Ok(self.flush_markers())
     }
     fn process_remote(&mut self, record: &SessionRecord) -> Result<(), &'static str> {
@@ -453,13 +511,37 @@ impl ReceivedWorld {
         let view = self.core.world_view().ok_or("world-view-unavailable")?;
         // Character/ownership checks below use cached own bindings. Avoid a
         // whole-world Humanoid search on every physics tick.
+        self.owned_parts.observe(&intents);
+        self.owned_part_clock.advance(self.prediction_started.elapsed().as_millis() as u32)?;
+        self.ready_owned_parts.clear();
+        let schema = self.core.schema().ok_or("world-schema-unavailable")?;
+        let stage = Instant::now();
+        let simulated = self.owned_parts.advance(&view, &self.rpc_class_parents, scope,
+            self.core.instance_state_report()["legacy_pv_enabled"].as_bool() == Some(true),
+            self.prediction_started.elapsed().as_secs_f64());
+        self.stage_timings.entry("owned_prediction").or_default().observe(stage);
+        self.ready_physics_contacts = simulated.contacts;
+        for part in simulated.parts {
+            match crate::isr_sender::record(schema, &view, &part) {
+                Ok(record) => self.ready_owned_parts.push((part.id, record, self.owned_part_clock.step)),
+                Err(reason) => {
+                    self.owned_parts.reject(reason);
+                    self.ready_owned_parts.clear();self.ready_physics_contacts.clear();
+                    return Err("owned-part-encoding-failed");
+                }
+            }
+        }
         let region_received = view
             .get_property(&player, "Character")
             .and_then(|v| v["$ref"].as_str().map(str::to_owned))
             .and_then(|id| view.get_property(&id, "PrimaryPart"))
             .and_then(|v| v["$ref"].as_str().map(str::to_owned))
-            .and_then(|root| root_position(&view, &root))
-            .is_some_and(|position| region_contains(position, &self.region_records));
+            .and_then(|root| root_position(&view, &root).map(|position| {
+                crate::received_world_ready::can_simulate(&view,&root,
+                    region_contains(position, &self.region_records),self.initial_tag)
+            }))
+            .unwrap_or(false);
+        let stage = Instant::now();
         let frame = self
             .prediction
             .advance(
@@ -473,6 +555,7 @@ impl ReceivedWorld {
                 self.prediction_started.elapsed().as_secs_f64(),
             )
             .map_err(|_| "local-prediction-failed")?;
+        self.stage_timings.entry("character_prediction").or_default().observe(stage);
         if let (Some(engine), Some(feedback)) = (self.engine.as_mut(), self.prediction.feedback()) {
             engine
                 .queue_physics_feedback(view.sequence(), feedback)
@@ -493,6 +576,12 @@ impl ReceivedWorld {
             for reply in engine.take_remote_client_replies() {
                 rpc.queue_client_reply(scope, client_reply_from_value(&reply)?)
                     .map_err(|_| "remote-reply-rejected")?;
+                if reply["ok"] == true {
+                    self.remote_client_callback_successes += 1;
+                } else {
+                    self.remote_client_callback_errors += 1;
+                    self.last_client_callback_error = reply["error"].as_str().map(|s|s.chars().take(256).collect());
+                }
             }
             let mut contacts = Vec::new();
             for event in engine.take_remote_server_events() {
@@ -575,6 +664,7 @@ impl ReceivedWorld {
         }
         if let Some(actions) = record.world_delta.lifecycle_actions() {
             for action in actions {
+                self.attribute_receipts.observe(action);
                 if let Some(id) = action["id"].as_str() {
                     match action["kind"].as_str() {
                         Some("create") if action["node"]["class_name"] == "Player" => {
@@ -599,7 +689,18 @@ impl ReceivedWorld {
         self.regions += record.regions.len() as u64;
         self.property_changes += record.property_changes.len() as u64;
         self.metadata += record.metadata.len() as u64;
+        for change in &record.property_changes {
+            let Some(id) = change["id"].as_str() else { continue; };
+            let Some(index) = change["property_index"].as_u64() else { continue; };
+            let Some(property) = self.core.schema().and_then(|schema| schema.properties.get(index as usize)) else { continue; };
+            if matches!(property.name.as_str(), "Archivable" | "archivable") {
+                let value = self.core.world_view().and_then(|view| view.get_property(id, &property.name));
+                self.archivable_receipts.observe(id, record.world_sequence, value.as_ref());
+            }
+        }
         self.validated_pings.extend(pings);
+        self.prediction.observe_replication(record);
+        self.owned_parts.observe_replication(record);
         Ok(())
     }
     fn marker(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
@@ -658,6 +759,10 @@ impl ReceivedWorld {
     }
 
     fn summary(&self) -> Value {
+        crate::memory_diagnostics::heap("world_before_summary");
+        if std::env::var_os("ROVE_MEMORY_DIAGNOSTICS").is_some() {
+            eprintln!("MEMORY_DIAG_CORE {}", self.core.storage_profile());
+        }
         let view = self.core.world_view();
         let own = self.local_player().ok().flatten();
         let own_in_players = view
@@ -680,7 +785,8 @@ impl ReceivedWorld {
             .as_ref()
             .zip(own.as_deref())
             .and_then(|(world, id)| world.get_property(id, "GameplayPaused"));
-        json!({"schema_received":self.core.schema_installed(), "globals_received":self.core.scope().is_some(),
+        let mut report = json!({"schema_received":self.core.schema_installed(), "globals_received":self.core.scope().is_some(),
+            "world_stage_timings":self.stage_timings,
             "initial_world_tag_received":self.initial_tag, "world_packets_committed":self.core.committed_packets(),
             "world_packets_rejected":self.core.rejected_packets(), "world_nodes":view.map_or(0,|v|v.node_count()),
             "property_storage":rove_client_core::property_storage::statistics(),
@@ -700,7 +806,10 @@ impl ReceivedWorld {
             "property_acknowledgments":self.property_acks.report(),
             "simulation_clock":self.simulation_clock.report(),
             "received_property_changes":self.property_changes,
+            "instance_state_replication":self.core.instance_state_report(),
             "local_prediction":self.prediction.report(),
+            "owned_part_physics":self.owned_parts.report(),
+            "owned_part_clock":self.owned_part_clock.report(),
             "physics_enabled":self.physics_enabled,
             "physics_error":self.physics_error,
             "remote_server_results_received":self.remote_server_results_received,
@@ -709,7 +818,14 @@ impl ReceivedWorld {
             "announced_players_service":self.announced_players.is_some(),
             "remote_rpc_pending":self.rpc.as_ref().map_or(0,RpcSession::pending_len),
             "unconsumed_receipts":{"remote_events":self.events,"streaming_regions":self.regions,
-                "property_acknowledgements":self.property_acks.report()["pending"],"metadata":self.metadata}})
+                "property_acknowledgements":self.property_acks.report()["pending"],"metadata":self.metadata}});
+        report["remote_client_callback_successes"] = json!(self.remote_client_callback_successes);
+        report["remote_client_callback_errors"] = json!(self.remote_client_callback_errors);
+        report["last_client_callback_error"] = json!(self.last_client_callback_error);
+        report["remote_rpc_pending_details"] = self.rpc.as_ref().map(RpcSession::pending_report).unwrap_or(Value::Null);
+        report["attribute_receipts"] = self.attribute_receipts.report();
+        report["archivable_receipts"] = self.archivable_receipts.report();
+        report
     }
     fn local_player(&self) -> Result<Option<String>, &'static str> {
         let Some(world) = self.core.world_view() else {
@@ -1109,6 +1225,8 @@ fn emit_rpc_outbound(
         .map_err(|_| "reply-queue-limit")?;
     outgoing
         .send(Effect::RpcOutbound {
+            callback_outcomes: (world.remote_client_callback_successes, world.remote_client_callback_errors, world.last_client_callback_error.clone()),
+            pending_report: world.rpc.as_ref().map(RpcSession::pending_report).unwrap_or(Value::Null),
             payloads: std::mem::take(&mut world.ready_rpc_outbound),
             _budget: permit,
         })
@@ -1148,6 +1266,7 @@ fn worker(
     loop {
         if physics_enabled && !stop.load(Ordering::Acquire) && Instant::now() >= next_physics {
             next_physics = Instant::now() + Duration::from_micros(16_667);
+            let stage = Instant::now();
             let frame = if world.physics_error.is_none() {
                 match world.advance_prediction() {
                     Ok(frame) => frame.filter(|frame| frame.fixed_steps > 0),
@@ -1159,6 +1278,23 @@ fn worker(
             } else {
                 None
             };
+            world.stage_timings.entry("prediction").or_default().observe(stage);
+            // Python updates the estimator on every available local physics tick,
+            // even when there are no authored records to send. An ACK must not
+            // wait until the next scripted teleport to update the offset.
+            if world.owned_part_clock.last_ms.is_some() {
+                let result=(|| {
+                    let permit=reply_budget.clone().try_acquire_owned().map_err(|_|"owned-physics-output-queue-full")?;
+                    outgoing.send(Effect::OwnedParts {
+                        records:world.ready_owned_parts.drain(..).map(|(_,record,_)|record).collect(),
+                        step:world.owned_part_clock.step,
+                        remote_step:world.core.instance_state_report()["last_packet_timestamp"].as_u64().map(|s|s as u32),
+                        contacts:std::mem::take(&mut world.ready_physics_contacts),
+                        prepared_at:Instant::now(),_budget:permit,
+                    }).map_err(|_|"session-stopped-before-physics-send")
+                })();
+                if let Err(error)=result {failure=Some(error);let _=outgoing.send(Effect::Failed(error));break;}
+            }
             if let Ok(mut output) = physics_output.lock() {
                 if let Some(frame) = frame {
                     output.coalesced += u64::from(output.latest.is_some());
@@ -1201,11 +1337,12 @@ fn worker(
             let mut program = false;
             let replies = match (message.application, message.channel, kind) {
                 (4, 1, 147) => {
-                    feature_count = Some(
-                        crate::login::feature_configuration(payload)
-                            .map_err(|_| "feature-configuration-rejected")?
-                            .len(),
-                    );
+                    let config = crate::login::feature_configuration(payload)
+                        .map_err(|_| "feature-configuration-rejected")?;
+                    world.core.set_instance_state_legacy_pv(config.iter()
+                        .find(|(name, _)| name == "DebugAdaptivePVCompressor")
+                        .is_some_and(|(_, value)| value == "false"));
+                    feature_count = Some(config.len());
                     vec![]
                 }
                 (4, 1, 155) => {
@@ -1225,8 +1362,8 @@ fn worker(
                     world.validated_pings.extend(items);
                     vec![]
                 }
-                (4, 1, 129 | 151) | (4, 1 | 3, 131) => {
-                    world.ingest_at(payload, message.received_clock_word)?
+                (4, 1, 129 | 151) | (4, 1 | 3, 131) | (4, 5, 161) => {
+                    world.ingest_received(&message)?
                 }
                 _ => {
                     *unhandled.entry(kind).or_default() += 1;
@@ -1310,6 +1447,18 @@ fn worker(
     report["unhandled_game_packets"] = json!(unhandled);
     report["packets_discarded_after_stop"] = json!(discarded);
     report
+}
+
+/// Reserve memory before pulling a datagram. This future can wait for budget
+/// inside select without stalling clock/reply branches or growing an extra queue.
+async fn receive_budgeted_datagram(
+    connection:&Connection,budget:&Arc<Semaphore>,clock:PingClock,
+)->Result<(rove_client_core::transport::session::UnreliablePacket,u32,OwnedSemaphorePermit), &'static str> {
+    const MAX_PAYLOAD:u32=65_536;
+    let permit=budget.clone().acquire_many_owned(MAX_PAYLOAD).await.map_err(|_|"incoming-queue-closed")?;
+    let packet=receive_unreliable(connection).await.map_err(|_|"datagram-read-failed")?;
+    if packet.payload.len()>MAX_PAYLOAD as usize {return Err("incoming-datagram-too-large");}
+    Ok((packet,clock.word(),permit))
 }
 
 async fn enqueue(
@@ -1430,17 +1579,9 @@ pub fn run_with_options(
     )
     .map_err(|e| e.to_string())?;
     let integrity = SessionIntegrity::new();
+    let dashboard = config.as_ref().and_then(|config| config.dashboard.clone());
     let mut auth = ProgramAuth::for_allocation(issued, trust).map_err(|e| e.to_string())?;
     auth.set_integrity(integrity.clone());
-    let engine = config
-        .map(|config| {
-            LiveRuntime::new_with_integrity(
-                config,
-                issued.game_id.clone().ok_or("issued-job-id-missing")?,
-                integrity.clone(),
-            )
-        })
-        .transpose()?;
     // Encoding and credential validation occur before the socket opens.
     let packets = issued
         .game_login_packets(Some((13, 14)))
@@ -1451,7 +1592,10 @@ pub fn run_with_options(
         .map_err(|_| "transport-runtime-unavailable")?;
     runtime.block_on(async {
         let started=Instant::now();
-        let (endpoint,connection,socket)=tokio::time::timeout(Duration::from_secs(20),connect_webtransport(&allocation)).await
+        let delivery=Arc::new(rove_client_core::transport::delivery::DatagramDelivery::default());
+        let mut isr_clock=crate::isr_clock::IsrClock::default();
+        let (endpoint,connection,socket)=tokio::time::timeout(Duration::from_secs(20),
+            rove_client_core::transport::connect_webtransport_with_delivery(&allocation,Some(delivery.clone()))).await
             .map_err(|_| "connection-timeout")?.map_err(|_| "connection-failed")?;
         let caps=connection.capability_negotiation().ok_or("capability-negotiation-missing")?;
         if caps.negotiated() & BYTECODE_RANGE_CAPABILITY == 0 {
@@ -1459,6 +1603,19 @@ pub fn run_with_options(
             endpoint.close(0u32.into(),b"bytecode range unsupported");
             return Err("bytecode-range-negotiation-unavailable".into());
         }
+        // This code policy is only enabled after the issued server's pinned
+        // transport handshake and bytecode-range negotiation succeeded.
+    let engine = config
+        .map(|mut config| {
+            config.pinned_session_code = true;
+            LiveRuntime::new_with_integrity(
+                config,
+                issued.game_id.clone().ok_or("issued-job-id-missing")?,
+                integrity.clone(),
+            )
+        })
+        .transpose()?;
+        let runtime_rtt = engine.as_ref().map(LiveRuntime::session_rtt);
         let negotiated=caps.negotiated();
         let accepted_at=Instant::now();
         let ping_clock=PingClock::new(accepted_at);
@@ -1471,6 +1628,8 @@ pub fn run_with_options(
         let receive_failure=Arc::new(Mutex::new(None));
         let mut readers=start_receivers(&connection,network_tx.clone(),budget.clone(),receive_failure.clone(),ping_clock);
         let (world_tx,world_rx)=mpsc::channel(32);
+        // One held incoming frame bounds backpressure without blocking replies.
+        let mut pending_world:Option<Incoming>=None;
         let (effect_tx,mut effects)=mpsc::unbounded_channel();
         let stop=Arc::new(AtomicBool::new(false));
         let worker_stop=stop.clone(); let user_id=issued.user_id;
@@ -1486,17 +1645,29 @@ pub fn run_with_options(
         let mut received=0u64; let mut sent_programs=0u64; let mut sent_markers=0u64;
         let mut streaming_ready_sent=0u64;
         let mut remote_client_replies_sent=0u64;
+        let mut callback_outcomes=(0u64,0u64,None::<String>);
+        let mut pending_rpc_report=Value::Null;
         let mut remote_server_events_sent=0u64;
         let mut unreliable_remote_server_events_sent=0u64;
         let mut remote_server_calls_sent=0u64;
         let mut script_contacts_sent=0u64;
         let mut login_sent=0; let mut unknown_datagrams=0u64; let mut fragmented_datagrams=0u64;
+        let mut unreliable_packets_received=0u64;
+        let mut unreliable_channels_received=BTreeMap::<String,u64>::new();
         let mut last_received=accepted_at; let mut duration_reached=false;
+        let mut user_left=false;
+        let mut dashboard_at=Instant::now();
+        let mut ram_budget=crate::memory_budget::GrowingMemoryBudget::default();
+        let mut ram_sample_at=Instant::now();
         let mut sync_sequence=0;
         let mut physics_sequence=0u64;
         let mut physics_announced=false;
         let mut physics_send_attempts=0u64;
         let mut physics_send_returns=0u64;
+        let mut owned_part_records_sent=0u64;
+        let mut owned_part_announced=false;
+        let mut owned_part_packets_sent=0u64;
+        let mut physics_contacts_sent=0u64;
         let mut physics_stale_frames=0u64;
         let session_result=async {
             clock.initialize_replicator().map_err(|_| "wire-clock-init-failed")?;
@@ -1510,11 +1681,37 @@ pub fn run_with_options(
             let deadline=tokio::time::sleep_until((accepted_at+Duration::from_secs(seconds)).into()); tokio::pin!(deadline);
             let mut tick=tokio::time::interval(Duration::from_millis(20)); tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                // Service all ready sources fairly. Python drains received
+                // traffic before the next tick; prioritizing continuously-ready
+                // effects/reliable frames here can starve game datagrams.
                 tokio::select! {
-                    biased;
                     _=&mut deadline => { duration_reached=true; return Ok::<_, &'static str>(()); }
                     error=connection.closed() => { close=Some(close_metadata(&error)); return Ok(()); }
                     _=tick.tick() => {
+                        if Instant::now()>=ram_sample_at {
+                            ram_sample_at=Instant::now()+Duration::from_millis(250);
+                            ram_budget.sample_process();
+                        }
+                        if let Some(dashboard)=dashboard.as_ref() {
+                            if dashboard.leave_requested() { user_left=true; return Ok(()); }
+                            if Instant::now()>=dashboard_at {
+                                dashboard_at=Instant::now()+Duration::from_millis(250);
+                                let pings=ping_responder.diagnostics();
+                                dashboard.update(json!({"phase":"connected","connected_seconds":accepted_at.elapsed().as_secs_f64(),
+                                    "rtt_ms":connection.rtt().as_secs_f64()*1000.0,"messages_received":received,
+                                    "ping_requests":pings.requests_received,"ping_replies":pings.replies_sent,
+                                    "ping_pending":ping_responder.pending(),"physics_frames_sent":physics_send_returns,
+                                    "owned_part_records_sent":owned_part_records_sent,"owned_part_packets_sent":owned_part_packets_sent,
+                                    "physics_contact_packets_sent":physics_contacts_sent,"remote_client_replies_sent":remote_client_replies_sent,
+                                    "remote_client_callback_successes":callback_outcomes.0,"remote_client_callback_errors":callback_outcomes.1,
+                                    "last_client_callback_error":callback_outcomes.2,
+                                    "remote_rpc_pending_details":pending_rpc_report,
+                                    "unreliable_packets_received":unreliable_packets_received,
+                                    "quic_datagram_frames_received":connection.quic_connection().stats().frame_rx.datagram,
+                                    "isr_clock_observations":isr_clock.report()["remote_observations"],
+                                    "last_packet_age_seconds":last_received.elapsed().as_secs_f64()}));
+                            }
+                        }
                         ping_writer.flush(&mut ping_responder,&mut ping_telemetry,&sender,&connection).await?;
                         let physics_frame = physics_output.lock().map_err(|_| "physics-output-unavailable")?.latest.take();
                         if let Some((frame,produced_at))=physics_frame {
@@ -1522,9 +1719,9 @@ pub fn run_with_options(
                                 physics_stale_frames+=1;
                             } else {
                                 physics_sequence=physics_sequence.checked_add(1).ok_or("physics-sequence-overflow")?;
-                                let payload=physics_sender::encode_root_frame(frame.binding.root_part_id,
+                                let payload=physics_sender::encode_root_frame_with_rotation(frame.binding.root_part_id,
                                     clock.physics_milliseconds().map_err(|_| "physics-clock-unavailable")?,
-                                    physics_sequence,frame.position,frame.velocity,frame.grounded)?;
+                                    physics_sequence,frame.position,frame.rotation,frame.velocity,frame.grounded)?;
                                 if !physics_announced {
                                     let announcement=control_open(physics_sender::APPLICATION,physics_sender::CHANNEL,physics_sender::WIRE_ID)
                                         .map_err(|_| "physics-channel-invalid")?;
@@ -1565,7 +1762,42 @@ pub fn run_with_options(
                             sender.send(4,1,&payload).await.map_err(|_| "streaming-resume-send-failed")?;
                             streaming_ready_sent+=1;
                         }
-                        Effect::RpcOutbound { payloads,.. } => {
+                        Effect::OwnedParts {records,step,remote_step,contacts,prepared_at,..} => {
+                            for outcome in delivery.drain() {
+                                match outcome {
+                                    rove_client_core::transport::delivery::Delivery::Acknowledged(step)=>isr_clock.acknowledged(step),
+                                    rove_client_core::transport::delivery::Delivery::Lost(_)=>isr_clock.lost(),
+                                }
+                            }
+                            if let Some(remote_step)=remote_step {isr_clock.observe_remote(remote_step);}
+                            let offset=isr_clock.update(step)?;
+                            // Keep physical poses and their contact transitions in
+                            // one ordered bounded effect. Dropping/coalescing only
+                            // one side would lose or invent begin/end history.
+                            if (!records.is_empty() || !contacts.is_empty())
+                                && prepared_at.elapsed()>Duration::from_millis(250) {return Err("owned-physics-output-stale");}
+                            for batch in records.chunks(8) {
+                                let payload=crate::isr_sender::packet_with_offset(step,batch,offset)?;
+                                if !owned_part_announced {
+                                    let announcement=control_open(crate::isr_sender::APPLICATION,crate::isr_sender::CHANNEL,crate::isr_sender::WIRE_ID)
+                                        .map_err(|_| "isr-channel-invalid")?;
+                                    sender.send(crate::isr_sender::APPLICATION,CONTROL_CHANNEL,&announcement).await
+                                        .map_err(|_| "isr-channel-announcement-failed")?;
+                                    owned_part_announced=true;
+                                }
+                                let sequence=owned_part_packets_sent.checked_add(1).ok_or("isr-sequence-overflow")?;
+                                rove_client_core::transport::delivery::send_tracked(&connection,&delivery,
+                                    crate::isr_sender::WIRE_ID,sequence,&payload,step)?;
+                                owned_part_packets_sent=sequence;owned_part_records_sent+=batch.len() as u64;
+                            }
+                            for payload in contacts {
+                                sender.send(4,7,&payload).await.map_err(|_|"physics-contact-send-failed")?;
+                                physics_contacts_sent+=1;
+                            }
+                        }
+                        Effect::RpcOutbound { payloads,callback_outcomes:outcomes,pending_report,.. } => {
+                            callback_outcomes=outcomes;
+                            pending_rpc_report=pending_report;
                             for packet in payloads {
                                 match packet.channel {
                                     1 | 7 => sender.send(4,u32::from(packet.channel),&packet.payload).await.map_err(|_| "remote-rpc-send-failed")?,
@@ -1584,7 +1816,10 @@ pub fn run_with_options(
                             }
                         }
                     },
-                    message=network_rx.recv() => {
+                    permit=world_tx.reserve(), if pending_world.is_some() => {
+                        permit.map_err(|_| "world-owner-stopped")?.send(pending_world.take().unwrap());
+                    }
+                    message=network_rx.recv(), if pending_world.is_none() => {
                         let message=message.ok_or("network-receiver-stopped")?;
                         ping_telemetry.observe_packet(message.application,&message.payload);
                         received+=1;last_received=Instant::now();
@@ -1598,26 +1833,29 @@ pub fn run_with_options(
                                 application_close=Some(reason);return Ok(());
                             }
                         } else if message.application==6 && message.channel==3 {
-                            sync.receive(&message.payload,&clock,true).map_err(|_| "time-sync-receive-failed")?;
-                        } else {
-                            tokio::select! {
-                                result=world_tx.send(message) => {result.map_err(|_| "world-owner-stopped")?;}
-                                _=&mut deadline => {duration_reached=true;return Ok(());}
+                            if sync.receive(&message.payload,&clock,true).map_err(|_| "time-sync-receive-failed")? {
+                                if let (Some(runtime),Some(rtt))=(&runtime_rtt,sync.latest_rtt_ms()) { runtime.observe(rtt); }
                             }
+                        } else {
+                            pending_world=Some(message);
                         }
                     }
-                    datagram=receive_unreliable(&connection) => {
-                        let datagram=datagram.map_err(|_| "datagram-read-failed")?;
+                    datagram=receive_budgeted_datagram(&connection,&budget,ping_clock), if pending_world.is_none() => {
+                        let (datagram,received_clock_word,permit)=datagram?;
+                        unreliable_packets_received+=1;
                         if !datagram.complete {fragmented_datagrams+=1;continue;}
                         let Some(&(app,channel))=channels.get(&datagram.wire_id) else {unknown_datagrams+=1;continue;};
+                        *unreliable_channels_received.entry(format!("{app}:{channel}")).or_default()+=1;
                         ping_telemetry.observe_packet(app,&datagram.payload);
                         received+=1;last_received=Instant::now();
-                        if app==6 && channel==3 {sync.receive(&datagram.payload,&clock,true).map_err(|_| "time-sync-receive-failed")?;}
-                        else {
-                            tokio::select! {
-                                result=enqueue(&world_tx,&budget,app,channel,datagram.payload,ping_clock) => {result?;}
-                                _=&mut deadline => {duration_reached=true;return Ok(());}
+                        if app==6 && channel==3 {
+                            if sync.receive(&datagram.payload,&clock,true).map_err(|_| "time-sync-receive-failed")? {
+                                if let (Some(runtime),Some(rtt))=(&runtime_rtt,sync.latest_rtt_ms()) { runtime.observe(rtt); }
                             }
+                        }
+                        else {
+                            pending_world=Some(Incoming {application:app,channel,payload:datagram.payload,
+                                received_clock_word,_budget:permit});
                         }
                     }
 
@@ -1638,6 +1876,7 @@ pub fn run_with_options(
         // Freeze the observation before our own close wakes reliable readers.
         // Shutdown-induced NotConnected is not a peer failure.
         let observed_receive_failure=receive_failure.lock().ok().and_then(|value|value.clone());
+        crate::memory_diagnostics::heap("transport_before_stop");
         stop.store(true,Ordering::Release);
         connection.close(0u32.into(),b"rust session complete"); endpoint.close(0u32.into(),b"rust session complete");
         readers.abort_all(); while readers.join_next().await.is_some() {}
@@ -1660,7 +1899,7 @@ pub fn run_with_options(
         );
         let _=tokio::time::timeout(Duration::from_millis(500),endpoint.wait_idle()).await;
         let stats=socket.stats();
-        let completed=duration_reached && session_result.is_ok() && report["ok"]==true;
+        let completed=(duration_reached || user_left) && session_result.is_ok() && report["ok"]==true;
         report["ok"]=json!(completed);
         if let Err(error)=session_result {
             report["transport_error"]=json!(error);
@@ -1677,6 +1916,7 @@ pub fn run_with_options(
         report["unreliable_remote_server_events_sent"]=json!(unreliable_remote_server_events_sent);
         report["remote_server_calls_sent"]=json!(remote_server_calls_sent);
         report["script_contacts_sent"]=json!(script_contacts_sent);
+        report["physics_contact_packets_sent"]=json!(physics_contacts_sent);
         let mut physics=report["local_prediction"].clone();
         physics["enabled"]=json!(physics_enabled);
         physics["error"]=report["physics_error"].clone();
@@ -1691,7 +1931,21 @@ pub fn run_with_options(
             physics["frames_coalesced"]=json!(output.coalesced);
         }
         report["character_physics"]=physics;
-        report["stage"]=json!(if completed {"receive_duration_complete"} else {"receive_session_ended"});
+        report["owned_part_physics"]["records_sent"]=json!(owned_part_records_sent);
+        report["owned_part_physics"]["wire_format"]=json!("isr_legacy_pv");
+        report["owned_part_physics"]["application"]=json!(crate::isr_sender::APPLICATION);
+        report["owned_part_physics"]["channel"]=json!(crate::isr_sender::CHANNEL);
+        report["owned_part_physics"]["clock"]=report["owned_part_clock"].clone();
+        report["owned_part_physics"]["remote_clock_offset"]=json!(isr_clock.offset);
+        report["owned_part_physics"]["clock_estimator"]=isr_clock.report();
+        report["owned_part_physics"]["delivery"]=delivery.report();
+        report["owned_part_physics"]["packets_sent"]=json!(owned_part_packets_sent);
+        report["owned_part_physics"]["stale_records_dropped"]=json!(0);
+        if let Ok(output)=physics_output.lock() {
+            report["owned_part_physics"]["queue_policy"]=json!("bounded_ordered_physical_batches");
+        }
+        report["stage"]=json!(if user_left {"user_left"} else if completed {"receive_duration_complete"} else {"receive_session_ended"});
+        report["stopped_by_user"]=json!(user_left);
         report["stayed_open_for_requested_duration"]=json!(duration_reached);
         report["requested_seconds"]=json!(seconds); report["connected_seconds"]=json!(connected_seconds);
         report["elapsed_seconds"]=json!(started.elapsed().as_secs_f64());report["application_messages_received"]=json!(received);
@@ -1700,8 +1954,17 @@ pub fn run_with_options(
         report["receive_failure"]=observed_receive_failure.unwrap_or(Value::Null);
         report["time_sync"]=sync.public_report(); report["negotiated_capabilities"]=json!(format!("{negotiated:016x}"));
         report["udp_datagrams_sent"]=json!(stats.datagrams_sent);report["udp_datagrams_received"]=json!(stats.datagrams_received);
+        report["unreliable_packets_received"]=json!(unreliable_packets_received);
+        report["quic_datagram_frames_received"]=json!(connection.quic_connection().stats().frame_rx.datagram);
+        report["unreliable_channels_received"]=json!(unreliable_channels_received);
+        report["unreliable_channel_mappings"]=json!(channels);
         report["unknown_datagrams"]=json!(unknown_datagrams);report["fragmented_datagrams"]=json!(fragmented_datagrams);
         report["peak_kernel_resident_bytes"]=json!(peak_process_rss_bytes().ok());report["resident_end_bytes"]=json!(current_process_rss_bytes().ok());
+        if let Some(peak)=report["peak_kernel_resident_bytes"].as_u64() { ram_budget.observe(peak); }
+        report["ram_budget_bytes"]=json!(ram_budget.limit_bytes());
+        report["ram_buffer_bytes"]=json!(ram_budget.buffer_bytes());
+        report["ram_budget_scope"]=json!("client_process");
+        report["ram_budget_is_soft"]=json!(true);
         Ok(report)
     })
 }
@@ -2090,6 +2353,42 @@ mod runtime_tests {
     }
 
     #[test]
+    fn received_instance_state_uses_live_world_receipts_without_property_acks() {
+        let mut schema = ack_world().core.schema().unwrap().clone();
+        schema.classes[0].properties.clear();
+        schema.classes[0].isr_properties = vec![0];
+        schema.properties[0].name = "ReplicationPV".into();
+        schema.properties[0].type_id = 57;
+        let core = SessionCore::with_schema(schema, 8, 65536).unwrap();
+        let mut world = ReceivedWorld::with_core(core, 42).unwrap();
+        world.core.set_instance_state_legacy_pv(true);
+        world.ingest(&[129, 0, 0, 0, 0, 0, 0, 0, 1, 0]).unwrap();
+        let mut create = vec![131, 2, 1];
+        create.extend(7u32.to_le_bytes());
+        create.extend([0, 0, 255, 255, 0, 0]);
+        world.ingest(&create).unwrap();
+        let mut packet = vec![161];
+        packet.extend(100u32.to_le_bytes());
+        packet.extend(1u32.to_le_bytes());
+        packet.extend(0i32.to_le_bytes());
+        packet.extend([1, 0, 0, 0, 1]);
+        packet.extend(7u32.to_le_bytes());
+        packet.extend([0, 0, 1, 0]);
+        packet.extend(1u64.to_le_bytes());
+        packet.extend([1, 0, 0xe1]);
+        let before = world.core.world_sequence().unwrap();
+        assert!(world.ingest_at(&packet, 200).unwrap().is_empty());
+        assert_eq!(world.core.world_sequence(), Some(before + 1));
+        assert_eq!(world.core.instance_state_report()["records_applied"], 1);
+        assert!(world.ready_property_ack.is_none());
+        assert_eq!(world.core.world_view().unwrap().get_property("1:7", "ReplicationPV").unwrap()["position"], json!([0.,0.,0.]));
+        packet.pop();
+        assert!(world.ingest_at(&packet, 300).unwrap().is_empty());
+        assert_eq!(world.core.world_sequence(), Some(before + 1));
+        assert_eq!(world.core.instance_state_report()["packets_rejected"], 1);
+    }
+
+    #[test]
     fn cframe_receipts_prepare_and_commit_native_acknowledgements() {
         let mut world = ack_world();
         world.ingest(&[129, 0, 0, 0, 0, 0, 0, 0, 1, 0]).unwrap();
@@ -2127,6 +2426,19 @@ mod runtime_tests {
         assert_eq!(world.property_acks.report()["replies_sent"], 2);
         assert_eq!(world.property_acks.report()["pending"], 0);
         assert_eq!(world.simulation_clock.step, 48);
+
+        // Independent network channels may arrive in the reverse timestamp
+        // order. Their actual local processing clock still advances normally.
+        world.prediction_started = Instant::now() - Duration::from_millis(300);
+        for received_clock_word in [u32::MAX, 1] {
+            let message=Incoming {application:4,channel:1,payload:cframe_set(7,false),
+                received_clock_word,_budget:Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()};
+            world.ingest_received(&message).unwrap();
+            let ack=world.ready_property_ack.take().unwrap();
+            world.property_acks.commit(ack.id(),true).unwrap();
+        }
+        assert_eq!(world.property_acks.report()["replies_sent"],4);
+        assert!(world.simulation_clock.step>=72 && world.simulation_clock.step<1000);
     }
 
     #[test]

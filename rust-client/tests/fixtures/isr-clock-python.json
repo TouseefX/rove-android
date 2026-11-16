@@ -1,0 +1,254 @@
+[
+  {
+    "remote": 4294966530,
+    "ack": 4294967280,
+    "current": 4294967289,
+    "offset": -750,
+    "stabilized": false
+  },
+  {
+    "remote": 4294966607,
+    "ack": 44,
+    "current": 53,
+    "offset": -748,
+    "stabilized": false
+  },
+  {
+    "remote": 4294966718,
+    "ack": 104,
+    "current": 113,
+    "offset": -741,
+    "stabilized": false
+  },
+  {
+    "remote": 4294966863,
+    "ack": 164,
+    "current": 173,
+    "offset": -726,
+    "stabilized": false
+  },
+  {
+    "remote": 4294967042,
+    "ack": 224,
+    "current": 233,
+    "offset": -701,
+    "stabilized": false
+  },
+  {
+    "remote": 4294966842,
+    "ack": 284,
+    "current": 293,
+    "offset": -701,
+    "stabilized": false
+  },
+  {
+    "remote": 4294967089,
+    "ack": 344,
+    "current": 353,
+    "offset": -685,
+    "stabilized": false
+  },
+  {
+    "remote": 4294966957,
+    "ack": 404,
+    "current": 413,
+    "offset": -685,
+    "stabilized": false
+  },
+  {
+    "remote": 4294967272,
+    "ack": 464,
+    "current": 473,
+    "offset": -665,
+    "stabilized": false
+  },
+  {
+    "remote": 4294967208,
+    "ack": 524,
+    "current": 533,
+    "offset": -665,
+    "stabilized": false
+  },
+  {
+    "remote": 4294967178,
+    "ack": 584,
+    "current": 593,
+    "offset": -665,
+    "stabilized": false
+  },
+  {
+    "remote": 299,
+    "ack": 644,
+    "current": 653,
+    "offset": -633,
+    "stabilized": false
+  },
+  {
+    "remote": 337,
+    "ack": 704,
+    "current": 713,
+    "offset": -606,
+    "stabilized": false
+  },
+  {
+    "remote": 409,
+    "ack": 764,
+    "current": 773,
+    "offset": -580,
+    "stabilized": false
+  },
+  {
+    "remote": 102,
+    "ack": 824,
+    "current": 833,
+    "offset": -580,
+    "stabilized": false
+  },
+  {
+    "remote": 242,
+    "ack": 884,
+    "current": 893,
+    "offset": -580,
+    "stabilized": false
+  },
+  {
+    "remote": 416,
+    "ack": 944,
+    "current": 953,
+    "offset": -574,
+    "stabilized": false
+  },
+  {
+    "remote": 624,
+    "ack": 1004,
+    "current": 1013,
+    "offset": -554,
+    "stabilized": false
+  },
+  {
+    "remote": 453,
+    "ack": 1064,
+    "current": 1073,
+    "offset": -554,
+    "stabilized": false
+  },
+  {
+    "remote": 729,
+    "ack": 1124,
+    "current": 1133,
+    "offset": -538,
+    "stabilized": false
+  },
+  {
+    "remote": 626,
+    "ack": 1184,
+    "current": 1193,
+    "offset": -538,
+    "stabilized": false
+  },
+  {
+    "remote": 557,
+    "ack": 1244,
+    "current": 1253,
+    "offset": -538,
+    "stabilized": false
+  },
+  {
+    "remote": 935,
+    "ack": 1304,
+    "current": 1313,
+    "offset": -521,
+    "stabilized": false
+  },
+  {
+    "remote": 934,
+    "ack": 1364,
+    "current": 1373,
+    "offset": -521,
+    "stabilized": false
+  },
+  {
+    "remote": 967,
+    "ack": 1424,
+    "current": 1433,
+    "offset": -514,
+    "stabilized": false
+  },
+  {
+    "remote": 1034,
+    "ack": 1484,
+    "current": 1493,
+    "offset": -507,
+    "stabilized": false
+  },
+  {
+    "remote": 1135,
+    "ack": 1544,
+    "current": 1553,
+    "offset": -497,
+    "stabilized": false
+  },
+  {
+    "remote": 857,
+    "ack": 1604,
+    "current": 1613,
+    "offset": -497,
+    "stabilized": false
+  },
+  {
+    "remote": 1026,
+    "ack": 1664,
+    "current": 1673,
+    "offset": -497,
+    "stabilized": false
+  },
+  {
+    "remote": 1229,
+    "ack": 1724,
+    "current": 1733,
+    "offset": -496,
+    "stabilized": false
+  },
+  {
+    "remote": 1053,
+    "ack": 1784,
+    "current": 1793,
+    "offset": -496,
+    "stabilized": false
+  },
+  {
+    "remote": 1324,
+    "ack": 1844,
+    "current": 1853,
+    "offset": -498,
+    "stabilized": false
+  },
+  {
+    "remote": 1216,
+    "ack": 1904,
+    "current": 1913,
+    "offset": -498,
+    "stabilized": false
+  },
+  {
+    "remote": 1555,
+    "ack": 1964,
+    "current": 1973,
+    "offset": -489,
+    "stabilized": false
+  },
+  {
+    "remote": 1515,
+    "ack": 2024,
+    "current": 2033,
+    "offset": -489,
+    "stabilized": false
+  },
+  {
+    "remote": 1509,
+    "ack": 2084,
+    "current": 2093,
+    "offset": -489,
+    "stabilized": false
+  }
+]

@@ -3,13 +3,17 @@
 //! establish peer acceptance or support for motors and dependent bodies.
 
 use crate::physics_codec::{encode_position, encode_velocity};
+#[path = "physics_rotation.rs"]
+mod rotation;
+pub(crate) use rotation::{validate as validate_rotation, IDENTITY};
+pub(crate) use rotation::encode as encode_rotation;
 
 pub const APPLICATION: u8 = 4;
 pub const CHANNEL: u8 = 6;
 // Clock channels use 2/4 and the ping writer uses 6. Outgoing IDs are local.
 pub const WIRE_ID: u32 = 8;
 
-fn reference(output: &mut Vec<u8>, scope: u32, index: u32) -> Result<(), &'static str> {
+pub(crate) fn reference(output: &mut Vec<u8>, scope: u32, index: u32) -> Result<(), &'static str> {
     if scope == 0 || scope == u32::MAX {
         return Err("physics-root-reference-invalid");
     }
@@ -33,6 +37,20 @@ pub fn encode_root_frame(
     velocity: [f64; 3],
     grounded: bool,
 ) -> Result<Vec<u8>, &'static str> {
+    encode_root_frame_with_rotation(root, timestamp_ms, sequence, position, IDENTITY, velocity, grounded)
+}
+
+/// Preserve the requested root orientation instead of replacing it with identity.
+pub fn encode_root_frame_with_rotation(
+    root: u64,
+    timestamp_ms: u64,
+    sequence: u64,
+    position: [f64; 3],
+    orientation: [f64; 9],
+    velocity: [f64; 3],
+    grounded: bool,
+) -> Result<Vec<u8>, &'static str> {
+    let packed_rotation = if orientation == IDENTITY { None } else { Some(rotation::encode(orientation)?) };
     if sequence == 0 {
         return Err("physics-sequence-invalid");
     }
@@ -45,13 +63,41 @@ pub fn encode_root_frame(
     output.extend_from_slice(&[0, 1]); // No cached block; current body present.
     output.push(if grounded { 8 } else { 5 }); // Running / Freefall.
     output.push(0); // Empty motor block for the supported own-root branch.
-    output.push(1); // Identity rotation; position and both velocities present.
+    output.push(if packed_rotation.is_some() { 0 } else { 1 });
     output.extend(encode_position(position).map_err(|_| "physics-position-invalid")?);
+    if let Some(packed) = packed_rotation { output.extend(packed); }
     output.extend(encode_velocity(velocity).map_err(|_| "physics-velocity-invalid")?);
     output.push(0); // Zero angular velocity.
     output.push(0); // Current record's null world-coordinate reference.
     output.push(0); // End dependent bodies.
     output.push(0); // End top-level roots.
+    Ok(output)
+}
+
+/// Isolated-part client-current records have no Humanoid state or child list.
+/// All authority/topology checks belong to the received-world owner.
+pub(crate) fn encode_owned_parts(timestamp_ms: u64, sequence: u64,
+    frames: &[crate::owned_part_poses::PartFrame]) -> Result<Vec<u8>, &'static str> {
+    if sequence == 0 { return Err("physics-sequence-invalid"); }
+    if frames.is_empty() || frames.len() > 8 { return Err("physics-part-batch-invalid"); }
+    let mut output = Vec::with_capacity(18 + 80 * frames.len());
+    output.push(0x1b);
+    output.extend(timestamp_ms.to_le_bytes());
+    output.extend(sequence.to_le_bytes());
+    output.push(0x85);
+    for frame in frames {
+        reference(&mut output, (frame.id >> 32) as u32, frame.id as u32)?;
+        output.extend([0, 1, 0x20, 0]); // no cache, body, isolated, zero motors
+        // Use the same native quaternion branch as the independent Python
+        // isolated-part codec, including identity rotations.
+        output.push(0);
+        output.extend(encode_position(frame.position).map_err(|_| "physics-position-invalid")?);
+        output.extend(rotation::encode(frame.rotation)?);
+        output.extend(encode_velocity(frame.linear).map_err(|_| "physics-velocity-invalid")?);
+        output.extend(encode_velocity(frame.angular).map_err(|_| "physics-velocity-invalid")?);
+        output.push(0); // current record's world-coordinate reference
+    }
+    output.push(0); // end top-level roots; bit5 omits dependent-body terminators
     Ok(output)
 }
 

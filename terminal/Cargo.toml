@@ -1,0 +1,37 @@
+[package]
+name = "rove-terminal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+headless-luau = { path = "../rust-client", optional = true }
+rove-client-core = { path = "../client-core", optional = true }
+libc = "=0.2.191"
+ratatui = "=0.29.0"
+ratatui-image = { version = "=8.1.1", default-features = false, features = ["crossterm"] }
+image = { version = "=0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }
+crossterm = "=0.28.1"
+serde_json = "=1.0.154"
+ureq = "=2.9.7"
+url = "=2.5.8"
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.0"
+mimalloc = { version = "=0.1.52", default-features = false, features = ["override", "v2"] }
+
+[features]
+default = []
+embedded-worker = ["dep:headless-luau", "dep:rove-client-core"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[patch.crates-io]
+quinn-proto = { path = "../vendor/quinn-proto" }
+mlua-sys = { path = "../rust-runtime-sys/vendor/mlua-sys" }
+libmimalloc-sys = { path = "../rust-client/vendor/libmimalloc-sys" }
+
+[profile.release]
+opt-level = 2
+strip = true

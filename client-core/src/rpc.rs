@@ -315,6 +315,8 @@ struct OutboundPending {
     success_event: u16,
     error_event: u16,
     after_sequence: u64,
+    submitted_at: std::time::Instant,
+    receiver_name: String,
 }
 
 /// Small proof retained from this session's validated globals, before later
@@ -578,13 +580,16 @@ impl RpcSession {
             let Some(wire_id) = args[0].as_i64().and_then(|v| i32::try_from(v).ok()) else {
                 continue;
             };
+            // Each direction owns its counters. A callback may have the same
+            // receiver/counter as our outstanding InvokeServer, especially
+            // when the server invokes the client while servicing that call.
+            // Route by the received descriptor before correlating a result.
+            if event_name(schema, event_id as usize) == Some("RemoteOnInvokeClient") {
+                self.observe_client_request(schema, view, target, event_id, args)?;
+                continue;
+            }
             let key = (target.to_owned(), wire_id);
             let Some(pending) = self.pending.get(&key).cloned() else {
-                // A recognized callback request is accepted into a bounded
-                // reply queue only after validation against schema and world.
-                if event_name(schema, event_id as usize) == Some("RemoteOnInvokeClient") {
-                    self.observe_client_request(schema, view, target, event_id, args)?;
-                }
                 continue;
             };
             if seq <= pending.after_sequence {
@@ -833,8 +838,27 @@ impl RpcSession {
             success_event: success as u16,
             error_event: error as u16,
             after_sequence: sequence,
+            submitted_at: std::time::Instant::now(),
+            receiver_name: receiver_name(view, &call.node),
         };
         Ok((payload, (call.node.clone(), wire), pending))
+    }
+
+    /// Bounded metadata only: no arguments, callback values, or session secrets.
+    /// Sending a request does not imply that the server accepted it.
+    pub fn pending_report(&self) -> Value {
+        let mut calls: Vec<_> = self.pending.iter().collect();
+        calls.sort_unstable_by_key(|(_, pending)| pending.token);
+        let details: Vec<_> = calls.into_iter().take(8).map(|((node, counter), pending)| {
+            serde_json::json!({
+                "request_id": pending.token, "node": node,
+                "receiver_name": pending.receiver_name, "wire_counter": counter,
+                "elapsed_seconds": pending.submitted_at.elapsed().as_secs_f64(),
+                "after_sequence": pending.after_sequence,
+            })
+        }).collect();
+        serde_json::json!({"server_calls": self.pending.len(),
+            "client_callbacks": self.client_pending.len(), "details": details})
     }
 
     pub fn pending_len(&self) -> usize {
@@ -843,6 +867,17 @@ impl RpcSession {
     pub fn capabilities(&self) -> u32 {
         self.capabilities
     }
+}
+
+fn receiver_name(view: &WorldView, id: &str) -> String {
+    let name = view.name(id).map(str::to_owned).or_else(|| {
+        let value = view.get_property(id, "Name")?;
+        value.as_str().map(str::to_owned).or_else(|| {
+            let hex = value.get("$bytes_hex")?.as_str()?;
+            crate::runtime_snapshot::decode_name_hex(hex).ok()
+        })
+    }).unwrap_or_default();
+    name.chars().take(128).collect()
 }
 
 fn failed(p: &OutboundPending, message: &str) -> RemoteResult {
@@ -1810,6 +1845,71 @@ mod tests {
         .is_err());
         let mut budget = MAX_VALUE_ITEMS;
         assert!(variant(&json!([1, 2]), &view, 0, &mut budget).is_err());
+    }
+
+    #[test]
+    fn pending_names_support_received_binary_name_properties() {
+        let view = crate::world::WorldStore::from_snapshot(&json!({"version":1,"nodes":[
+            {"id":"1:3","class_name":"RemoteFunction","properties":{"Name":{"$bytes_hex":"5265636569766564204e616d65"}}}
+        ]})).unwrap().view();
+        assert_eq!(receiver_name(&view, "1:3"), "Received Name");
+    }
+
+    #[test]
+    fn opposite_direction_requests_can_share_a_receiver_and_counter() {
+        let schema = test_schema();
+        let view = test_world();
+        let mut rpc = RpcSession::new(9, 7, (1, 2), 0x100000).unwrap();
+        rpc.queue_server_call(9, ServerCall {
+            node: "1:3".into(), request_id: 88, arguments: vec![],
+        }).unwrap();
+        let mut tx = MockTransport::default();
+        rpc.drain_outbound(9, &schema, &view, 1, &mut tx, 16).unwrap();
+        let active = HashSet::from([88]);
+        // The server invokes this same RemoteFunction before answering our call.
+        // Its counter belongs to the opposite direction and is not our result.
+        let results = rpc.observe_record(9, &schema, &view,
+            &record(2, vec![json!({"key":"1:3","event":0,"arguments":[1,[]]})]),
+            &active).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(rpc.pending_len(), 2);
+        rpc.queue_client_reply(9, ClientReply {
+            node: "1:3".into(), request_id: 1, ok: true,
+            values: vec![json!("callback result")], error: None,
+        }).unwrap();
+        rpc.drain_outbound(9, &schema, &view, 2, &mut tx, 16).unwrap();
+        assert_eq!(rpc.pending_len(), 1);
+        let results = rpc.observe_record(9, &schema, &view,
+            &record(3, vec![json!({"key":"1:3","event":1,"arguments":[1,[42]]})]),
+            &active).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_id, 88);
+        assert_eq!(results[0].values, Some(vec![json!(42)]));
+        assert_eq!(rpc.pending_len(), 0);
+    }
+
+    #[test]
+    fn pending_report_is_bounded_and_does_not_retain_arguments() {
+        let schema = test_schema();
+        let view = test_world();
+        let mut rpc = RpcSession::new(9, 7, (1, 2), 0x100000).unwrap();
+        for request_id in 1..=10 {
+            rpc.queue_server_call(9, ServerCall {
+                node: "1:3".into(), request_id,
+                arguments: vec![json!("argument-must-not-appear")],
+            }).unwrap();
+        }
+        let mut tx = MockTransport::default();
+        rpc.drain_outbound(9, &schema, &view, 1, &mut tx, 16).unwrap();
+        let report = rpc.pending_report();
+        assert_eq!(report["server_calls"], 10);
+        assert_eq!(report["client_callbacks"], 0);
+        assert_eq!(report["details"].as_array().unwrap().len(), 8);
+        assert_eq!(report["details"][0]["receiver_name"], "RF");
+        assert_eq!(report["details"][0]["request_id"], 1);
+        assert_eq!(report["details"][0]["wire_counter"], 1);
+        assert!(!report.to_string().contains("argument-must-not-appear"));
+        assert!(report["details"][0]["elapsed_seconds"].as_f64().unwrap() >= 0.0);
     }
 
     #[test]

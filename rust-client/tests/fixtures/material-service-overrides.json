@@ -1,0 +1,206 @@
+{
+  "source": "https://raw.githubusercontent.com/Roblox/creator-docs/main/content/en-us/reference/engine/classes/MaterialService.yaml",
+  "source_sha256": "d289690641bfa5b4bd06985f2dd3a8b9ef533bd45973b09c8b332698a43db9fe",
+  "overrides": [
+    {
+      "name": "Asphalt",
+      "value": 1376,
+      "property": "AsphaltName"
+    },
+    {
+      "name": "Basalt",
+      "value": 788,
+      "property": "BasaltName"
+    },
+    {
+      "name": "Brick",
+      "value": 848,
+      "property": "BrickName"
+    },
+    {
+      "name": "Cardboard",
+      "value": 2304,
+      "property": "CardboardName"
+    },
+    {
+      "name": "Carpet",
+      "value": 2305,
+      "property": "CarpetName"
+    },
+    {
+      "name": "CeramicTiles",
+      "value": 2306,
+      "property": "CeramicTilesName"
+    },
+    {
+      "name": "ClayRoofTiles",
+      "value": 2307,
+      "property": "ClayRoofTilesName"
+    },
+    {
+      "name": "Cobblestone",
+      "value": 880,
+      "property": "CobblestoneName"
+    },
+    {
+      "name": "Concrete",
+      "value": 816,
+      "property": "ConcreteName"
+    },
+    {
+      "name": "CorrodedMetal",
+      "value": 1040,
+      "property": "CorrodedMetalName"
+    },
+    {
+      "name": "CrackedLava",
+      "value": 804,
+      "property": "CrackedLavaName"
+    },
+    {
+      "name": "DiamondPlate",
+      "value": 1056,
+      "property": "DiamondPlateName"
+    },
+    {
+      "name": "Fabric",
+      "value": 1312,
+      "property": "FabricName"
+    },
+    {
+      "name": "Foil",
+      "value": 1072,
+      "property": "FoilName"
+    },
+    {
+      "name": "Glacier",
+      "value": 1552,
+      "property": "GlacierName"
+    },
+    {
+      "name": "Granite",
+      "value": 832,
+      "property": "GraniteName"
+    },
+    {
+      "name": "Grass",
+      "value": 1280,
+      "property": "GrassName"
+    },
+    {
+      "name": "Ground",
+      "value": 1360,
+      "property": "GroundName"
+    },
+    {
+      "name": "Ice",
+      "value": 1536,
+      "property": "IceName"
+    },
+    {
+      "name": "LeafyGrass",
+      "value": 1284,
+      "property": "LeafyGrassName"
+    },
+    {
+      "name": "Leather",
+      "value": 2309,
+      "property": "LeatherName"
+    },
+    {
+      "name": "Limestone",
+      "value": 820,
+      "property": "LimestoneName"
+    },
+    {
+      "name": "Marble",
+      "value": 784,
+      "property": "MarbleName"
+    },
+    {
+      "name": "Metal",
+      "value": 1088,
+      "property": "MetalName"
+    },
+    {
+      "name": "Mud",
+      "value": 1344,
+      "property": "MudName"
+    },
+    {
+      "name": "Pavement",
+      "value": 836,
+      "property": "PavementName"
+    },
+    {
+      "name": "Pebble",
+      "value": 864,
+      "property": "PebbleName"
+    },
+    {
+      "name": "Plaster",
+      "value": 2310,
+      "property": "PlasterName"
+    },
+    {
+      "name": "Plastic",
+      "value": 256,
+      "property": "PlasticName"
+    },
+    {
+      "name": "Rock",
+      "value": 896,
+      "property": "RockName"
+    },
+    {
+      "name": "RoofShingles",
+      "value": 2308,
+      "property": "RoofShinglesName"
+    },
+    {
+      "name": "Rubber",
+      "value": 2311,
+      "property": "RubberName"
+    },
+    {
+      "name": "Salt",
+      "value": 1392,
+      "property": "SaltName"
+    },
+    {
+      "name": "Sand",
+      "value": 1296,
+      "property": "SandName"
+    },
+    {
+      "name": "Sandstone",
+      "value": 912,
+      "property": "SandstoneName"
+    },
+    {
+      "name": "SmoothPlastic",
+      "value": 272,
+      "property": "SmoothPlasticName"
+    },
+    {
+      "name": "Slate",
+      "value": 800,
+      "property": "SlateName"
+    },
+    {
+      "name": "Snow",
+      "value": 1328,
+      "property": "SnowName"
+    },
+    {
+      "name": "Wood",
+      "value": 512,
+      "property": "WoodName"
+    },
+    {
+      "name": "WoodPlanks",
+      "value": 528,
+      "property": "WoodPlanksName"
+    }
+  ]
+}

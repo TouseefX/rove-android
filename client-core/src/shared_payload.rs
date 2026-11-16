@@ -118,7 +118,13 @@ pub(crate) fn compress_bytes(raw: &[u8]) -> Option<Vec<u8>> {
     COMPRESSOR.with(|cell| {
         let mut context = cell.borrow_mut();
         if context.is_none() {
-            *context = zstd::bulk::Compressor::with_dictionary(1, PROPERTY_DICTIONARY).ok();
+            *context = zstd::bulk::Compressor::with_dictionary(1, PROPERTY_DICTIONARY).ok().and_then(|mut compressor| {
+                use zstd::zstd_safe::CParameter;
+                compressor.set_parameter(CParameter::WindowLog(16)).ok()?;
+                compressor.set_parameter(CParameter::HashLog(13)).ok()?;
+                compressor.set_parameter(CParameter::ChainLog(13)).ok()?;
+                Some(compressor)
+            });
         }
         context
             .as_mut()
@@ -144,6 +150,23 @@ pub(crate) fn decompress_bytes(bytes: &[u8], expanded: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_values_round_trip_without_retaining_a_large_compression_workspace() {
+        let mut state=0x12345678u32;
+        let bytes=(0..2*1024*1024).map(|_| {
+            state^=state<<13; state^=state>>17; state^=state<<5; state as u8
+        }).collect::<Vec<_>>();
+        let encoded=compress_bytes(&bytes).unwrap();
+        assert_eq!(decompress_bytes(&encoded,bytes.len()),bytes);
+        COMPRESSOR.with(|cell| {
+            let bytes=cell.borrow_mut().as_mut().unwrap().context_mut().sizeof();
+            assert!(bytes < 512*1024,"compressor retained {bytes} bytes after one large value");
+        });
+        let small=b"{\"Name\":\"Part\",\"Anchored\":false}";
+        let encoded=compress_bytes(small).unwrap();
+        assert_eq!(decompress_bytes(&encoded,small.len()),small);
+    }
 
     #[test]
     fn dictionary_round_trip_is_exact_across_owner_threads() {

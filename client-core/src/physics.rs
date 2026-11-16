@@ -758,7 +758,7 @@ fn oriented_surface_records(
     }
 }
 
-fn received_rotation(frame: &serde_json::Value) -> Option<[f64; 9]> {
+pub fn received_rotation(frame: &serde_json::Value) -> Option<[f64; 9]> {
     if let Some(rotation) = frame.get("rotation") {
         return rotation_array(rotation);
     }

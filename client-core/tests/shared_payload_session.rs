@@ -160,6 +160,13 @@ fn part_node(index: u32, property: Value) -> Value {
         "parent": null,
         "properties": {"SharedPayload": property},
         "origins": {},
+        // completed creates start with empty attributes and tags.
+        "attributes": {},
+        "attributes_known": true,
+        "attributes_origin": "constructor_default",
+        "collection_tags": [],
+        "collection_tags_known": true,
+        "collection_tags_origin": "constructor_default",
         // this packet finished creating the node; constructor defaults are still unknown
         "received_creation_complete": true,
         "constructor_defaults_known": false

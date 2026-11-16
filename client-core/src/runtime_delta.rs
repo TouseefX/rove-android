@@ -58,8 +58,8 @@ impl RuntimeDeltaNormalizer {
         let mut class_property_types = HashMap::with_capacity(schema.classes.len());
         for class in &schema.classes {
             let mut types = HashMap::with_capacity(class.properties.len());
-            for property_id in &class.properties {
-                let property = &schema.properties[*property_id];
+            for property_id in class.properties.iter().copied().chain(class.isr_properties.iter().map(|&id| id as usize)) {
+                let property = &schema.properties[property_id];
                 types.insert(property.name.clone(), property.type_id);
             }
             class_property_types.insert(class.name.clone(), types);
@@ -331,6 +331,31 @@ impl RuntimeDeltaNormalizer {
                         .filter(|value| !value.is_empty())
                         .ok_or("create node id must be a non-empty string")?
                         .to_owned();
+                    // Mirror canonical creation semantics before compacting the
+                    // VM view. Explicit malformed blobs must remain unknown.
+                    let blob = if compacted_create_id.is_some() {
+                        post_receipt_view.and_then(|v| v.get_property(&node_id, "AttributesReplicate"))
+                    } else {
+                        node.get("properties").and_then(|p| p.get("AttributesReplicate")).cloned()
+                    };
+                    let attrs = crate::received_attributes::creation(blob.as_ref(),
+                        (removed.contains(&node_id) || pre_receipt_view.read_only_node(&node_id).is_none())
+                        && !created_classes.contains_key(&node_id)
+                        && node.get("attributes_known").is_none()
+                        && node["received_creation_complete"] == Value::Bool(true));
+                    node.as_object_mut().ok_or("create node must be an object")?.extend(attrs);
+                    let blob = if compacted_create_id.is_some() {
+                        post_receipt_view.and_then(|v| v.get_property(&node_id, "Tags"))
+                    } else {
+                        node.get("properties").and_then(|p| p.get("Tags")).cloned()
+                    };
+                    let tags = crate::received_tags::creation(blob.as_ref(),
+                        (removed.contains(&node_id) || pre_receipt_view.read_only_node(&node_id).is_none())
+                        && !created_classes.contains_key(&node_id)
+                        && node.get("collection_tags_known").is_none()
+                        && node.get("collection_tags").is_none()
+                        && node["received_creation_complete"] == Value::Bool(true));
+                    node.as_object_mut().ok_or("create node must be an object")?.extend(tags);
                     if !id.is_empty() && id != node_id {
                         return Err("create action id differs from node id".into());
                     }
@@ -378,6 +403,12 @@ impl RuntimeDeltaNormalizer {
                 "set" => {
                     if id.is_empty() {
                         return Err("set action id must be a non-empty string".into());
+                    }
+                    if let Some(blob) = action.get("fields").and_then(|f| f.get("AttributesReplicate")) {
+                        action["attribute_snapshot"] = Value::Object(crate::received_attributes::snapshot(blob));
+                    }
+                    if let Some(blob) = action.get("fields").and_then(|f| f.get("Tags")) {
+                        action["tag_snapshot"] = Value::Object(crate::received_tags::snapshot(blob));
                     }
                     let class_name = created_classes.get(id).map(String::as_str).or_else(|| {
                         (!removed.contains(id))
@@ -676,7 +707,11 @@ fn compact_create_action(
     Ok(Value::Object(compact_action))
 }
 
-pub(crate) fn normalize_remote_variant(value: &Value, depth: usize) -> Result<Value, String> {
+/// Convert one typed replication `Variant` into the data representation used
+/// by the Luau host. The host also calls this at its authenticated event
+/// boundary so a raw typed value cannot leak through an alternate receipt
+/// path.
+pub fn normalize_remote_variant(value: &Value, depth: usize) -> Result<Value, String> {
     if depth > 16 {
         return Err("remote value nesting exceeds limit".into());
     }
@@ -765,10 +800,10 @@ fn validate_schema(schema: &Schema) -> Result<(), String> {
         if class.id != index {
             return Err("schema class identifiers are invalid".into());
         }
-        for property_id in &class.properties {
+        for property_id in class.properties.iter().copied().chain(class.isr_properties.iter().map(|&id| id as usize)) {
             let property = schema
                 .properties
-                .get(*property_id)
+                .get(property_id)
                 .ok_or("schema class references a missing property")?;
             if property.class != class.id {
                 return Err("schema class property belongs to another class".into());
@@ -866,6 +901,11 @@ fn normalize_set_fields(
     action: &mut Value,
     types: Option<&HashMap<String, u8>>,
 ) -> Result<(), String> {
+    // Rebuild provenance from the received schema; never trust a source mask.
+    if let Some(object) = action.as_object_mut() {
+        object.remove("_physics_fields");
+    }
+    let mut physics_fields = Vec::new();
     let fields = action
         .get_mut("fields")
         .and_then(Value::as_object_mut)
@@ -875,10 +915,32 @@ fn normalize_set_fields(
             *value = normalize_cframe(value, type_id);
         }
     }
+    if types.and_then(|types| types.get("ReplicationPV")) == Some(&57) {
+        if let Some(pv) = fields.get("ReplicationPV").cloned() {
+            // Preserve physics provenance for notification planning. These
+            // values still replace local overrides and update Actor reads.
+            physics_fields.push("ReplicationPV");
+            if !fields.contains_key("CFrame") {
+                fields.insert("CFrame".into(), pv.clone());
+                physics_fields.push("CFrame");
+            }
+            for key in ["AssemblyLinearVelocity", "Velocity", "AssemblyAngularVelocity", "RotVelocity"] {
+                if let Some(value) = crate::runtime_snapshot::received_velocity(&pv, key)? {
+                    if !fields.contains_key(key) {
+                        fields.insert(key.into(), value);
+                        physics_fields.push(key);
+                    }
+                }
+            }
+        }
+    }
     if !fields.contains_key("Size") && types.and_then(|types| types.get("size")) == Some(&22) {
         if let Some(size) = fields.get("size").cloned() {
             fields.insert("Size".into(), size);
         }
+    }
+    if !physics_fields.is_empty() {
+        action["_physics_fields"] = json!(physics_fields);
     }
     Ok(())
 }
@@ -998,6 +1060,100 @@ mod tests {
             metadata: vec![],
             property_changes: vec![],
         }
+    }
+
+    #[test]
+    fn received_attributes_match_in_eager_and_shared_creation_and_updates() {
+        let schema = schema();
+        let mut normalizer = RuntimeDeltaNormalizer::new(&schema).unwrap();
+        let mut store = WorldStore::from_snapshot(&json!({"version":1,"sequence":0,"nodes":[]})).unwrap();
+        let before = store.view();
+        let receipt = record(json!({"version":1,"delta":true,"sequence":1,"actions":[
+            {"sequence":1,"kind":"create","id":"p","node":{"id":"p","class_name":"Part",
+             "received_creation_complete":true,"properties":{}}}]}),1);
+        store.apply_delta(&receipt.world_delta).unwrap();
+        let full = normalizer.normalize(&before,&receipt,false).unwrap();
+        let compact = normalizer.normalize_for_shared_view(&before,&store.view(),&receipt,false).unwrap();
+        for result in [full,compact] {
+            let node = &result.worker_delta["actions"][0]["node"];
+            assert_eq!(node["attributes_known"],true);
+            assert_eq!(node["attributes"],json!({}));
+        }
+        let before = store.view();
+        let receipt = record(json!({"version":1,"delta":true,"sequence":2,"actions":[
+            {"sequence":2,"kind":"set","id":"p","fields":{"AttributesReplicate":{"$bytes_hex":"010000000100000078042a000000"}}}]}),2);
+        store.apply_delta(&receipt.world_delta).unwrap();
+        let result = normalizer.normalize(&before,&receipt,false).unwrap();
+        assert_eq!(result.worker_delta["actions"][0]["attribute_snapshot"], json!({"attributes":{"x":42},"attributes_known":true}));
+        assert_eq!(store.view().read_only_node("p").unwrap().metadata_field("attributes","x"),Some(json!(42)));
+    }
+
+    #[test]
+    fn physics_projection_marks_only_fields_derived_from_typed_pv() {
+        let types = HashMap::from([("ReplicationPV".into(), 57)]);
+        let pv = json!({"position":[10,0,0],"rotation":1,"decoded_velocities":[[3,0,0],[0,4,0]]});
+        let mut action = json!({"kind":"set","fields":{"ReplicationPV":pv,"Transparency":0.5}});
+        normalize_set_fields(&mut action, Some(&types)).unwrap();
+        assert_eq!(action["_physics_fields"], json!(["ReplicationPV","CFrame","AssemblyLinearVelocity","Velocity","AssemblyAngularVelocity","RotVelocity"]));
+        assert_eq!(action["fields"]["AssemblyLinearVelocity"], json!({"$vector3":[3,0,0]}));
+        assert!(action["fields"]["CFrame"].get("$cframe").is_some());
+        assert!(action["fields"].get("_physics_fields").is_none());
+    }
+
+    #[test]
+    fn received_tags_match_in_eager_and_shared_creation_and_updates() {
+        let schema=schema();
+        let mut normalizer=RuntimeDeltaNormalizer::new(&schema).unwrap();
+        let mut store=WorldStore::from_snapshot(&json!({"version":1,"sequence":0,"nodes":[]})).unwrap();
+        let before=store.view();
+        let receipt=record(json!({"version":1,"delta":true,"sequence":1,"actions":[
+            {"sequence":1,"kind":"create","id":"p","node":{"id":"p","class_name":"Part",
+             "received_creation_complete":true,"properties":{}}}]}),1);
+        store.apply_delta(&receipt.world_delta).unwrap();
+        for result in [normalizer.normalize(&before,&receipt,false).unwrap(),
+            normalizer.normalize_for_shared_view(&before,&store.view(),&receipt,false).unwrap()] {
+            let node=&result.worker_delta["actions"][0]["node"];
+            assert_eq!(node["collection_tags_known"],true);
+            assert_eq!(node["collection_tags"],json!([]));
+        }
+        for (sequence,blob,known,tags) in [(2,json!({"$bytes_hex":"620061"}),true,json!(["a","b"])),
+            (3,json!({"$bytes_hex":"ff"}),false,json!([])),(4,json!(""),true,json!([]))] {
+            let before=store.view();
+            let receipt=record(json!({"version":1,"delta":true,"sequence":sequence,"actions":[
+                {"sequence":sequence,"kind":"set","id":"p","fields":{"Tags":blob}}]}),sequence);
+            store.apply_delta(&receipt.world_delta).unwrap();
+            for result in [normalizer.normalize(&before,&receipt,false).unwrap(),
+                normalizer.normalize_for_shared_view(&before,&store.view(),&receipt,false).unwrap()] {
+                assert_eq!(result.worker_delta["actions"][0]["tag_snapshot"],
+                    json!({"collection_tags":tags,"collection_tags_known":known}));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_motion_properties_keep_their_own_notification_origin() {
+        let types = HashMap::from([("ReplicationPV".into(), 57)]);
+        let mut action = json!({"kind":"set","fields":{
+            "ReplicationPV":{"position":[10,0,0],"rotation":1,"decoded_velocities":[[3,0,0],[0,4,0]]},
+            "CFrame":{"$cframe":{"position":[20,0,0],"rotation":[1,0,0,0,1,0,0,0,1]}},
+            "AssemblyLinearVelocity":{"$vector3":[7,0,0]}
+        }});
+        normalize_set_fields(&mut action, Some(&types)).unwrap();
+        assert_eq!(action["_physics_fields"],json!(["ReplicationPV","Velocity","AssemblyAngularVelocity","RotVelocity"]));
+        assert_eq!(action["fields"]["CFrame"]["$cframe"]["position"],json!([20,0,0]));
+        assert_eq!(action["fields"]["AssemblyLinearVelocity"],json!({"$vector3":[7,0,0]}));
+    }
+
+    #[test]
+    fn physics_provenance_requires_the_received_pv_type_and_does_not_guess_velocity() {
+        let pv = json!({"position":[10,0,0],"rotation":1});
+        let mut action = json!({"kind":"set","_physics_fields":["Color"],"fields":{"ReplicationPV":pv}});
+        normalize_set_fields(&mut action, None).unwrap();
+        assert!(action.get("_physics_fields").is_none());
+        assert!(action["fields"].get("CFrame").is_none());
+        normalize_set_fields(&mut action, Some(&HashMap::from([("ReplicationPV".into(),57)]))).unwrap();
+        assert_eq!(action["_physics_fields"],json!(["ReplicationPV","CFrame"]));
+        assert!(action["fields"].get("AssemblyLinearVelocity").is_none());
     }
 
     #[test]
@@ -1570,6 +1726,50 @@ mod tests {
         assert_eq!(
             normalized.worker_delta["actions"][0]["arguments"],
             json!([41, [2.0]])
+        );
+    }
+
+    #[test]
+    fn shared_worker_normalizes_remote_event_variants_before_vm_submission() {
+        let typed_array = json!({"$remote_variant":{"type":30,"value":[
+            {"$remote_variant":{"type":12,"value":2.5}},
+            {"$remote_variant":{"type":2,"value":"ok"}}
+        ]}});
+        let actions = json!([
+            {"sequence":1,"kind":"create","id":"remote","node":{
+                "id":"remote","class_name":"RemoteEvent","name":"Event","properties":{}}},
+            {"sequence":2,"kind":"event","id":"remote","name":"OnClientEvent",
+             "arguments":[typed_array]}
+        ]);
+        let receipt = SessionRecord {
+            packet_kind: 131,
+            world_sequence: 2,
+            world_delta: json!({"version":1,"delta":true,"sequence":2,"actions":actions}).into(),
+            events: vec![json!({"key":"remote","name":"OnClientEvent","arguments":[typed_array]})],
+            pings: vec![],
+            tags: vec![],
+            regions: vec![],
+            metadata: vec![],
+            property_changes: vec![],
+        };
+        let pre_store = WorldStore::from_snapshot(&json!({"version":1,"sequence":0,"nodes":[]})).unwrap();
+        let pre = pre_store.view();
+        let mut post_store = pre_store;
+        post_store.apply_delta(&receipt.world_delta).unwrap();
+        let mut normalizer = RuntimeDeltaNormalizer::new(&schema()).unwrap();
+
+        let output = normalizer
+            .normalize_for_shared_view_worker(&pre, &post_store.view(), &receipt, false)
+            .unwrap();
+
+        assert_eq!(
+            output.worker_delta["actions"][1]["arguments"],
+            json!([{"$remote_array":[2.5,"ok"]}])
+        );
+        assert_ne!(
+            output.worker_delta["actions"][1]["arguments"][0],
+            typed_array,
+            "the VM handoff must not retain replication's typed variant wrapper"
         );
     }
 }
