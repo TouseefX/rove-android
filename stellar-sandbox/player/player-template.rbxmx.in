@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="utf-8"?>
+<roblox version="4">
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Model" referent="RBX0">
+		<Properties>
+			<string name="Name">RoveStellarClient</string>
+		</Properties>
+		<Item class="Folder" referent="RBX1">
+			<Properties>
+				<string name="Name">Sandbox</string>
+				<bool name="Sandboxed">true</bool>
+				<SecurityCapabilities name="Capabilities">129</SecurityCapabilities>
+			</Properties>
+			<Item class="LocalScript" referent="RBX2">
+				<Properties>
+					<string name="Name">RoveStellarClient</string>
+					<bool name="Disabled">false</bool>
+					<ProtectedString name="Source"><![CDATA[
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local enginePrint = print
+local engineWarn = warn
+local prefix = "ROVE_STELLAR_PLAYER_V1 "
+local sourceSha256 = "__ROVE_STELLAR_SOURCE_SHA256__"
+local placeId = string.format("%.0f", game.PlaceId)
+local maxPrints, maxLineBytes, maxTotalBytes = 128, 4096, 16 * 1024
+local prints, printBytes, truncated = {}, 0, false
+local reportValue = script:FindFirstChild("ReportJson")
+local probeModule = script.Parent:FindFirstChild("Probe")
+local encoderModule = script.Parent:FindFirstChild("EncodeReturns")
+
+local function validPrefix(value, limit)
+	local prefix = string.sub(value, 1, limit)
+	local _, invalid = utf8.len(prefix)
+	return invalid and string.sub(prefix, 1, invalid - 1) or prefix
+end
+local function printable(value)
+	local kind = typeof(value)
+	if kind == "string" then return validPrefix(value, maxLineBytes)
+	elseif kind == "nil" then return "nil"
+	elseif kind == "boolean" then return value and "true" or "false"
+	elseif kind == "number" then
+		if value ~= value then return "nan" end
+		if value == math.huge then return "inf" end
+		if value == -math.huge then return "-inf" end
+		return tostring(value)
+	end
+	return "<" .. kind .. ">"
+end
+local function capture(level, ...)
+	if #prints >= maxPrints then truncated = true; return end
+	local argumentCount = select("#", ...)
+	local count = math.min(argumentCount, 64)
+	if argumentCount > count then truncated = true end
+	local parts, used = table.create(count), 0
+	for index = 1, count do
+		local separator = index > 1 and "\t" or ""
+		local available = maxLineBytes - used - #separator
+		if available <= 0 then truncated = true; break end
+		local value = select(index, ...)
+		if typeof(value) == "string" and #value > maxLineBytes then truncated = true end
+		local piece = printable(value)
+		if #piece > available then piece = validPrefix(piece, available); truncated = true end
+		parts[#parts + 1] = separator .. piece
+		used += #separator + #piece
+		if truncated and used >= maxLineBytes then break end
+	end
+	local remaining = math.max(maxTotalBytes - printBytes, 0)
+	if remaining == 0 then truncated = true; return end
+	local line = table.concat(parts)
+	if #line > remaining then line = validPrefix(line, remaining); truncated = true end
+	printBytes += #line
+	prints[#prints + 1] = {level = level, text = line}
+	if level == "warn" then engineWarn(line) else enginePrint(line) end
+end
+local function report(status, detail, sandboxed)
+	local runtime = status == "unsupported_context" and "unsupported" or "roblox-player"
+	local result = {
+		protocol = 1,
+		runtime = runtime,
+		status = status,
+		placeId = placeId,
+		sourceSha256 = sourceSha256,
+		prints = prints,
+		returns = {},
+		sandbox = sandboxed == true,
+	}
+	if truncated then result.outputTruncated = true end
+	if detail then result.error = validPrefix(tostring(detail), 1024) end
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, result)
+	if not ok or type(encoded) ~= "string" then
+		local fallbackStatus = status == "unsupported_context" and status or "harness_error"
+		local fallbackRuntime = fallbackStatus == "unsupported_context" and "unsupported" or "roblox-player"
+		encoded = "{\"protocol\":1,\"runtime\":\"" .. fallbackRuntime .. "\",\"status\":\"" .. fallbackStatus .. "\",\"placeId\":\"" .. placeId .. "\",\"sourceSha256\":\"" .. sourceSha256 .. "\",\"prints\":[],\"returns\":[],\"sandbox\":" .. tostring(sandboxed == true) .. ",\"error\":\"JSON encoding failed\"}"
+	end
+	if reportValue and reportValue:IsA("StringValue") then
+		local writeOk = pcall(function() reportValue.Value = encoded end)
+		if not writeOk then engineWarn("Rove Player report could not be stored in ReportJson") end
+	end
+	enginePrint(prefix .. encoded)
+end
+local function sandboxChecks()
+	local ok, reason = pcall(function()
+		local created, value = pcall(Instance.new, "Folder")
+		if created then
+			pcall(function() value:Destroy() end)
+			return false, "Instance.new was allowed"
+		end
+		if type(value) ~= "string" or not string.find(value, "CreateInstances", 1, true) then
+			return false, "CreateInstances denial was not confirmed"
+		end
+		if not script.Parent:IsA("Folder") or script.Parent.Parent ~= nil then
+			return false, "An instance outside the sandbox was visible"
+		end
+		return true
+	end)
+	return ok and reason == true, ok and "Sandbox restriction check failed" or "Sandbox restriction check errored"
+end
+local function isLiveClient()
+	local clientOk, isClient = pcall(RunService.IsClient, RunService)
+	local studioOk, isStudio = pcall(RunService.IsStudio, RunService)
+	return clientOk and studioOk and isClient == true and isStudio == false
+end
+
+if not isLiveClient() then
+	report("unsupported_context", "This model runs only in a live Roblox Player client.", false)
+	return
+end
+if not reportValue or not reportValue:IsA("StringValue") or not probeModule or not probeModule:IsA("ModuleScript") or not encoderModule or not encoderModule:IsA("ModuleScript") then
+	report("harness_error", "The Rove Player model is incomplete.", false)
+	return
+end
+local safe, sandboxReason = sandboxChecks()
+if not safe then report("sandbox_unavailable", sandboxReason, false); return end
+local probeOk, probe = pcall(require, probeModule)
+if not probeOk then report("script_error", probe, false); return end
+if type(probe) ~= "table" or probe.status ~= "ok" or type(probe.run) ~= "function" then
+	report("sandbox_unavailable", type(probe) == "table" and probe.error or "Probe module sandbox check failed.", false)
+	return
+end
+local encoderOk, encodeReturns = pcall(require, encoderModule)
+if not encoderOk or typeof(encodeReturns) ~= "function" then
+	report("harness_error", "The bounded return encoder could not be loaded.", true)
+	return
+end
+local callOk, packed = pcall(function()
+	return table.pack(pcall(probe.run, capturePrint, captureWarn))
+end)
+if not callOk or type(packed) ~= "table" then
+	report("harness_error", "Guest execution could not be captured.", true)
+	return
+end
+local values = {n = packed[1] and packed.n - 1 or 0}
+local status, detail = "ok", nil
+if packed[1] then
+	for index = 1, values.n do values[index] = packed[index + 1] end
+else
+	status, detail = "script_error", packed[2]
+end
+if truncated then status = "output_limit" end
+local encodeOk, returns = pcall(encodeReturns, values)
+if not encodeOk or type(returns) ~= "table" then
+	status, detail, returns = "harness_error", "The bounded return encoder failed.", {}
+end
+local resultStatus = status
+local result = {
+	protocol = 1,
+	runtime = "roblox-player",
+	status = resultStatus,
+		placeId = placeId,
+	sourceSha256 = sourceSha256,
+	prints = prints,
+	returns = returns,
+	sandbox = true,
+}
+if truncated then result.outputTruncated = true end
+if type(detail) == "string" then result.error = validPrefix(detail, 1024)
+elseif detail then result.error = "Submitted source raised an error." end
+local jsonOk, json = pcall(HttpService.JSONEncode, HttpService, result)
+if not jsonOk or type(json) ~= "string" then
+	report("harness_error", "JSON encoding failed.", true)
+	return
+end
+reportValue.Value = json
+enginePrint(prefix .. json)
+]]></ProtectedString>
+				</Properties>
+				<Item class="StringValue" referent="RBX3">
+					<Properties>
+						<string name="Name">ReportJson</string>
+						<string name="Value"></string>
+					</Properties>
+				</Item>
+			</Item>
+			<Item class="ModuleScript" referent="RBX4">
+				<Properties>
+					<string name="Name">Probe</string>
+					<ProtectedString name="Source">local function sandboxChecks()
+ local ok, reason = pcall(function()
+  local created, value = pcall(Instance.new, "Folder")
+  if created then pcall(function() value:Destroy() end); return false end
+  if type(value) ~= "string" or not string.find(value, "CreateInstances", 1, true) then return false end
+  if not script.Parent:IsA("Folder") or script.Parent.Parent ~= nil then return false end
+  return true
+ end)
+ return ok and reason == true
+end
+if not sandboxChecks() then return {status = "sandbox_unavailable", error = "Probe module sandbox checks failed."} end
+return {status = "ok", run = function(print, warn)
+__ROVE_STELLAR_SOURCE_XML__
+end}</ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX5">
+				<Properties>
+					<string name="Name">EncodeReturns</string>
+					<ProtectedString name="Source">__ROVE_STELLAR_ENCODER_XML__</ProtectedString>
+				</Properties>
+			</Item>
+		</Item>
+	</Item>
+</roblox>

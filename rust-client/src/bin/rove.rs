@@ -978,8 +978,7 @@ fn repl(options: &Options, snapshot: Value) -> Result<Value, String> {
     Ok(json!({"ok":true,"closed":true,"failed_jobs":failed_jobs,"live_game_session":false}))
 }
 
-fn main_result() -> Result<Value, String> {
-    let arguments: Vec<String> = env::args().skip(1).collect();
+fn main_result(arguments: Vec<String>) -> Result<Value, String> {
     if arguments
         .first()
         .is_some_and(|mode| matches!(mode.as_str(), "auth" | "join"))
@@ -1034,7 +1033,20 @@ fn main_result() -> Result<Value, String> {
 }
 
 fn main() {
-    let result = main_result();
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    match arguments.as_slice() {
+        [] => {
+            println!("Rove command-line worker. Run `rove --help` to see available commands.");
+            println!("For the Stellar env logger, run rove-stellar.exe from the Player integration ZIP.");
+            return;
+        }
+        [flag] if matches!(flag.as_str(), "-h" | "--help" | "help") => {
+            println!("{USAGE}");
+            return;
+        }
+        _ => {}
+    }
+    let result = main_result(arguments);
     let failed = result.as_ref().map_or(true, |value| {
         value.get("ok").and_then(Value::as_bool) == Some(false)
     });
