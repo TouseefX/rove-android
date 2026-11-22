@@ -19,7 +19,7 @@ use std::{
 const MAX_SOURCE: usize = 100 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 8 * 1024 * 1024;
 const MAX_REQUEST: usize = 608 * 1024 * 1024;
-const MAX_RESULT: usize = 1024 * 1024;
+const MAX_RESULT: usize = 8 * 1024 * 1024;
 
 fn split_pump_budget(total: Duration, has_actor_vm: bool) -> (Duration, Duration) {
     if !has_actor_vm {
@@ -90,7 +90,7 @@ impl Session {
         let response = self.dispatch(&command, shared)?;
         let bytes = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
         if bytes.len() > MAX_RESULT {
-            return Err("persistent response exceeds 1 MiB".into());
+            return Err("persistent response exceeds 8 MiB".into());
         }
         Ok(Response(bytes))
     }
@@ -113,7 +113,7 @@ impl Session {
             return Err("invalid VM reply: recursion limit exceeded".into());
         }
         if !json_fits(&response, MAX_RESULT) {
-            return Err("persistent response exceeds 1 MiB".into());
+            return Err("persistent response exceeds 8 MiB".into());
         }
         Ok(response)
     }

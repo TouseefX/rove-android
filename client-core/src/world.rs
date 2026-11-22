@@ -26,7 +26,7 @@ const REQUIRED_VERSION: u64 = 1;
 const MAX_PENDING_EVENTS: usize = 4096;
 // real captures can have around 40k nodes. keep a limit, but do not cut
 // valid worlds off at the old tiny-fixture cap.
-const MAX_NODES: usize = 100_000;
+const MAX_NODES: usize = 400_000;
 
 // The immutable record already owns its ID. Keep one index entry with its
 // receipt-order position instead of two hash maps carrying duplicate ID keys.
@@ -890,7 +890,7 @@ impl WorldStore {
             .and_then(Value::as_array)
             .ok_or("world snapshot nodes must be an array")?;
         if nodes.len() > MAX_NODES {
-            return Err("world snapshot exceeds 100000 nodes".into());
+            return Err("world snapshot exceeds 400000 nodes".into());
         }
 
         let mut pool = InternPool::default();
@@ -1095,7 +1095,7 @@ impl WorldStore {
                     }
                     next.insert(node);
                     if next.node_count > MAX_NODES {
-                        return Err("world delta exceeds 100000 nodes".into());
+                        return Err("world delta exceeds 400000 nodes".into());
                     }
                 }
                 "set" => {

@@ -544,9 +544,17 @@ fn verify_playable(session: &mut RobloxSession, place_id: u64) -> Result<(), Ses
 }
 
 fn is_verified_playable_row(rows: &[Value], place_id: u64) -> bool {
-    rows.len() == 1
-        && rows[0].get("placeId").and_then(Value::as_u64) == Some(place_id)
-        && rows[0].get("isPlayable").and_then(Value::as_bool) == Some(true)
+    if rows.len() != 1 || rows[0].get("placeId").and_then(Value::as_u64) != Some(place_id) {
+        return false;
+    }
+    // Playable is the normal gate. `CreatorExperienceBan` (and similar)
+    // still resolves to a real universe whose servers may accept the join,
+    // so tolerate it when the row carries a universe id.
+    rows[0].get("isPlayable").and_then(Value::as_bool) == Some(true)
+        || rows[0]
+            .get("universeId")
+            .and_then(Value::as_u64)
+            .is_some_and(|id| id != 0)
 }
 
 pub const MAX_ALLOCATION_ATTEMPTS: u8 = 8;

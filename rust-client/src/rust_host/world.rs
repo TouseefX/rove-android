@@ -140,7 +140,7 @@ pub(super) fn instance_full_name(world: &World, instance_id: &str) -> mlua::Resu
         }
         current = node.parent.as_deref();
         seen += 1;
-        if seen > 100_000 {
+        if seen > 400_000 {
             return Err(mlua::Error::RuntimeError(
                 "parent cycle detected".into(),
             ));
@@ -369,7 +369,7 @@ impl World {
             || shared.map_or(0, SharedProjectedWorldView::node_count),
             Vec::len,
         );
-        if node_count > 100_000 {
+        if node_count > 400_000 {
             return Err("world snapshot exceeds node limit".into());
         }
         let mut world = World {
@@ -1115,7 +1115,7 @@ impl World {
                         }
                         selected.push(id.clone());
                         pending.extend(self.nodes.children(&id, &self.node_order));
-                        if selected.len() > 100_000 {
+                        if selected.len() > 400_000 {
                             return Err("destroy subtree limit exceeded".into());
                         }
                     }
@@ -2928,7 +2928,7 @@ pub fn descendants(ctx: &WorldRef, id: &str) -> Vec<String> {
             continue;
         }
         result.push(child.to_owned());
-        if result.len() > 100_000 {
+        if result.len() > 400_000 {
             break;
         }
         if let Some(children) = by_parent.remove(child) {
@@ -3259,7 +3259,7 @@ fn create_initialized_instance(
     }
     let (id, name, properties) = {
         let mut world = ctx.borrow_mut();
-        if world.nodes.len() >= 101_000 {
+        if world.nodes.len() >= 501_000 {
             return Err(mlua::Error::RuntimeError(
                 "local instance limit exceeded".into(),
             ));
@@ -3429,7 +3429,7 @@ pub fn ensure_engine_global_node(lua: &Lua, ctx: &WorldRef, class: &str) -> mlua
         if world.nodes.get(id).is_some_and(|node| !node.destroyed) {
             // Keep the existing singleton stable.
         } else {
-            if world.nodes.len() >= 101_000 {
+            if world.nodes.len() >= 501_000 {
                 return Err(mlua::Error::RuntimeError(
                     "engine global node limit exceeded".into(),
                 ));
@@ -3526,7 +3526,7 @@ pub fn ensure_client_service(lua: &Lua, ctx: &WorldRef, class: &str) -> mlua::Re
     }
     let (id, game_id) = {
         let mut world = ctx.borrow_mut();
-        if world.nodes.len() >= 100_000 {
+        if world.nodes.len() >= 400_000 {
             return Err(mlua::Error::RuntimeError(
                 "world node limit exceeded".into(),
             ));
@@ -3886,7 +3886,7 @@ pub fn clone_instance(lua: &Lua, ctx: &WorldRef, root_id: &str) -> mlua::Result<
         let kids = children(ctx, &id);
         selected.push(id);
         pending.extend(kids.into_iter().rev());
-        if selected.len() > 100_000 {
+        if selected.len() > 400_000 {
             return Err(mlua::Error::RuntimeError(
                 "clone node limit exceeded".into(),
             ));
@@ -3895,7 +3895,7 @@ pub fn clone_instance(lua: &Lua, ctx: &WorldRef, root_id: &str) -> mlua::Result<
     let mut id_map = HashMap::with_capacity(selected.len());
     {
         let mut world = ctx.borrow_mut();
-        if world.nodes.len().saturating_add(selected.len()) > 101_000 {
+        if world.nodes.len().saturating_add(selected.len()) > 501_000 {
             return Err(mlua::Error::RuntimeError(
                 "local instance limit exceeded".into(),
             ));
@@ -4036,7 +4036,7 @@ pub fn destroy_instance(lua: &Lua, ctx: &WorldRef, root_id: &str) -> mlua::Resul
         }
         pending.extend(children(ctx, &id).into_iter().rev());
         selected.push(id);
-        if selected.len() > 100_000 {
+        if selected.len() > 400_000 {
             return Err(mlua::Error::RuntimeError(
                 "destroy subtree limit exceeded".into(),
             ));
@@ -4360,7 +4360,7 @@ impl UserData for InstanceHandle {
         methods.add_method("GetDescendants", |lua, this, ()| {
             let ctx = this.ctx()?;
             let out = descendants(&ctx, &this.id);
-            if out.len() > 100_000 {
+            if out.len() > 400_000 {
                 return Err(mlua::Error::RuntimeError(
                     "descendant limit exceeded".into(),
                 ));
@@ -4665,7 +4665,7 @@ impl UserData for InstanceHandle {
                 }
                 current = world.nodes.get(&id).and_then(|n| n.parent.clone());
                 seen += 1;
-                if seen > 100_000 {
+                if seen > 400_000 {
                     break;
                 }
             }
@@ -4693,7 +4693,7 @@ impl UserData for InstanceHandle {
                 }
                 current = world.nodes.get(&id).and_then(|n| n.parent.clone());
                 seen += 1;
-                if seen > 100_000 {
+                if seen > 400_000 {
                     break;
                 }
             }
