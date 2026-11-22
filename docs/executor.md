@@ -129,3 +129,14 @@ accepting the move (`completed_move_to: 1`, ~10k fixed steps).
 Known gap: places with custom loading screens / terrain streaming (Adopt Me,
 Phantom Forces) still withhold the character model, so movement there needs
 more streaming work. Everything else (world, scripts, remotes) works there.
+
+## Physics session wrap (Nov 22)
+
+Verified live in Crossroads across several runs:
+- character spawns reliably in ~1s
+- gravity simulation: y drops 21 -> 3 under 196.2 gravity
+- MoveTo walking: 28-31 studs traversed, server accepted
+  (completed_move_to: 1), ~1k physics steps per minute
+
+Remaining variance is session-length dependent (a few runs ended before the
+move window elapsed), not physics.
