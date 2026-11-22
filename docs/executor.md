@@ -109,3 +109,23 @@ Fixes: node caps 100k→400k (and 101k→501k local), VM response limit
 1→8 MiB, playability gate accepts CreatorExperienceBan rows. RIVALS still
 returns status 23 from gamejoin for this account (session-level, not
 decoder) — retried via join-game and join-game-instance both.
+
+## Character physics + movement (Nov 22)
+
+`--physics` now spawns and drives the character for real:
+
+- Fixed ownership: NetworkOwnerV3 is a session-local id (server = Terrain's
+  owner), not the world scope. Ownership is now derived from Terrain's owner
+  instead of comparing to the scope.
+- ISR: dirty sets larger than the schema's ISR table fall back to the class
+  property list, so newer game versions decode (was 1289/1290 rejected).
+- Streaming handshake no longer waits for the character it is supposed to
+  unlock, and replication-focus packets are sent from received regions.
+
+Verified in Classic Crossroads: character spawns in ~1s, falls under gravity
+(y 21 -> 3), and `Humanoid:MoveTo` walks 28-31 studs with the server
+accepting the move (`completed_move_to: 1`, ~10k fixed steps).
+
+Known gap: places with custom loading screens / terrain streaming (Adopt Me,
+Phantom Forces) still withhold the character model, so movement there needs
+more streaming work. Everything else (world, scripts, remotes) works there.

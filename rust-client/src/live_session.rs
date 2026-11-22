@@ -21,7 +21,8 @@ use rove_client_core::{
     memory::{current_process_rss_bytes, peak_process_rss_bytes},
     property_acknowledgments::{PreparedPropertyAcks, PropertyAcknowledgments},
     replication_out::{
-        contact_batch, streaming_ready, MarkerQueue, MarkerReadiness, StreamingEvidence,
+        contact_batch, replication_focus, streaming_ready, MarkerQueue, MarkerReadiness,
+        StreamingEvidence,
     },
     rpc::{
         encode_reflected_signal, ClientReply, ReflectedSignal, RemoteResult, RpcOutboundKind,
@@ -106,6 +107,9 @@ enum Effect {
     StreamingReady {
         payload: Vec<u8>,
         _budget: OwnedSemaphorePermit,
+    },
+    Focus {
+        payload: Vec<u8>,
     },
     RpcOutbound {
         callback_outcomes: (u64, u64, Option<String>),
@@ -255,6 +259,8 @@ struct ReceivedWorld {
     ready_property_ack: Option<PreparedPropertyAcks>,
     streaming_ready_sent: bool,
     ready_streaming_resume: Option<Vec<u8>>,
+    pending_focus: Option<Vec<u8>>,
+    focus_id: u32,
     rpc: Option<RpcSession>,
     announced_players: Option<rove_client_core::rpc::AnnouncedPlayers>,
     rpc_class_parents: HashMap<String, String>,
@@ -318,6 +324,8 @@ impl ReceivedWorld {
             ready_property_ack: None,
             streaming_ready_sent: false,
             ready_streaming_resume: None,
+            pending_focus: None,
+            focus_id: 0,
             rpc: None,
             announced_players: None,
             rpc_class_parents: HashMap::new(),
@@ -368,7 +376,23 @@ impl ReceivedWorld {
         let previous = self.engine.as_ref().and_then(|_| self.core.world_view());
         let accepted = if payload.first() == Some(&161) {
             let Some(accepted) = self.core.ingest_instance_state(payload)
-                .map_err(|_| "instance-state-commit-failed")? else { return Ok(vec![]); };
+                .map_err(|e| {
+                    if let Ok(dir) = std::env::var("ROVE_DUMP_BAD_PACKETS") {
+                        static ISR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = ISR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("isr-{}.bin", n)), payload);
+                    }
+                    "instance-state-commit-failed"
+                })? else {
+                    if let Ok(dir) = std::env::var("ROVE_DUMP_BAD_PACKETS") {
+                        static ISR_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = ISR_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 40 {
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("isr-{}.bin", n)), payload);
+                        }
+                    }
+                    return Ok(vec![]);
+                };
             accepted
         } else {
             if let Ok(dir) = std::env::var("ROVE_DUMP_OK_PACKETS") {
@@ -710,11 +734,36 @@ impl ReceivedWorld {
         if self.region_records.len() + record.regions.len() > 100_000 {
             return Err("streaming-region-history-limit");
         }
+        let had_regions = self.regions;
         self.region_records.extend(record.regions.clone());
         self.events += record.events.len() as u64;
         self.regions += record.regions.len() as u64;
         self.property_changes += record.property_changes.len() as u64;
         self.metadata += record.metadata.len() as u64;
+        // Without a focus the streamer has no idea what to send, so the
+        // spawn region never materializes. Echo the latest region center
+        // back with a generous radius until the character arrives.
+        if record.regions.len() != 0 || (had_regions == 0 && self.regions != 0) {
+            if let Some(center) = record
+                .regions
+                .last()
+                .and_then(|region| region["coordinate"].as_array())
+                .filter(|values| values.len() == 3)
+            {
+                let to_f32 = |index: usize| {
+                    center[index].as_f64().unwrap_or(0.0) as f32
+                };
+                self.focus_id = self.focus_id.wrapping_add(1);
+                if let Ok(packet) = replication_focus(
+                    self.focus_id,
+                    [to_f32(0), to_f32(1), to_f32(2)],
+                    512.0,
+                    4000,
+                ) {
+                    self.pending_focus = Some(packet);
+                }
+            }
+        }
         for change in &record.property_changes {
             let Some(id) = change["id"].as_str() else { continue; };
             let Some(index) = change["property_index"].as_u64() else { continue; };
@@ -763,7 +812,13 @@ impl ReceivedWorld {
             return Ok(None);
         }
         let evidence = self.spawn_evidence()?;
-        if !evidence.player_spawned || !evidence.spawn_region_received {
+        // Streaming servers deliver the character only after the client
+        // acknowledges the spawn region, so the handshake must not wait for
+        // the character itself (chicken-and-egg on streaming places). Any
+        // received region proves streaming has begun.
+        let region_known = evidence.spawn_region_received
+            || (self.regions > 0 && !evidence.player_spawned);
+        if !region_known {
             return Ok(None);
         }
         let player = evidence.player_id.ok_or("spawn-player-missing")?;
@@ -775,8 +830,8 @@ impl ReceivedWorld {
             property,
             9,
             StreamingEvidence {
-                player_spawned: true,
-                spawn_region_received: true,
+                player_spawned: evidence.player_spawned,
+                spawn_region_received: region_known,
             },
         )
         .map_err(|_| "streaming-resume-encode-failed")?;
@@ -1449,6 +1504,11 @@ fn worker(
                     })
                     .map_err(|_| "session-stopped-before-send")?;
             }
+            if let Some(payload) = world.pending_focus.take() {
+                outgoing
+                    .send(Effect::Focus { payload })
+                    .map_err(|_| "session-stopped-before-send")?;
+            }
             emit_rpc_outbound(&mut world, &outgoing, &reply_budget)?;
             Ok(())
         })();
@@ -1786,6 +1846,9 @@ pub fn run_with_options(
                             let written=sender.send(4,1,prepared.payload()).await.is_ok();
                             property_acks.commit(prepared.id(),written).map_err(|_| "property-acknowledgement-accounting-invalid")?;
                             if !written {return Err("property-acknowledgement-send-failed");}
+                        }
+                        Effect::Focus { payload } => {
+                            sender.send(4,1,&payload).await.map_err(|_| "focus-send-failed")?;
                         }
                         Effect::StreamingReady { payload,.. } => {
                             sender.send(4,1,&payload).await.map_err(|_| "streaming-resume-send-failed")?;

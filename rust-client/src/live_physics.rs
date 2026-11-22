@@ -52,6 +52,9 @@ pub struct OwnBinding {
 ///
 /// The caller must build this from received state. A local default or guessed
 /// owner value cannot satisfy the gate.
+/// NetworkOwnerV3 value reserved for the server.
+const SERVER_NETWORK_OWNER: u64 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnCharacterEvidence {
     pub binding: OwnBinding,
@@ -64,6 +67,8 @@ pub struct OwnCharacterEvidence {
     pub streaming_region_confirmed: bool,
     pub anchored: Option<ReceivedFlag>,
     pub network_owner_scope: Option<u64>,
+    /// Session-local network id of the server (owner of Terrain).
+    pub server_owner_id: Option<u64>,
     pub client_scope: Option<u64>,
     pub ownership_granted: Option<ReceivedFlag>,
     pub server_authority_mode: Option<ReceivedFlag>,
@@ -93,8 +98,13 @@ impl OwnCharacterEvidence {
                     source: EvidenceSource::ServerReplication
                 })
             )
-            && self.network_owner_scope.is_some()
-            && self.network_owner_scope == self.client_scope
+            && self.network_owner_scope.is_some_and(|owner| match self.server_owner_id {
+                // Live worlds expose the server's id via Terrain: any other
+                // owner is a client, and one of them is us.
+                Some(server) => owner != server,
+                // Without that hint (fixtures) fall back to the scope id.
+                None => Some(owner) == self.client_scope,
+            })
             && !matches!(
                 self.server_authority_mode,
                 Some(ReceivedFlag {
@@ -703,6 +713,26 @@ fn received_snapshot_cached(
         .and_then(|value| value.as_f64())
         .filter(|value| value.is_finite() && value.fract() == 0.0 && *value >= 0.0)
         .map(|value| value as u64);
+    // The server's session-local network id: Terrain is always server-owned.
+    // A second signal is the owner shared by most anchored parts.
+    let server_owner_id = {
+        let owner_of = |id: &str| {
+            view.get_property(id, "NetworkOwnerV3")
+                .and_then(|value| value.as_f64())
+                .filter(|v| v.is_finite() && *v >= 0.0 && v.fract() == 0.0)
+                .map(|v| v as u64)
+        };
+        let terrain = {
+            let mut found = None;
+            view.for_each_node(|node| {
+                if found.is_none() && node.class_name() == "Terrain" {
+                    found = owner_of(node.id());
+                }
+            });
+            found
+        };
+        terrain
+    };
     let server_authority = view
         .get_property(workspace, "ServerAuthorityMode")
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -750,9 +780,13 @@ fn received_snapshot_cached(
             streaming_region_confirmed,
             anchored,
             network_owner_scope,
+            server_owner_id,
             client_scope: Some(client_scope),
             ownership_granted: Some(ReceivedFlag {
-                value: network_owner_scope == Some(client_scope),
+                value: network_owner_scope.is_some_and(|owner| match server_owner_id {
+                    Some(server) => owner != server,
+                    None => Some(owner) == Some(client_scope),
+                }),
                 source: EvidenceSource::ServerReplication,
             }),
             server_authority_mode: server_authority,
@@ -1342,7 +1376,11 @@ impl LocalPrediction {
                 "anchored_unknown"
             } else if snapshot.evidence.anchored.is_some_and(|v| v.value) {
                 "anchored"
-            } else if snapshot.evidence.network_owner_scope != Some(client_scope) {
+            } else if !snapshot
+                .evidence
+                .ownership_granted
+                .is_some_and(|flag| flag.value)
+            {
                 "not_owned_by_this_session"
             } else if !snapshot.evidence.assembly_root_confirmed {
                 "assembly_root_unknown"
@@ -2194,6 +2232,7 @@ mod tests {
                 source: EvidenceSource::ServerReplication,
             }),
             network_owner_scope: Some(9),
+            server_owner_id: Some(1),
             client_scope: Some(9),
             ownership_granted: Some(ReceivedFlag {
                 value: true,

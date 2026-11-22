@@ -181,6 +181,33 @@ pub struct StreamingEvidence {
     pub spawn_region_received: bool,
 }
 
+const REPLICATION_FOCUS: [u8; 2] = [131, 26];
+
+/// Encode one replication-focus update telling the streamer where to send
+/// terrain and instances. `id` cycles per update (server echoes it back).
+pub fn replication_focus(
+    id: u32,
+    center: [f32; 3],
+    radius: f32,
+    timeout_ms: u32,
+) -> Result<Vec<u8>, WireError> {
+    if !center.iter().all(|v| v.is_finite()) || !radius.is_finite() {
+        return Err(WireError::new("Non-finite replication focus"));
+    }
+    let mut packet = Vec::with_capacity(32);
+    packet.extend_from_slice(&REPLICATION_FOCUS);
+    packet.extend_from_slice(&id.to_le_bytes());
+    packet.push(1); // floating-point coordinates
+    for value in center {
+        packet.extend_from_slice(&value.to_le_bytes());
+    }
+    packet.extend_from_slice(&radius.to_le_bytes());
+    packet.extend_from_slice(&(-1.0f32).to_le_bytes()); // no optional distance
+    packet.extend_from_slice(&[0, 0]); // both flags false
+    packet.extend_from_slice(&timeout_ms.to_le_bytes());
+    Ok(packet)
+}
+
 /// Encode the narrow GameplayPaused=false update after explicit spawn evidence.
 pub fn streaming_ready(
     player: Guid,
@@ -188,9 +215,11 @@ pub fn streaming_ready(
     gameplay_paused_type_id: u8,
     evidence: StreamingEvidence,
 ) -> Result<Vec<u8>, WireError> {
-    if !evidence.player_spawned || !evidence.spawn_region_received {
+    // Streaming places gate character delivery on this handshake, so the
+    // surrounding region is enough; the character may still be in flight.
+    if !evidence.spawn_region_received {
         return Err(WireError::new(
-            "Character and surrounding region must be received before resuming",
+            "Surrounding region must be received before resuming",
         ));
     }
     if gameplay_paused_type_id != 9 {

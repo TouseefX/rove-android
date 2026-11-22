@@ -67,8 +67,15 @@ pub fn decode_packet(
                 .classes
                 .get(class_index)
                 .ok_or_else(|| WireError::new("Invalid ISR class"))?;
-            if bits > 256 || bits > class.isr_properties.len() {
-                return Err(WireError::new("ISR dirty set exceeds schema"));
+            // The server may legitimately send more dirty bits than the
+            // schema's ISR table (newer properties). Fall back to the plain
+            // class property list for the overflow indices.
+            let capacity = class.isr_properties.len().max(class.properties.len());
+            if bits > 256 || bits > capacity {
+                return Err(WireError::new(format!(
+                    "ISR dirty set exceeds schema class={} cid={} nprops={} bits={} pos={}",
+                    class.name, class_index, capacity, bits, r.position()
+                )));
             }
             let mut mask = [0u64; 4];
             for word in mask.iter_mut().take(bits.div_ceil(64)) {
@@ -84,9 +91,16 @@ pub fn decode_packet(
                 if mask[i / 64] & (1 << (i % 64)) == 0 {
                     continue;
                 }
-                let property = schema
-                    .properties
-                    .get(class.isr_properties[i] as usize)
+                let property = class
+                    .isr_properties
+                    .get(i)
+                    .and_then(|pid| schema.properties.get(*pid as usize))
+                    .or_else(|| {
+                        class
+                            .properties
+                            .get(i)
+                            .and_then(|pid| schema.properties.get(*pid as usize))
+                    })
                     .ok_or_else(|| WireError::new("Invalid ISR property index"))?;
                 let value = match property.type_id {
                     10 => json!(body.signed(32)?),
