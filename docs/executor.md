@@ -89,3 +89,23 @@ Changes:
 - attribute arrays raised to 1M entries (Adopt Me sends big arrays)
 - world-level class-changed duplicates tolerated in live mode only
 All 914 client tests green; changes pushed.
+
+## Broad game coverage (Nov 22)
+
+Tested against top-chart games:
+
+| game | nodes | RAM | result |
+|---|---|---|---|
+| Grow a Garden | 109,886 | 38 MB | ok (node cap raised 100k→400k) |
+| Blox Fruits | 94,526 | 44 MB | ok, 0 rejected |
+| Phantom Forces | 92,613 | 48 MB | ok, 0 rejected |
+| Steal An Egg | 61,740 | 46 MB | ok |
+| Dandy's World | 30,271 | 47 MB | ok |
+| DOORS | 24,767 | 51 MB | ok |
+| Murder Mystery 2 | 34,228 | 52 MB | ok |
+| Adopt Me! | 43,399 | 48 MB | ok |
+
+Fixes: node caps 100k→400k (and 101k→501k local), VM response limit
+1→8 MiB, playability gate accepts CreatorExperienceBan rows. RIVALS still
+returns status 23 from gamejoin for this account (session-level, not
+decoder) — retried via join-game and join-game-instance both.
