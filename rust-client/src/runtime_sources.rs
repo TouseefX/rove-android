@@ -16,7 +16,7 @@ use std::{
 };
 
 const MAX_NODES: usize = 20_000;
-const MAX_CATALOG_ENTRIES: usize = 4096;
+const MAX_CATALOG_ENTRIES: usize = 16384;
 const MAX_CATALOG_BYTES: usize = 3 * 1024 * 1024;
 const MAX_SOURCE_BYTES: usize = 128 * 1024;
 const MAX_BUILTIN_ENTRIES: usize = 256;
@@ -186,7 +186,7 @@ pub fn validate_catalog(value: &Value) -> Result<Value> {
         .as_object()
         .ok_or_else(|| RuntimeSourceError::Invalid("script catalog must be an object".into()))?;
     if entries.len() > MAX_CATALOG_ENTRIES {
-        return invalid("script catalog exceeds 4096 entries");
+        return invalid("script catalog exceeds 16384 entries");
     }
     let mut bytes = 0usize;
     for (id, entry) in entries {

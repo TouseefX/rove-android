@@ -1,6 +1,6 @@
 //! Received ISR updates (app 4, channel 5). Nothing here sends movement.
 use crate::{
-    replication::{compact_position, read_key},
+    replication::{compact_position, finite_f32, read_key},
     schema::Schema,
     wire::{Reader, WireError},
     world::WorldView,
@@ -89,6 +89,8 @@ pub fn decode_packet(
                     .get(class.isr_properties[i] as usize)
                     .ok_or_else(|| WireError::new("Invalid ISR property index"))?;
                 let value = match property.type_id {
+                    10 => json!(body.signed(32)?),
+                    11 => finite_f32(body.f32()?)?,
                     28 | 69 => reference(&mut body)?.map_or(Value::Null, |id| json!({"$ref":id})),
                     57 if legacy_pv => read_pv(&mut body, lod)?,
                     57 => {

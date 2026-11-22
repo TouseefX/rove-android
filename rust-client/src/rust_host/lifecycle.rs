@@ -18,8 +18,8 @@ use super::{
     world::{self, WorldRef},
 };
 
-const MAX_CATALOG_ENTRIES: usize = 4096;
-const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CATALOG_ENTRIES: usize = 16384;
+const MAX_CATALOG_BYTES: usize = 12 * 1024 * 1024;
 const MAX_SOURCE: usize = 128 * 1024;
 const MAX_BUNDLE_ENTRIES: usize = 256;
 const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;

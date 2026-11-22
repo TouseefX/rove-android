@@ -48,6 +48,9 @@ impl<'a> Reader<'a> {
     pub fn position(&self) -> usize {
         self.pos
     }
+    pub fn slice(&self) -> &'a [u8] {
+        self.data
+    }
 
     pub fn take(&mut self, size: usize) -> Result<&'a [u8], WireError> {
         let end = self
@@ -129,6 +132,19 @@ impl<'a> Reader<'a> {
         Err(WireError::new("Variable integer exceeds width"))
     }
 
+    pub fn varint_zigzag(&mut self, bits: u32) -> Result<i64, WireError> {
+        let mut result: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            let byte = self.u8()?;
+            result |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 || shift >= bits {
+                break;
+            }
+        }
+        Ok(((result >> 1) as i64) ^ -((result & 1) as i64))
+    }
     pub fn signed(&mut self, bits: u32) -> Result<i64, WireError> {
         let value = self.varuint(bits)?;
         let sign = -((value & 1) as i64);

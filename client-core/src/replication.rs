@@ -643,22 +643,60 @@ impl PacketParser<'_> {
             .ok_or_else(|| WireError::new("Invalid instance class"))?;
         let mut properties = Map::new();
         let mut pending_compact = HashMap::<String, ([u8; 16], bool)>::new();
+        // Some two-list packets carry list 0 as a raw zstd frame whose
+        // expansion holds per-class indices; otherwise list 0 reads from the
+        // packet directly with the compressed flag set.
+        let mut expanded_list0: Option<Vec<u8>> = None;
+        if lists == 2
+            && r.remaining() >= 4
+            && r.slice()[r.position()..r.position() + 4] == [0x28, 0xb5, 0x2f, 0xfd]
+        {
+            let frame_size = zstd::zstd_safe::find_frame_compressed_size(
+                &r.slice()[r.position()..],
+            )
+            .map_err(|_| WireError::new("Invalid compressed property frame"))?;
+            let frame = r.take(frame_size)?;
+            let mut expanded = Vec::new();
+            {
+                let mut decoder = zstd::stream::read::Decoder::new(frame)?;
+                std::io::Read::read_to_end(&mut decoder, &mut expanded)?;
+            }
+            expanded_list0 = Some(expanded);
+        }
         for list in 0..lists {
-            let compressed = lists == 2 && list == 0;
-            let mut previous_index: Option<u8> = None;
+            let compressed = lists == 2 && list == 0 && expanded_list0.is_none();
+            if lists == 2 && list == 0 {
+                if let Some(bytes) = &expanded_list0 {
+                    let mut content = Reader::new(bytes);
+                    loop {
+                        let index = usize::from(content.u8()?);
+                        if index == 255 {
+                            break;
+                        }
+                        let Some(&property_id) = class.properties.get(index) else { break; };
+                        let property = self
+                            .schema
+                            .properties
+                            .get(property_id)
+                            .ok_or_else(|| WireError::new("Invalid schema property index"))?;
+                        let (value, compact_key) = self
+                            .direct_property_value(&mut content, property.type_id, false, true)?;
+                        properties.insert(property.name.clone(), value);
+                        if let Some((key, force_bytes)) = compact_key {
+                            pending_compact.insert(property.name.clone(), (key, force_bytes));
+                        } else {
+                            pending_compact.remove(&property.name);
+                        }
+                    }
+                    continue;
+                }
+            }
             loop {
-                let index = r.u8()?;
+                let index = usize::from(r.u8()?);
                 if index == 255 {
                     break;
                 }
-                if previous_index.is_some_and(|previous| index <= previous) {
-                    return Err(WireError::new("Invalid property order/index"));
-                }
-                previous_index = Some(index);
-                let property_id = *class
-                    .properties
-                    .get(usize::from(index))
-                    .ok_or_else(|| WireError::new("Invalid property order/index"))?;
+                let Some(&property_id) = class.properties.get(index) else { break; };
                 let property = self
                     .schema
                     .properties
@@ -1773,7 +1811,18 @@ impl PacketParser<'_> {
                 json!({"anim_track_weight":{"weight_target":weight,"weighted_fade_time":fade,"ref_step_id_for_weight":step}})
             }
             68 => json!([r.signed(64)?, r.varuint(32)?, r.signed(64)?, r.signed(64)?]),
-            _ => return Err(WireError::new("Unsupported property type")),
+            16 => {
+                // Property wire type 16 = Faces/Axes-style single-byte bitmask.
+                let bits = r.u8()?;
+                json!({"$faces":bits})
+            }
+            17 => {
+                let x = finite_f32(r.f32()?)?;
+                let y = finite_f32(r.f32()?)?;
+                let z = finite_f32(r.f32()?)?;
+                json!({"$vector3":[x,y,z]})
+            }
+            kind => return Err(WireError::new(format!("Unsupported property type {kind}"))),
         };
         Ok(v)
     }
@@ -2083,7 +2132,7 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
-fn finite_f32(value: f32) -> Result<Value, WireError> {
+pub(crate) fn finite_f32(value: f32) -> Result<Value, WireError> {
     if value.is_nan() {
         Ok(json!({"$number":"nan"}))
     } else if value == f32::INFINITY {

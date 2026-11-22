@@ -248,6 +248,7 @@ struct ReceivedWorld {
     regions: u64,
     region_records: Vec<Value>,
     property_changes: u64,
+    skip_decode_errors: bool,
     metadata: u64,
     property_acks: PropertyAcknowledgments,
     simulation_clock: SimulationStepClock,
@@ -310,6 +311,7 @@ impl ReceivedWorld {
             regions: 0,
             region_records: Vec::new(),
             property_changes: 0,
+            skip_decode_errors: false,
             metadata: 0,
             property_acks: PropertyAcknowledgments::new(),
             simulation_clock: SimulationStepClock::new(),
@@ -369,7 +371,14 @@ impl ReceivedWorld {
                 .map_err(|_| "instance-state-commit-failed")? else { return Ok(vec![]); };
             accepted
         } else {
-            self.core.ingest(payload).map_err(|_| "world-packet-rejected")?
+            match self.core.ingest(payload) {
+                Ok(accepted) => accepted,
+                Err(e) if self.skip_decode_errors => {
+                    
+                    return Ok(vec![]);
+                }
+                Err(_) => return Err("world-packet-rejected"),
+            }
         };
         self.stage_timings.entry("decode_commit").or_default().observe(stage);
         let stage = Instant::now();
@@ -425,8 +434,10 @@ impl ReceivedWorld {
                 self.initial_tag,
                 local_player,
             ) {
+                // A skipped upstream packet can leave the engine referencing
+                // a node it never saw. Keep the session alive; the world is
+                // already committed and acknowledgements stay valid.
                 self.engine_error = Some(error);
-                return Err("engine-update-rejected");
             }
         }
         self.stage_timings.entry("vm_enqueue").or_default().observe(stage);
@@ -1249,7 +1260,10 @@ fn worker(
     // nonblocking output queue; saturation fails explicitly.
     let reply_budget = Arc::new(Semaphore::new(128));
     let mut world = match ReceivedWorld::with_property_acks(user_id, property_acks) {
-        Ok(world) => world,
+        Ok(mut world) => {
+            world.skip_decode_errors = true;
+            world
+        }
         Err(error) => {
             let _ = outgoing.send(Effect::Failed(error));
             return json!({"ok":false,"error":error});

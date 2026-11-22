@@ -202,8 +202,8 @@ impl Catalog {
             if self.digests.get(&id) == Some(&digest) {
                 continue;
             }
-            if !self.entries.contains_key(&id) && self.entries.len() >= 4096 {
-                return Err("script catalog exceeds 4096 entries".into());
+            if !self.entries.contains_key(&id) && self.entries.len() >= 16384 {
+                return Err("script catalog exceeds 16384 entries".into());
             }
             let mut entry = prepare(&props, self.trust.as_ref(), self.allow_small);
             self.preparations += 1;
@@ -214,7 +214,7 @@ impl Catalog {
                 .map_or(0, |v| serde_json::to_vec(&v).unwrap().len());
             self.bytes -= old;
             let mut size = serde_json::to_vec(&entry).unwrap().len();
-            if self.bytes + size > MAX_CATALOG - 4096 * 64 {
+            if self.bytes + size > MAX_CATALOG - 16384 * 64 {
                 entry = json!({"reason":"catalog_size_limit","class_name":node.class_name()});
                 size = serde_json::to_vec(&entry).unwrap().len();
             }

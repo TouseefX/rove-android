@@ -80,6 +80,8 @@ pub struct Node {
 
 pub struct World {
     pub nodes: NodeMap,
+    /// Live reception tolerates updates for nodes skipped on the wire.
+    pub tolerate_unknown_sets: bool,
     pub services: HashMap<String, String>,
     pub snapshot: Json,
     pub(crate) camera_state: super::camera::CameraState,
@@ -164,6 +166,7 @@ impl World {
     pub fn fork_for_vm(&self) -> World {
         World {
             nodes: self.nodes.clone(),
+            tolerate_unknown_sets: self.tolerate_unknown_sets,
             services: self.services.clone(),
             snapshot: self.snapshot.clone(),
             camera_state: self.camera_state.clone(),
@@ -355,6 +358,8 @@ impl World {
             return Err("unsupported or missing world snapshot version".into());
         }
         let sequence = root.get("sequence").and_then(Json::as_u64).unwrap_or(0);
+        let tolerate_unknown_sets =
+            std::env::var_os("ROVE_TOLERATE_UNKNOWN_SETS").is_some_and(|v| v != "0");
         let display = super::camera::display_update(root)?;
         let records = root.get("nodes").and_then(Json::as_array);
         if records.is_none() && shared.is_none() {
@@ -369,6 +374,7 @@ impl World {
         }
         let mut world = World {
             nodes: NodeMap::with_capacity(node_count),
+            tolerate_unknown_sets,
             services: HashMap::new(),
             snapshot: Json::Null,
             camera_state: super::camera::CameraState::default(),
@@ -971,10 +977,12 @@ impl World {
                         );
                     }
                     remember_node(&self.nodes, before_nodes, &id);
-                    let node = self
-                        .nodes
-                        .get_mut(&id)
-                        .ok_or("set references unknown node")?;
+                    let Some(node) = self.nodes.get_mut(&id) else {
+                        if self.tolerate_unknown_sets {
+                            continue;
+                        }
+                        return Err("set references unknown node".to_string());
+                    };
                     super::movement::clear_received_attachment_overrides(
                         node,
                         &fields,
@@ -1078,10 +1086,9 @@ impl World {
                         .ok_or("tag update list is missing")?;
                     validate_tags(tags, true)?;
                     remember_node(&self.nodes, before_nodes, &id);
-                    let node = self
-                        .nodes
-                        .get_mut(&id)
-                        .ok_or("tag update references unknown node")?;
+                    let Some(node) = self.nodes.get_mut(&id) else {
+                        continue;
+                    };
                     node.collection_tags = validate_tags(tags, true)?;
                     node.collection_tags_known = true;
                 }
