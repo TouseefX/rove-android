@@ -82,6 +82,8 @@ pub struct World {
     pub nodes: NodeMap,
     /// Live reception tolerates updates for nodes skipped on the wire.
     pub tolerate_unknown_sets: bool,
+    /// Sets that arrived before their node; replayed once it exists.
+    pending_sets: Vec<Json>,
     pub services: HashMap<String, String>,
     pub snapshot: Json,
     pub(crate) camera_state: super::camera::CameraState,
@@ -167,6 +169,7 @@ impl World {
         World {
             nodes: self.nodes.clone(),
             tolerate_unknown_sets: self.tolerate_unknown_sets,
+            pending_sets: self.pending_sets.clone(),
             services: self.services.clone(),
             snapshot: self.snapshot.clone(),
             camera_state: self.camera_state.clone(),
@@ -375,6 +378,7 @@ impl World {
         let mut world = World {
             nodes: NodeMap::with_capacity(node_count),
             tolerate_unknown_sets,
+            pending_sets: Vec::new(),
             services: HashMap::new(),
             snapshot: Json::Null,
             camera_state: super::camera::CameraState::default(),
@@ -789,6 +793,34 @@ impl World {
     ) -> Result<(), String> {
         let root = delta.as_object().ok_or("world delta must be an object")?;
         let display = super::camera::display_update(root)?;
+        // Replay sets whose node has since arrived.
+        if self.tolerate_unknown_sets && !self.pending_sets.is_empty() {
+            let pending = std::mem::take(&mut self.pending_sets);
+            let mut still_missing = Vec::new();
+            for action in pending {
+                let Some(id) = action.get("id").and_then(Json::as_str) else { continue };
+                if self.nodes.contains_key(id) {
+                    let fields = action.get("fields").and_then(Json::as_object).cloned()
+                        .unwrap_or_default();
+                    if let Some(node) = self.nodes.get_mut(id) {
+                        for (key, value) in fields {
+                            if key == "Parent" {
+                                node.parent = ref_id(&value);
+                            } else if key == "Name" {
+                                if let Some(name) = value.as_str() {
+                                    node.name = name.to_owned();
+                                }
+                            } else {
+                                node.properties.insert(key, value);
+                            }
+                        }
+                    }
+                } else {
+                    still_missing.push(action);
+                }
+            }
+            self.pending_sets = still_missing;
+        }
         if !super::session::json_fits(delta, 32 * 1024 * 1024) {
             return Err("world delta exceeds 8 MiB".into());
         }
@@ -979,6 +1011,10 @@ impl World {
                     remember_node(&self.nodes, before_nodes, &id);
                     let Some(node) = self.nodes.get_mut(&id) else {
                         if self.tolerate_unknown_sets {
+                            if self.pending_sets.len() >= 20_000 {
+                                self.pending_sets.remove(0);
+                            }
+                            self.pending_sets.push(Json::Object(a.clone()));
                             continue;
                         }
                         return Err("set references unknown node".to_string());

@@ -181,6 +181,17 @@ pub struct StreamingEvidence {
     pub spawn_region_received: bool,
 }
 
+const REQUEST_CHARACTER: [u8; 2] = [131, 49];
+
+/// Ask the server to spawn our character (needed on streaming places that
+/// otherwise wait forever for this request).
+pub fn request_character(player: Guid) -> Result<Vec<u8>, WireError> {
+    let mut packet = Vec::with_capacity(18);
+    packet.extend_from_slice(&REQUEST_CHARACTER);
+    packet.extend_from_slice(&guid(Some(player))?);
+    Ok(packet)
+}
+
 const REPLICATION_FOCUS: [u8; 2] = [131, 26];
 
 /// Encode one replication-focus update telling the streamer where to send

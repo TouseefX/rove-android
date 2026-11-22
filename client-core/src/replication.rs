@@ -645,7 +645,6 @@ impl PacketParser<'_> {
         lists: usize,
         inline_shared: bool,
     ) -> Result<(), WireError> {
-        eprintln!("NEWINST-ENTRY lists={} next3={:02x?}", lists, r.slice().get(r.position()..r.position()+3).unwrap_or(&[]));
         if !(1..=2).contains(&lists) {
             return Err(WireError::new("Invalid instance property list count"));
         }

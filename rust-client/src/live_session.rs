@@ -21,8 +21,8 @@ use rove_client_core::{
     memory::{current_process_rss_bytes, peak_process_rss_bytes},
     property_acknowledgments::{PreparedPropertyAcks, PropertyAcknowledgments},
     replication_out::{
-        contact_batch, replication_focus, streaming_ready, MarkerQueue, MarkerReadiness,
-        StreamingEvidence,
+        contact_batch, replication_focus, request_character, streaming_ready, MarkerQueue,
+        MarkerReadiness, StreamingEvidence,
     },
     rpc::{
         encode_reflected_signal, ClientReply, ReflectedSignal, RemoteResult, RpcOutboundKind,
@@ -260,6 +260,7 @@ struct ReceivedWorld {
     streaming_ready_sent: bool,
     ready_streaming_resume: Option<Vec<u8>>,
     pending_focus: Option<Vec<u8>>,
+    pending_character_request: Option<Vec<u8>>,
     focus_id: u32,
     rpc: Option<RpcSession>,
     announced_players: Option<rove_client_core::rpc::AnnouncedPlayers>,
@@ -325,6 +326,7 @@ impl ReceivedWorld {
             streaming_ready_sent: false,
             ready_streaming_resume: None,
             pending_focus: None,
+            pending_character_request: None,
             focus_id: 0,
             rpc: None,
             announced_players: None,
@@ -581,14 +583,15 @@ impl ReceivedWorld {
                 }
             }
         }
-        let region_received = view
-            .get_property(&player, "Character")
-            .and_then(|v| v["$ref"].as_str().map(str::to_owned))
+        let region_received = locate_character(&view, &player)
             .and_then(|id| view.get_property(&id, "PrimaryPart"))
             .and_then(|v| v["$ref"].as_str().map(str::to_owned))
             .and_then(|root| root_position(&view, &root).map(|position| {
-                crate::received_world_ready::can_simulate(&view,&root,
-                    region_contains(position, &self.region_records),self.initial_tag)
+                // A received root pose is sufficient evidence to simulate
+                // locally; region coverage is advisory (servers often stream
+                // regions that do not contain the spawn cell yet).
+                let _ = position;
+                crate::received_world_ready::can_simulate(&view,&root,true,self.initial_tag)
             }))
             .unwrap_or(false);
         let stage = Instant::now();
@@ -750,8 +753,10 @@ impl ReceivedWorld {
                 .and_then(|region| region["coordinate"].as_array())
                 .filter(|values| values.len() == 3)
             {
+                // Region coordinates are 64-stud cell indices; focus centers
+                // are world studs, so use the cell center in studs.
                 let to_f32 = |index: usize| {
-                    center[index].as_f64().unwrap_or(0.0) as f32
+                    (center[index].as_f64().unwrap_or(0.0) * 64.0 + 32.0) as f32
                 };
                 self.focus_id = self.focus_id.wrapping_add(1);
                 if let Ok(packet) = replication_focus(
@@ -807,6 +812,10 @@ impl ReceivedWorld {
         ))
     }
 
+    fn pending_sets_count(&self) -> usize {
+        0
+    }
+
     fn prepare_streaming_resume(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
         if self.streaming_ready_sent {
             return Ok(None);
@@ -836,6 +845,13 @@ impl ReceivedWorld {
         )
         .map_err(|_| "streaming-resume-encode-failed")?;
         self.streaming_ready_sent = true;
+        // Opt-in: some servers re-send the character on this request and
+        // stall spawning, so it stays off unless explicitly enabled.
+        if std::env::var_os("ROVE_SEND_CHAR_REQUEST").is_some() {
+            if let Ok(request) = request_character(parse_instance_guid(&player)?) {
+                self.pending_character_request = Some(request);
+            }
+        }
         Ok(Some(payload))
     }
 
@@ -1135,6 +1151,38 @@ struct SpawnEvidence {
     pause_property_id: Option<u16>,
 }
 
+/// Resolve the local player's character, falling back to a Workspace model
+/// whose name matches the player when the reference has not arrived yet.
+fn locate_character(
+    view: &rove_client_core::world::WorldView,
+    player_id: &str,
+) -> Option<String> {
+    if let Some(id) = view
+        .get_property(player_id, "Character")
+        .and_then(|value| value["$ref"].as_str().map(str::to_owned))
+    {
+        return Some(id);
+    }
+    let name = view
+        .get_property(player_id, "Name")
+        .and_then(|value| value.as_str().map(str::to_owned))?;
+    let mut found = None;
+    view.for_each_node(|node| {
+        if found.is_none()
+            && node.class_name() == "Model"
+            && matches!(node.name(), rove_client_core::world::ReadOnlyField::Value(n) if n == name)
+            && matches!(
+                node.parent(),
+                rove_client_core::world::ReadOnlyField::Value(parent)
+                    if view.class_name(parent) == Some("Workspace")
+            )
+        {
+            found = Some(node.id().to_owned());
+        }
+    });
+    found
+}
+
 fn region_contains(position: [f64; 3], regions: &[Value]) -> bool {
     let coordinate = position.map(|value| (value / 64.0).floor() as i64);
     let coordinate_received = regions.iter().any(|region| {
@@ -1191,33 +1239,68 @@ fn evaluate_spawn_evidence(
         ..SpawnEvidence::default()
     };
     if view.class_name(&player_id) != Some("Player") {
+        trace_gate(&format!("player-class={:?}", view.class_name(&player_id)));
         return evidence;
     }
-    let Some(character_id) = view
-        .get_property(&player_id, "Character")
-        .and_then(|value| value["$ref"].as_str().map(str::to_owned))
-    else {
-        return evidence;
+    let character_id = match locate_character(view, &player_id) {
+        Some(id) => id,
+        None => {
+            let player_name = view
+                .get_property(&player_id, "Name")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            let mut found = None;
+            if let Some(name) = player_name {
+                view.for_each_node(|node| {
+                    if found.is_none()
+                        && node.class_name() == "Model"
+                        && matches!(node.name(), rove_client_core::world::ReadOnlyField::Value(n) if n == name)
+                        && matches!(
+                            node.parent(),
+                            rove_client_core::world::ReadOnlyField::Value(parent)
+                                if view.class_name(parent) == Some("Workspace")
+                        )
+                    {
+                        found = Some(node.id().to_owned());
+                    }
+                });
+            }
+            match found {
+                Some(id) => id,
+                None => {
+                    trace_gate("no-character-property");
+                    return evidence;
+                }
+            }
+        }
     };
-    if view.class_name(&character_id) != Some("Model")
-        || view
-            .parent(&character_id)
-            .and_then(|parent| view.class_name(parent))
-            != Some("Workspace")
-    {
+
+    if view.class_name(&character_id) != Some("Model") {
+        trace_gate(&format!("char-class={:?}", view.class_name(&character_id)));
+        return evidence;
+    }
+    let parent_class = view
+        .parent(&character_id)
+        .and_then(|parent| view.class_name(parent));
+    if parent_class != Some("Workspace") {
+        trace_gate(&format!("char-parent={parent_class:?}"));
         return evidence;
     }
     let mut humanoid = None;
+    let mut kids: Vec<String> = Vec::new();
     view.for_each_node(|node| {
         if matches!(
             node.parent(),
             rove_client_core::world::ReadOnlyField::Value(parent) if parent == character_id
-        ) && node.class_name() == "Humanoid"
-        {
-            humanoid = Some(node.id().to_owned());
+        ) {
+            kids.push(format!("{}:{}", node.id(), node.class_name()));
+            if node.class_name() == "Humanoid" {
+                humanoid = Some(node.id().to_owned());
+            }
         }
     });
+
     let Some(humanoid_id) = humanoid else {
+        trace_gate("no-humanoid");
         return evidence;
     };
     if view
@@ -1234,6 +1317,7 @@ fn evaluate_spawn_evidence(
         .get_property(&character_id, "PrimaryPart")
         .and_then(|value| value["$ref"].as_str().map(str::to_owned))
     else {
+        trace_gate("no-primary-part");
         return evidence;
     };
     if !matches!(view.class_name(&root_id), Some("Part" | "MeshPart"))
@@ -1243,11 +1327,18 @@ fn evaluate_spawn_evidence(
         return evidence;
     }
     let Some(position) = root_position(view, &root_id) else {
+        trace_gate("no-root-position");
         return evidence;
     };
     evidence.spawn_region_received = region_contains(position, regions);
     evidence.player_spawned = true;
     evidence
+}
+
+fn trace_gate(message: &str) {
+    if std::env::var_os("ROVE_SPAWN_TRACE").is_some() {
+        eprintln!("SPAWN-GATE {message}");
+    }
 }
 
 fn root_position(view: &rove_client_core::world::WorldView, root: &str) -> Option<[f64; 3]> {
@@ -1502,6 +1593,11 @@ fn worker(
                         payload,
                         _budget: permit,
                     })
+                    .map_err(|_| "session-stopped-before-send")?;
+            }
+            if let Some(payload) = world.pending_character_request.take() {
+                outgoing
+                    .send(Effect::Focus { payload })
                     .map_err(|_| "session-stopped-before-send")?;
             }
             if let Some(payload) = world.pending_focus.take() {

@@ -868,6 +868,8 @@ impl WorldData {
 pub struct WorldStore {
     data: Arc<WorldData>,
     pool: InternPool,
+    /// Sets whose instance had not been created yet (streaming order).
+    pending_sets: Vec<Value>,
 }
 
 impl WorldStore {
@@ -914,6 +916,7 @@ impl WorldStore {
         Ok(Self {
             data: Arc::new(data),
             pool,
+            pending_sets: Vec::new(),
         })
     }
 
@@ -996,6 +999,29 @@ impl WorldStore {
             if creates.insert(binding.action_index, binding).is_some() {
                 return Err("duplicate compact create binding".into());
             }
+        }
+        // Replay sets whose node has since streamed in.
+        if !self.pending_sets.is_empty() {
+            let pending = std::mem::take(&mut self.pending_sets);
+            let mut still = Vec::new();
+            for action in pending {
+                let Some(id) = action.get("id").and_then(Value::as_str) else { continue };
+                let Some(fields) = action.get("fields").and_then(Value::as_object) else { continue };
+                let Some(record) = next.get(id).cloned() else {
+                    still.push(action);
+                    continue;
+                };
+                let mut changed = (*record).clone();
+                for (key, value) in fields {
+                    match key.as_str() {
+                        "Parent" => changed.set_parent(parse_parent_slot(value, &mut self.pool)?),
+                        "Name" => changed.set_name(parse_name_slot(value, &mut self.pool)?),
+                        _ => changed.set_property_ref_with_shared(key, value, shared)?,
+                    }
+                }
+                next.replace_record(changed);
+            }
+            self.pending_sets = still;
         }
         let mut last_action_sequence = self.data.sequence;
         for (action_index, action) in actions.iter().enumerate() {
@@ -1106,6 +1132,10 @@ impl WorldStore {
                         .ok_or("set action fields must be an object")?;
                     let Some(record) = next.get(&id).cloned() else {
                         compact_by_action.retain(|(index, _), _| *index != action_index);
+                        if self.pending_sets.len() >= 20_000 {
+                            self.pending_sets.remove(0);
+                        }
+                        self.pending_sets.push(delta["actions"][action_index].clone());
                         continue;
                     };
                     let mut changed = record.as_ref().clone();
