@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 const MAX_CODE: usize = 128 * 1024;
-const MAX_CATALOG: usize = 3 * 1024 * 1024;
+const MAX_CATALOG: usize = 16 * 1024 * 1024;
 fn hash(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }

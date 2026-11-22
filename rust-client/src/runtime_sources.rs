@@ -17,7 +17,7 @@ use std::{
 
 const MAX_NODES: usize = 20_000;
 const MAX_CATALOG_ENTRIES: usize = 16384;
-const MAX_CATALOG_BYTES: usize = 3 * 1024 * 1024;
+const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SOURCE_BYTES: usize = 128 * 1024;
 const MAX_BUILTIN_ENTRIES: usize = 256;
 const MAX_BUILTIN_BYTES: usize = 2 * 1024 * 1024;
@@ -210,7 +210,7 @@ pub fn validate_catalog(value: &Value) -> Result<Value> {
                 .len(),
         );
         if bytes > MAX_CATALOG_BYTES {
-            return invalid("script catalog exceeds 3 MiB");
+            return invalid("script catalog exceeds 16 MiB");
         }
     }
     Ok(value.clone())

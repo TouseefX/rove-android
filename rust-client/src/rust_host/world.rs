@@ -789,7 +789,7 @@ impl World {
     ) -> Result<(), String> {
         let root = delta.as_object().ok_or("world delta must be an object")?;
         let display = super::camera::display_update(root)?;
-        if !super::session::json_fits(delta, 8 * 1024 * 1024) {
+        if !super::session::json_fits(delta, 32 * 1024 * 1024) {
             return Err("world delta exceeds 8 MiB".into());
         }
         let target = root

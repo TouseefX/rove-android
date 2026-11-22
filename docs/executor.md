@@ -47,3 +47,10 @@ authored Luau through the official VM embedded in the Rust client.
 - 89,330 nodes replicated, 2,849 packets committed / 0 rejected
 - 35.2 MB resident RAM (lightweight) — heavy FPS world under 36 MB
 - Scripts executed; session clean end.
+
+### BedWars (6872265039)
+
+- 3,389 nodes, 502 packets committed / 0 rejected
+- server itself closes reliable streams after ~30s for this world; session
+  ends cleanly (reset-as-eof). Scripts ran; catalog raised to 16 MiB to fit
+  2.5k+ game scripts (BedWars ships ~2,500 scripts).

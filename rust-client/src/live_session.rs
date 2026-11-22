@@ -51,7 +51,7 @@ use tokio::{
 };
 
 const QUEUE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_STREAMS: usize = 16;
+const MAX_STREAMS: usize = 256;
 const MAX_CHANNELS: usize = 64;
 const BYTECODE_RANGE_CAPABILITY: u64 = 0x10_0000;
 

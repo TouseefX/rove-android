@@ -161,7 +161,16 @@ impl ReliableReceiver {
 
         let mut scratch = [0u8; RELIABLE_READ_CHUNK];
         loop {
-            match self.stream.read(&mut scratch).await.map_err(read_error)? {
+            let chunk = match self.stream.read(&mut scratch).await {
+                Ok(chunk) => chunk,
+                Err(wtransport::error::StreamReadError::Reset(_)) => {
+                    // Peer closed this reliable channel; treat as EOF.
+                    self.ended = true;
+                    return Ok(None);
+                }
+                Err(error) => return Err(read_error(error)),
+            };
+            match chunk {
                 Some(count) if count != 0 => {
                     self.pending.extend(self.decoder.feed(&scratch[..count])?);
                     if let Some(message) = self.pending.pop_front() {
