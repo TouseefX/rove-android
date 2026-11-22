@@ -51,6 +51,9 @@ impl<'a> Reader<'a> {
     pub fn slice(&self) -> &'a [u8] {
         self.data
     }
+    pub fn set_position(&mut self, pos: usize) {
+        self.pos = pos.min(self.data.len());
+    }
 
     pub fn take(&mut self, size: usize) -> Result<&'a [u8], WireError> {
         let end = self
@@ -154,7 +157,9 @@ impl<'a> Reader<'a> {
     pub fn count(&mut self, limit: u64) -> Result<usize, WireError> {
         let value = self.varuint(32)?;
         if value > limit {
-            return Err(WireError::new("Collection exceeds limit"));
+            return Err(WireError::new(format!(
+                "Collection value {value} exceeds limit {limit}"
+            )));
         }
         usize::try_from(value).map_err(|_| WireError::new("Collection exceeds platform limit"))
     }

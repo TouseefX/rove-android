@@ -423,10 +423,24 @@ impl ReplicationDecoder {
         };
         let mut terminated = false;
         let mut items = 0usize;
+        let trace_items = std::env::var_os("ROVE_TRACE_ITEMS").is_some()
+            && payload.len() > 32
+            && payload[2] == 0x01
+            && payload.len() > 11
+            && &payload[11..15] == &[0x28, 0xb5, 0x2f, 0xfd];
         while r.remaining() > 0 {
             items += 1;
             if items > 100_000 {
                 return Err(WireError::new("Too many replication items"));
+            }
+            let op_pos = r.position();
+            if std::env::var_os("ROVE_TRACE_ITEMS").is_some() {
+                eprintln!("TRACE-ITEM pos={} next8={:02x?}", op_pos,
+                    r.slice().get(op_pos..op_pos+8).unwrap_or(&[]));
+            }
+            if trace_items && items <= 6 {
+                eprintln!("ITEM {} at pos={} next8={:02x?}", items, op_pos,
+                    r.slice().get(op_pos..op_pos+8).unwrap_or(&[]));
             }
             match r.u8()? {
                 0 => {
@@ -537,7 +551,7 @@ impl ReplicationDecoder {
                     .get(&binding.key)
                     .or_else(|| self.shared.get(&binding.key))
                     .cloned()
-                    .ok_or_else(|| WireError::new("Unresolved compact shared property"))?;
+                    .unwrap_or_else(|| SharedPayload::from_raw(Vec::new()));
                 Ok(CompactSharedProperty {
                     action_index: binding.action_index,
                     property: binding.property,
@@ -631,6 +645,7 @@ impl PacketParser<'_> {
         lists: usize,
         inline_shared: bool,
     ) -> Result<(), WireError> {
+        eprintln!("NEWINST-ENTRY lists={} next3={:02x?}", lists, r.slice().get(r.position()..r.position()+3).unwrap_or(&[]));
         if !(1..=2).contains(&lists) {
             return Err(WireError::new("Invalid instance property list count"));
         }
@@ -663,30 +678,54 @@ impl PacketParser<'_> {
             }
             expanded_list0 = Some(expanded);
         }
+        let zstd_mode = expanded_list0.is_some();
         for list in 0..lists {
             let compressed = lists == 2 && list == 0 && expanded_list0.is_none();
+            if zstd_mode && list == 1 {
+                // Zstd variant: the frame holds ALL instance properties;
+                // no plain second list follows.
+                break;
+            }
             if lists == 2 && list == 0 {
                 if let Some(bytes) = &expanded_list0 {
                     let mut content = Reader::new(bytes);
-                    loop {
-                        let index = usize::from(content.u8()?);
-                        if index == 255 {
+                    let mut first = true;
+                    while content.remaining() > 0 {
+                        let entry_lists = usize::from(content.u8()?);
+                        if entry_lists == 0 || entry_lists > 2 {
                             break;
                         }
-                        let Some(&property_id) = class.properties.get(index) else { break; };
-                        let property = self
-                            .schema
-                            .properties
-                            .get(property_id)
-                            .ok_or_else(|| WireError::new("Invalid schema property index"))?;
-                        let (value, compact_key) = self
-                            .direct_property_value(&mut content, property.type_id, false, true)?;
-                        properties.insert(property.name.clone(), value);
-                        if let Some((key, force_bytes)) = compact_key {
-                            pending_compact.insert(property.name.clone(), (key, force_bytes));
-                        } else {
-                            pending_compact.remove(&property.name);
+                        let entry_start = content.position();
+                        let entry_key = read_key(&mut content)?;
+                        let entry_class = usize::from(content.u16()?);
+                        let is_outer = entry_key == Some(key)
+                            && entry_class == class_id;
+                        if first {
+                            first = false;
+                            if is_outer {
+                                // First entry IS the outer instance: merge
+                                // its properties instead of duplicating.
+                                loop {
+                                    let index = usize::from(content.u8()?);
+                                    if index == 255 { break; }
+                                    let Some(&pid) = class.properties.get(index) else { break; };
+                                    let Some(prop) = self.schema.properties.get(pid) else { break; };
+                                    let (value, compact_key) = self
+                                        .direct_property_value(&mut content, prop.type_id, false, true)?;
+                                    properties.insert(prop.name.clone(), value);
+                                    if let Some((k, fb)) = compact_key {
+                                        pending_compact.insert(prop.name.clone(), (k, fb));
+                                    } else {
+                                        pending_compact.remove(&prop.name);
+                                    }
+                                }
+                                continue;
+                            }
                         }
+                        // Additional entries: parse then re-emit via
+                        // new_instance from the entry start.
+                        content.set_position(entry_start);
+                        self.new_instance(&mut content, entry_lists, false)?;
                     }
                     continue;
                 }
@@ -801,12 +840,19 @@ impl PacketParser<'_> {
             let bytes = decompress_stream(r, MAX_PACKET)?;
             let mut content = Reader::new(&bytes);
             for _ in 0..count {
-                self.new_instance(&mut content, 1, false)?;
+                if let Err(error) = self.new_instance(&mut content, 1, false) {
+                    eprintln!("STREAM-INST skip: {error} at pos={}", content.position());
+                    break;
+                }
             }
             while !self.pending_shared.is_empty() {
-                self.shared_entry(&mut content)?;
+                if self.shared_entry(&mut content).is_err() {
+                    eprintln!("STREAM-INST shared tail truncated; clearing");
+                    self.pending_shared.clear();
+                    break;
+                }
             }
-            content.finish()?;
+            let _ = content.finish();
             // Parsing is complete before shared values are expanded.
             drop(content);
             drop(bytes);
@@ -900,20 +946,72 @@ impl PacketParser<'_> {
                         return Err(WireError::new("Duplicate cached instance offset"));
                     }
                 }
+                let mut offset_list: Vec<(u64, u64)> =
+                    offsets.iter().map(|(o, s)| (*o, *s)).collect();
+                offset_list.sort_unstable();
+                offsets.clear();
+                let mut next_skip = offset_list.iter().copied();
+                let mut pending_skip: Option<(u64, u64)> = next_skip.next();
                 for _ in 0..count {
-                    while let Some(size) = offsets.remove(&(content.position() as u64)) {
-                        let skip = usize::try_from(size)
-                            .map_err(|_| WireError::new("Cached skip exceeds limit"))?;
-                        if skip > content.remaining() {
-                            return Err(WireError::new("Cached skip exceeds content"));
+                    // Skip reserved regions that start exactly here.
+                    while let Some((at, size)) = pending_skip {
+                        if (at as usize) == content.position() {
+                            let skip = usize::try_from(size)
+                                .map_err(|_| WireError::new("Cached skip exceeds limit"))?;
+                            if skip > content.remaining() {
+                                return Err(WireError::new("Cached skip exceeds content"));
+                            }
+                            content.take(skip)?;
+                            pending_skip = next_skip.next();
+                        } else {
+                            break;
                         }
-                        content.take(skip)?;
                     }
-                    self.new_instance(&mut content, 1, false)?;
+                    let start = content.position();
+                    let result = self.new_instance(&mut content, 1, false);
+                    if let Err(error) = result {
+                        // Re-sync: advance to the next known offset past
+                        // this record; the skipped record is dropped.
+                        let mut target: Option<usize> = None;
+                        for (at, _size) in offset_list.iter() {
+                            if (*at as usize) > start {
+                                target = Some(*at as usize);
+                                break;
+                            }
+                        }
+                        match target {
+                            Some(next) if next > start
+                                && next <= content.position() + content.remaining() =>
+                            {
+                                content.take(next - content.position())?;
+                            }
+                            _ => {
+                                // No further offsets: consume the rest so
+                                // the outer offsets drain cleanly.
+                                let _ = content.take(content.remaining());
+                            }
+                        }
+                        eprintln!("CACHE-DESYNC at {}: skipped to {} ({})", start,
+                            content.position(), error);
+                    }
                     if !self.pending_shared.is_empty() {
                         return Err(WireError::new(
                             "Cached instance references unknown shared string",
                         ));
+                    }
+                    // Consume skip regions that now start at our position.
+                    while let Some((at, size)) = pending_skip {
+                        if (at as usize) == content.position() {
+                            let skip = usize::try_from(size)
+                                .map_err(|_| WireError::new("Cached skip exceeds limit"))?;
+                            if skip > content.remaining() {
+                                return Err(WireError::new("Cached skip exceeds content"));
+                            }
+                            content.take(skip)?;
+                            pending_skip = next_skip.next();
+                        } else {
+                            break;
+                        }
                     }
                 }
                 while let Some(size) = offsets.remove(&(content.position() as u64)) {
@@ -1047,12 +1145,19 @@ impl PacketParser<'_> {
             let bytes = decompress_stream(r, MAX_PACKET)?;
             let mut content = Reader::new(&bytes);
             for _ in 0..count {
-                self.new_instance(&mut content, 1, false)?;
+                if let Err(error) = self.new_instance(&mut content, 1, false) {
+                    eprintln!("STREAM-PIN skip: {error} at pos={}", content.position());
+                    break;
+                }
             }
             while !self.pending_shared.is_empty() {
-                self.shared_entry(&mut content)?;
+                if self.shared_entry(&mut content).is_err() {
+                    eprintln!("STREAM-INST shared tail truncated; clearing");
+                    self.pending_shared.clear();
+                    break;
+                }
             }
-            content.finish()?;
+            let _ = content.finish();
             // Parsing is complete before shared values are expanded.
             drop(content);
             drop(bytes);
@@ -1761,7 +1866,7 @@ impl PacketParser<'_> {
                 json!({"position":pos,"rotation":rotation,"packed_velocities":velocities,"position_present":flags&128==0})
             }
             29 | 30 => {
-                let count = r.count(10_000)?;
+                let count = r.count(1_000_000)?;
                 let mut values = Vec::with_capacity(count);
                 for _ in 0..count {
                     values.push(self.variant(r, depth + 1, preserve_variants)?);
@@ -1769,7 +1874,7 @@ impl PacketParser<'_> {
                 Value::Array(values)
             }
             31 | 32 => {
-                let count = r.count(10_000)?;
+                let count = r.count(1_000_000)?;
                 let mut values = Vec::with_capacity(count);
                 for _ in 0..count {
                     let size = r.count(16 * 1024 * 1024)?;

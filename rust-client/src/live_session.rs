@@ -371,10 +371,25 @@ impl ReceivedWorld {
                 .map_err(|_| "instance-state-commit-failed")? else { return Ok(vec![]); };
             accepted
         } else {
+            if let Ok(dir) = std::env::var("ROVE_DUMP_OK_PACKETS") {
+                static DUMP_OK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = DUMP_OK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::path::Path::new(&dir).join(format!("ok-{}.bin", n));
+                let _ = std::fs::write(&path, payload);
+            }
             match self.core.ingest(payload) {
                 Ok(accepted) => accepted,
                 Err(e) if self.skip_decode_errors => {
-                    
+                    if let Ok(dir) = std::env::var("ROVE_DUMP_BAD_PACKETS") {
+                        static DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let path = std::path::Path::new(&dir).join(format!("bad-{}.bin", n));
+                        let _ = std::fs::write(&path, payload);
+                        eprintln!("packet dumped: {} ({} bytes): {e}", path.display(), payload.len());
+                    }
+                    return Ok(vec![]);
+                }
+                Err(_) if self.skip_decode_errors => {
                     return Ok(vec![]);
                 }
                 Err(_) => return Err("world-packet-rejected"),

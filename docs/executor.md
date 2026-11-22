@@ -54,3 +54,38 @@ authored Luau through the official VM embedded in the Rust client.
 - server itself closes reliable streams after ~30s for this world; session
   ends cleanly (reset-as-eof). Scripts ran; catalog raised to 16 MiB to fit
   2.5k+ game scripts (BedWars ships ~2,500 scripts).
+
+## Final state summary (Nov 21, 2026)
+
+Multi-game verification:
+- Crossroads (1818): full spawn, 5,575 nodes, 40 MB — clean
+- Adopt Me! (920587237): 42,329 nodes, 43 MB — stable 3-min soak, flat RSS
+- Phantom Forces (292439477): 89,330 nodes, 35 MB — 0 rejected packets
+- BedWars (6872265039): 3,389 nodes, 36 MB — server closes streams ~30s; clean end
+
+Protocol fixes landed this session:
+1. Two-list instance packets: zstd-compressed list 0 decode (was dropped)
+2. Property wire types 16 (Faces bitmask) + 17 (Vector3)
+3. Peer stream reset treated as clean EOF
+4. Script catalog raised to 16 MiB + 16k entries for big games
+5. World delta cap 8 -> 32 MiB
+6. Lenient live-reception (ROVE_TOLERATE_UNKNOWN_SETS) keeps sessions alive
+   through rare packets while tests stay strict
+
+Suite: 914/914 client tests + 223/223 core tests green. Changes pushed to
+github.com/alexkkork/rove (c59d341, fc6a4ed).
+
+## Packet-fidelity push (Nov 21 late)
+
+Captured 2.4 MB of live traffic offline and replayed against the decoder:
+- 11/12 previously-failing packets now DECODE OK
+- Adopt Me live: 1,564 committed / 1 rejected (was 7-12), 43,399 nodes
+- Crossroads spawn OK (4,561 nodes), Phantom Forces OK (92,613 nodes)
+Changes:
+- cached-instance record resync via offset table
+- zstd batch: first entry merges into outer create, later entries create
+- unknown shared refs become empty payloads instead of failing packets
+- tolerant stream-item loops (instances/pin) for live reception
+- attribute arrays raised to 1M entries (Adopt Me sends big arrays)
+- world-level class-changed duplicates tolerated in live mode only
+All 914 client tests green; changes pushed.
