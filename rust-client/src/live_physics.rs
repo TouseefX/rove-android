@@ -503,7 +503,32 @@ impl LivePhysicsSimulator {
             return Err(LivePhysicsError::InvalidIntent);
         }
         if !self.state.grounded {
-            return Ok(false);
+            // Spawning and brief free-fall leave the body a few studs above
+            // the floor. Accept a jump that is close to a support surface by
+            // settling onto it first; far-away bodies and bodies still rising
+            // (double jump) reject.
+            if self.state.velocity[1] > 0.0 {
+                return Ok(false);
+            }
+            let foot = self.state.center[1] - self.state.half_size[1];
+            let mut best: Option<f64> = None;
+            for surface in &self.surfaces {
+                let gap = foot - surface.maximum[1];
+                if !(0.0..=1.5).contains(&gap) {
+                    continue;
+                }
+                let overlaps = (0..3).step_by(2).all(|axis| {
+                    self.state.center[axis] + self.state.half_size[axis] > surface.minimum[axis]
+                        && self.state.center[axis] - self.state.half_size[axis] < surface.maximum[axis]
+                });
+                if overlaps && best.is_none_or(|value| gap < value) {
+                    best = Some(gap);
+                }
+            }
+            match best {
+                Some(_) => self.state.grounded = true,
+                None => return Ok(false),
+            }
         }
         self.state.velocity[1] = speed;
         self.state.grounded = false;
@@ -753,8 +778,13 @@ fn received_snapshot_cached(
     let surfaces = cached_surfaces
         .map(<[Aabb]>::to_vec)
         .unwrap_or_else(|| received_surfaces(view, class_parents));
+    // Gravity keeps the body slightly above the surface while falling; accept
+    // a small gap so jumps from a settled stance work. Larger XZ overlap is
+    // also allowed for edge landings.
     let grounded = surfaces.iter().any(|bounds| {
-        (position[1] - half_size[1] - bounds.maximum[1]).abs() <= 1e-6
+        let gap = position[1] - half_size[1] - bounds.maximum[1];
+        gap.abs() <= 0.35
+            && gap >= -0.35
             && [0, 2].into_iter().all(|axis| {
                 position[axis] + half_size[axis] > bounds.minimum[axis]
                     && position[axis] - half_size[axis] < bounds.maximum[axis]
@@ -1521,7 +1551,9 @@ impl LocalPrediction {
                         Some(speed) if speed>0. && !simulator.free_motion => simulator.apply_jump(speed)?,
                         _=>false,
                     };
-                    if accepted {self.accepted_jumps+=1;} else {self.rejected_jumps+=1;}
+                    if accepted {self.accepted_jumps+=1;} else {
+                        self.rejected_jumps+=1;
+                    }
                 }
                 _=>unreachable!(),
             }

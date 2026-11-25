@@ -1647,7 +1647,7 @@ impl PhysicsStepper {
                 // the footprint still overlaps an actual AABB top.
                 let supported = surfaces.iter().any(|surface| {
                     let foot_y = state.center[1] - state.half_size[1];
-                    (foot_y - surface.maximum[1]).abs() <= 1e-6
+                    (foot_y - surface.maximum[1]).abs() <= 1e-3
                         && state.center[0] + state.half_size[0] > surface.minimum[0]
                         && state.center[0] - state.half_size[0] < surface.maximum[0]
                         && state.center[2] + state.half_size[2] > surface.minimum[2]
@@ -1659,7 +1659,7 @@ impl PhysicsStepper {
                     horizontal_advanced = true;
                     let support_at_end = surfaces.iter().any(|surface| {
                         let foot_y = state.center[1] - state.half_size[1];
-                        (foot_y - surface.maximum[1]).abs() <= 1e-6
+                        (foot_y - surface.maximum[1]).abs() <= 1e-3
                             && state.center[0] + state.half_size[0] > surface.minimum[0]
                             && state.center[0] - state.half_size[0] < surface.maximum[0]
                             && state.center[2] + state.half_size[2] > surface.minimum[2]

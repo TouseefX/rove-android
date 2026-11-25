@@ -1600,10 +1600,12 @@ fn worker(
                     .send(Effect::Focus { payload })
                     .map_err(|_| "session-stopped-before-send")?;
             }
-            if let Some(payload) = world.pending_focus.take() {
-                outgoing
-                    .send(Effect::Focus { payload })
-                    .map_err(|_| "session-stopped-before-send")?;
+            if std::env::var_os("ROVE_SEND_FOCUS").is_some() {
+                if let Some(payload) = world.pending_focus.take() {
+                    outgoing
+                        .send(Effect::Focus { payload })
+                        .map_err(|_| "session-stopped-before-send")?;
+                }
             }
             emit_rpc_outbound(&mut world, &outgoing, &reply_budget)?;
             Ok(())
@@ -1851,6 +1853,7 @@ pub fn run_with_options(
         let mut physics_send_returns=0u64;
         let mut owned_part_records_sent=0u64;
         let mut owned_part_announced=false;
+        let send_owned_parts=std::env::var_os("ROVE_SEND_OWNED_PARTS").is_some();
         let mut owned_part_packets_sent=0u64;
         let mut physics_contacts_sent=0u64;
         let mut physics_stale_frames=0u64;
@@ -1950,7 +1953,7 @@ pub fn run_with_options(
                             sender.send(4,1,&payload).await.map_err(|_| "streaming-resume-send-failed")?;
                             streaming_ready_sent+=1;
                         }
-                        Effect::OwnedParts {records,step,remote_step,contacts,prepared_at,..} => {
+                        Effect::OwnedParts {mut records,step,remote_step,mut contacts,prepared_at,..} => {
                             for outcome in delivery.drain() {
                                 match outcome {
                                     rove_client_core::transport::delivery::Delivery::Acknowledged(step)=>isr_clock.acknowledged(step),
@@ -1964,6 +1967,10 @@ pub fn run_with_options(
                             // one side would lose or invent begin/end history.
                             if (!records.is_empty() || !contacts.is_empty())
                                 && prepared_at.elapsed()>Duration::from_millis(250) {return Err("owned-physics-output-stale");}
+                            if !send_owned_parts {
+                                records.clear();
+                                contacts.clear();
+                            }
                             for batch in records.chunks(8) {
                                 let payload=crate::isr_sender::packet_with_offset(step,batch,offset)?;
                                 if !owned_part_announced {
