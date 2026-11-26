@@ -45,13 +45,14 @@ def escape(text):
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
-# The tail starts at the first "panicked at": the assertion's own message (the
-# left/right of an assert_eq!) is the line after it, and it is what a reader
-# needs. Everything after it is short.
-first_panic = next(
+# Where the failure starts: a panic (a failed assert_eq!'s left/right is the
+# line after it) or a test's FAILED line. With neither, the failure is whatever
+# the compiler said, and the diagnostics below are the account of it.
+failure_at = next(
     (i for i, line in enumerate(lines) if "panicked at" in line or "FAILED" in line),
-    max(0, len(lines) - 120),
+    None,
 )
+
 found = []
 for i, line in enumerate(lines):
     m = short.match(line)
@@ -61,47 +62,44 @@ for i, line in enumerate(lines):
         detail = m.group("msg")
         if i + 1 < len(lines) and lines[i + 1].strip().startswith(("= help", "= note")):
             detail += " — " + lines[i + 1].strip()
-        found.append(("error", m.group("file"), m.group("line"), detail))
+        level = "warning" if ": warning" in line else "error"
+        found.append((level, m.group("file"), m.group("line"), detail))
         continue
     m = plain.match(line)
     if m and not line.strip().startswith("="):
-        found.append(("error", None, None, m.group("msg")))
+        level = "warning" if ": warning" in line else "error"
+        found.append((level, None, None, m.group("msg")))
 
-
-# Page 0 is the one that is certainly read, so it carries what makes a failure
-# readable: the panic block (a failed assert_eq!'s left/right) or, if there is
-# none, the first compiler diagnostics. Later pages are the rest of the
-# diagnostics, then the end of the log (a test that panicked prints no
-# `file:line:col:` line at all; its FAILED list and "test result:" line are at
-# the end of the output).
-panic_block = []
-if first_panic < len(lines):
-    panic_block = [("error", None, None, line[:900])
-                   for line in lines[first_panic:]
-                   if line.strip() and not test_ok.match(line)][:6]
-    found = [d for d in found if "panicked at" not in d[3]]
-
-rest = found
+# A red run is about its errors. Warnings are real but they are not why the job
+# stopped, and a page holds ten lines: the errors get the pages first.
+errors = [d for d in found if d[0] == "error"]
+warnings = [d for d in found if d[0] == "warning"]
+rest = errors + warnings
 diag_pages = (len(rest) + PER_PAGE - 1) // PER_PAGE
-tail = [line for line in lines[first_panic:] if line.strip()][-150:][::-1]
+
+# The end of the log is the last resort: a test that panics prints no
+# `file:line:col:` line at all, and its "test result:" line is at the end.
+tail = ([line for line in lines[failure_at:] if line.strip()] if failure_at is not None
+        else [line for line in lines if line.strip()][-40:])
+tail = tail[-150:][::-1]
 
 if page == 0:
-    page_items = panic_block if panic_block else rest[:PER_PAGE]
-    printed = len(page_items) if panic_block else min(len(rest), PER_PAGE)
-    if panic_block:
-        print("annotate: found %d diagnostic(s); page 0 = where the failure starts" % len(rest))
+    if failure_at is not None:
+        # The failure itself, first: whoever reads one annotation reads this.
+        page_items = [("error", None, None, line[:900])
+                      for line in tail[::-1]
+                      if line.strip() and not test_ok.match(line)][:PER_PAGE]
+        print("annotate: %d diagnostic(s); page 0 = where the failure starts" % len(rest))
     else:
-        print("annotate: diagnostics page 1 of %d (%d diagnostic(s))" % (max(diag_pages, 1), len(rest)))
-    rest = rest[0:] if panic_block else rest[PER_PAGE:]
+        page_items = rest[:PER_PAGE]
+        print("annotate: diagnostics page 1 of %d (%d)" % (max(diag_pages, 1), len(rest)))
+    rest = rest[len(page_items):] if failure_at is None else rest
 elif page - 1 < (len(rest) + PER_PAGE - 1) // PER_PAGE:
     page_items = rest[(page - 1) * PER_PAGE : page * PER_PAGE]
     print("annotate: diagnostics page %d" % (page + 1))
 else:
     tail_page = page - 1 - (len(rest) + PER_PAGE - 1) // PER_PAGE
-    page_items = [
-        ("error", None, None, line[:900])
-        for line in tail[tail_page * PER_PAGE : (tail_page + 1) * PER_PAGE]
-    ]
+    page_items = [("error", None, None, line[:900]) for line in tail[tail_page * PER_PAGE : (tail_page + 1) * PER_PAGE]]
     print("annotate: end of the log, page %d (%d line(s))" % (tail_page + 1, len(page_items)))
 
 for level, file, line, msg in page_items:
