@@ -30,6 +30,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +43,7 @@ jobs:
         run: |
           set -o pipefail
           cargo check --workspace --all-targets --locked \
-            --message-format=short 2>&1 | tee /tmp/check.log
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/check.log"
       # The Linux runner has no display, which the editor self-test needs.
       - name: Test
         if: runner.os != 'Linux'
@@ -50,7 +51,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --locked \
-            --message-format=short 2>&1 | tee /tmp/test.log
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/test.log"
       # Job logs are not readable back from here, but annotations are; see
       # tools/ci/annotate.py. A separate always-run step, because a step that
       # fails loses most of its own annotations.
@@ -58,12 +59,22 @@ jobs:
         if: always()
         shell: bash
         run: |
-          for log in /tmp/check.log /tmp/test.log; do
-            [ -f "$log" ] || continue
-            echo "=== $log"
+          for log in "$RUNNER_TEMP/check.log" "$RUNNER_TEMP/test.log"; do
+            if [ ! -f "$log" ]; then
+              echo "::notice::$log: not written"
+              continue
+            fi
+            echo "::notice::$log: $(wc -l < "$log") line(s)"
             for page in 0 1 2 3 4 5 6 7; do
               python3 tools/ci/annotate.py "$log" "$page" || true
             done
+            # No diagnostic and no FAILED line means the log itself is the only
+            # evidence, and the annotations are the only channel back.
+            if ! grep -qE "FAILED|panicked at|^error" "$log"; then
+              tail -12 "$log" | while IFS= read -r line; do
+                echo "::error::log tail: $line"
+              done
+            fi
           done
 
   # macOS: Apple Silicon and Intel. The tests run here too (the GPU tests
@@ -83,13 +94,13 @@ jobs:
         run: |
           set -o pipefail
           cargo check --workspace --all-targets --locked \
-            --message-format=short 2>&1 | tee /tmp/check.log
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/check.log"
       - name: Test
         shell: bash
         run: |
           set -o pipefail
           cargo test --workspace --locked \
-            --message-format=short 2>&1 | tee /tmp/test.log
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Re-emit the diagnostics
         if: always()
         run: |
