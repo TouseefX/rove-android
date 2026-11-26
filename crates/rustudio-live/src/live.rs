@@ -35,7 +35,7 @@ use rbx_dom_weak::{ustr, InstanceBuilder};
 use rustudio_core::doc::Document;
 use serde_json::Value as J;
 
-use crate::snapshot::{self, ValueConverter};
+use crate::snapshot::ValueConverter;
 
 /// What a batch of rove actions did to the world, for the harness to print.
 #[derive(Debug, Clone, Default)]
@@ -350,7 +350,9 @@ impl Live {
         };
         // The subtree goes with it; the id map must not keep the refs of
         // instances that no longer exist, or a later `$ref` binds a dead ref.
-        let doomed: Vec<Ref> = doc.dom.descendants(r).collect();
+        // `descendants` yields `&Instance` (the ref is `referent()`), and a
+        // whole map is dropped per batch rather than per instance.
+        let doomed: Vec<Ref> = doc.dom.descendants(r).map(|i| i.referent()).collect();
         for d in &doomed {
             if let Some(id) = self.refs.remove(d) {
                 self.ids.remove(&id);
@@ -358,6 +360,7 @@ impl Live {
             }
         }
         stats.removed += 1;
+        // The subtree minus the instance itself, which `destroy` takes with it.
         stats.instances_removed += doomed.len().saturating_sub(1);
         if !doomed.is_empty() && r != doc.dom.root_ref() {
             doc.dom.destroy(r);
@@ -473,7 +476,6 @@ pub fn stale_ids(world_ids: &HashSet<String>, live: &Live) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::Snapshot;
 
     fn empty_world() -> (Document, Live) {
         let snapshot = crate::snapshot::parse(
