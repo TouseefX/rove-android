@@ -57,20 +57,35 @@ for i, line in enumerate(lines):
         found.append(("error", None, None, m.group("msg")))
 
 
-# Pages are emitted in order and only the first ones are sure to be read, so
-# the order is: the compiler's own diagnostics, then the end of the log (a
-# test that panicked prints no `file:line:col:` line at all — its FAILED list
-# and "test result:" line are the end of the output).
-diag_pages = (len(found) + PER_PAGE - 1) // PER_PAGE
+# Page 0 is the one that is certainly read, so it carries what makes a failure
+# readable: the panic block (a failed assert_eq!'s left/right) or, if there is
+# none, the first compiler diagnostics. Later pages are the rest of the
+# diagnostics, then the end of the log (a test that panicked prints no
+# `file:line:col:` line at all; its FAILED list and "test result:" line are at
+# the end of the output).
+panic_block = []
+if first_panic < len(lines):
+    panic_block = [("error", None, None, line[:900])
+                   for line in lines[first_panic:] if line.strip()][:6]
+    found = [d for d in found if "panicked at" not in d[3]]
+
+rest = found
+diag_pages = (len(rest) + PER_PAGE - 1) // PER_PAGE
 tail = [line for line in lines[first_panic:] if line.strip()][-150:][::-1]
 
-if page < diag_pages:
-    page_items = found[page * PER_PAGE : (page + 1) * PER_PAGE]
-    print("annotate: diagnostics page %d of %d" % (page + 1, diag_pages))
-    if page == 0:
-        print("annotate: %d diagnostic(s) in %s" % (len(found), path))
+if page == 0:
+    page_items = panic_block if panic_block else rest[:PER_PAGE]
+    printed = len(page_items) if panic_block else min(len(rest), PER_PAGE)
+    if panic_block:
+        print("annotate: where the failure starts (and %d diagnostic(s) after it)" % len(rest))
+    else:
+        print("annotate: diagnostics page 1 of %d (%d diagnostic(s))" % (max(diag_pages, 1), len(rest)))
+    rest = rest[0:] if panic_block else rest[PER_PAGE:]
+elif page - 1 < (len(rest) + PER_PAGE - 1) // PER_PAGE:
+    page_items = rest[(page - 1) * PER_PAGE : page * PER_PAGE]
+    print("annotate: diagnostics page %d" % (page + 1))
 else:
-    tail_page = page - diag_pages
+    tail_page = page - 1 - (len(rest) + PER_PAGE - 1) // PER_PAGE
     page_items = [
         ("error", None, None, line[:900])
         for line in tail[tail_page * PER_PAGE : (tail_page + 1) * PER_PAGE]
