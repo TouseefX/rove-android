@@ -94,7 +94,24 @@ Opened from the app as `rustudio --live-snapshot FILE` (or by opening a file
 named `world_snapshot.json`), and measured in CI by
 `.github/workflows/live.yml`: the bridge's unit tests, a headless render of the
 fixture, `--bench` frame statistics, and an assertion step — all printed into
-the run's log.
+the run's log and repeated as annotations, because a log is not always
+readable back.
+
+What the accepted run printed (lavapipe, a CPU rasteriser: the frame times are
+a floor, not the phone's):
+
+| | |
+|---|---|
+| bridge | 7 nodes → 8 instances in 0.1 ms; roots `Workspace, Players, RunService`; 2 tagged + 5 scalar values; refs bound 2; `LocalPlayer: FixturePlayer` |
+| correctness | 22 bridge tests; dangling refs 0, refused values 0, orphans 0 |
+| render | `fixture-world.png`, 1600×900, 97 658 bytes, 180 frames |
+| frames | mean 38.63 ms headless (lavapipe); `--bench`: 300 frames, median 25.68 ms, p90 26.59, p99 35.68 |
+
+Two limits the run makes plain. Lavapipe is slow enough that the frame time
+says nothing about a phone; the bench's p99/max spread (35.7 / 290 ms) is the
+software rasteriser's, not the player's. And the fixture is seven nodes: the
+scale numbers (1818 ≈ 5.6k nodes, Phantom Forces ≈ 89k) are M3's to measure,
+not M1's to claim.
 
 ## What M2 adds
 
