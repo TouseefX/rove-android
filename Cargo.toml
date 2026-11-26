@@ -195,6 +195,17 @@ rbx_binary = { path = "vendor/rbx_binary" }
 # what the narrow phase costs inside rapier's own pipeline
 # (checks/humanoid-physics/solver/HARNESS.md "The switch").
 rapier3d = { path = "vendor/rapier3d" }
+# rove's transport. The path points into rove/vendor/ rather than a second copy
+# under this vendor/, because rove-client-core resolves its wtransport from
+# rove/vendor/wtransport with a relative path, and two copies of a crates.io
+# package with the same version cannot both be patched. A [patch] in a member is
+# ignored (with a warning) by the root, so it lives here. quinn-proto 0.11.19 +
+# TransportConfig::datagram_observer (ROVE-PATCH.md): the exact datagram bytes
+# and packet number a 1-RTT send
+# serialized, real ACK-path acknowledgments, real loss-detector losses — the
+# WebTransport loopback test checks HTTP/3 framing against an actual datagram
+# ACK, so the registry copy would not do.
+quinn-proto = { path = "rove/vendor/quinn-proto" }
 
 # Fast rebuilds for test runs by agents and for local iteration: release
 # optimisation, but compiled in many small units that are reused between

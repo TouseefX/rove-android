@@ -104,26 +104,11 @@ self-signed = ["dep:rcgen"]
 name = "wtransport"
 path = "src/lib.rs"
 
-[[example]]
-name = "client"
-path = "examples/client.rs"
-required-features = ["dangerous-configuration"]
-
-[[example]]
-name = "full"
-path = "examples/full.rs"
-required-features = ["self-signed"]
-
-[[example]]
-name = "gencert"
-path = "examples/gencert.rs"
-required-features = ["self-signed"]
-
-[[example]]
-name = "server"
-path = "examples/server.rs"
-required-features = ["self-signed"]
-
+# The example targets are dropped here, not deleted from upstream's manifest by
+# accident: this checkout carries only the crate's sources (no examples/ dir),
+# and Cargo refuses to load a manifest whose declared target has no file — which
+# stops resolution for the whole workspace, not just for examples. Rustudio uses
+# the crate's library only.
 [dependencies.bytes]
 version = "1.4.0"
 

@@ -74,10 +74,9 @@ unity = []
 name = "epaint"
 path = "src/lib.rs"
 
-[[bench]]
-name = "benchmark"
-path = "benches/benchmark.rs"
-harness = false
+# benchmark.rs is not in this checkout, and a declared target without a file
+# stops Cargo loading the manifest at all (see vendor/wtransport/Cargo.toml).
+# Nothing here runs epaint's benches.
 
 [dependencies.ahash]
 version = "0.8.12"

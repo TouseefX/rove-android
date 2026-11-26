@@ -32,11 +32,9 @@ wtransport = { path = "../vendor/wtransport", optional = true, default-features 
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Time"] }
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-strip = true
-
-[patch.crates-io]
-quinn-proto = { path = "../vendor/quinn-proto" }
+# The [profile.release] and [patch.crates-io] this crate carried as rove's own
+# root are removed here, and both carry over to the workspace root instead:
+# profiles and patches in a member are ignored (with a warning) by the root. The
+# root does not take rove's profile (lto = thin, codegen-units = 1) — that would
+# recompile the whole engine; it takes the quinn-proto patch, which the vendored
+# wtransport's transport path needs.
