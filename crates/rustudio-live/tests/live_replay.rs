@@ -13,7 +13,7 @@
 // `Ref` lives under `types` in the vendored rbx_dom_weak 4.2 (live.rs imports it
 // the same way); the crate root has no `Ref`.
 use rbx_dom_weak::types::{Ref, Variant, Vector3};
-use rbx_dom_weak::WeakDom;
+use rustudio_core::doc::Document;
 use rove_client_core::session::{IngestOutcome, SessionCore};
 use rustudio_live::live::{ApplyStats, Live};
 use rustudio_live::snapshot::ValueConverter;
@@ -72,10 +72,12 @@ fn packets(recording: &Value) -> Vec<(String, Vec<u8>)> {
 
 /// Replay the whole recording the way a live connection would: ingest, read the
 /// receipt the journal just committed, apply its actions.
-fn replay() -> (WeakDom, Live, Vec<(String, ApplyStats)>) {
+fn replay() -> (Document, Live, Vec<(String, ApplyStats)>) {
     let recording = recording();
     let mut core = SessionCore::with_limits(256, 4 << 20).expect("a session");
-    let mut doc = WeakDom::new();
+    // An empty place: a DataModel with no children, which is what the
+    // recording's globals packet is about to give it.
+    let mut doc = Document::empty();
     let mut conv = ValueConverter::default();
     let mut live = Live::new();
     let mut applied = Vec::new();
@@ -105,10 +107,10 @@ fn replay() -> (WeakDom, Live, Vec<(String, ApplyStats)>) {
     (doc, live, applied)
 }
 
-fn named(doc: &WeakDom, name: &str) -> Option<Ref> {
-    let mut stack: Vec<Ref> = doc.root().children().to_vec();
+fn named(doc: &Document, name: &str) -> Option<Ref> {
+    let mut stack: Vec<Ref> = doc.dom.root().children().to_vec();
     while let Some(r) = stack.pop() {
-        let instance = doc.get_by_ref(r)?;
+        let instance = doc.dom.get_by_ref(r)?;
         if instance.name == name {
             return Some(r);
         }
@@ -146,17 +148,17 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
 
     // The globals packet's containers are the world's roots; the replication
     // packet's Part hangs off Workspace.
-    assert_eq!(doc.get_by_ref(workspace).unwrap().name, "Workspace");
-    assert_eq!(doc.get_by_ref(players).unwrap().name, "Players");
-    assert_eq!(doc.get_by_ref(datamodel).unwrap().name, "DataModel");
+    assert_eq!(doc.dom.get_by_ref(workspace).unwrap().name, "Workspace");
+    assert_eq!(doc.dom.get_by_ref(players).unwrap().name, "Players");
+    assert_eq!(doc.dom.get_by_ref(datamodel).unwrap().name, "DataModel");
     let part = live
         .referent(&id(&recording, "part"))
         .expect("the Part is bound");
-    assert_eq!(doc.get_by_ref(part).unwrap().parent(), workspace);
+    assert_eq!(doc.dom.get_by_ref(part).unwrap().parent(), workspace);
 
     // The properties came through the converter with their real types: the
     // packet carries a Vector3 and a bool, not a JSON float array.
-    let instance = doc.get_by_ref(part).expect("the Part");
+    let instance = doc.dom.get_by_ref(part).expect("the Part");
     assert_eq!(
         instance.properties.get(&"Size".into()),
         Some(&Variant::Vector3(Vector3::new(4.0, 1.0, 2.0))),
@@ -175,7 +177,7 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
         0,
         "no create is still waiting for its parent"
     );
-    assert_eq!(doc.get_by_ref(players).unwrap().parent(), workspace);
+    assert_eq!(doc.dom.get_by_ref(players).unwrap().parent(), workspace);
 }
 
 #[test]
@@ -185,7 +187,7 @@ fn the_character_is_bound_to_players_even_though_it_arrived_first() {
     let players = live.referent(&id(&recording, "players")).unwrap();
     let character = live.referent(&id(&recording, "character")).unwrap();
     assert_eq!(
-        doc.get_by_ref(character).unwrap().parent(),
+        doc.dom.get_by_ref(character).unwrap().parent(),
         players,
         "the child arrived with no parent and was given its edge later"
     );
@@ -209,9 +211,9 @@ fn the_removal_takes_the_subtree_and_forgets_the_id() {
     // Only the Character is still a Part in the document.
     let parts: Vec<String> = {
         let mut found = Vec::new();
-        let mut stack: Vec<Ref> = doc.root().children().to_vec();
+        let mut stack: Vec<Ref> = doc.dom.root().children().to_vec();
         while let Some(r) = stack.pop() {
-            let instance = doc.get_by_ref(r).expect("live ref");
+            let instance = doc.dom.get_by_ref(r).expect("live ref");
             if instance.class.as_str() == "Part" {
                 found.push(instance.name.clone());
             }
