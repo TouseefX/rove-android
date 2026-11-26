@@ -19,6 +19,11 @@ path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/build.log"
 page = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 PER_PAGE = 10
 
+# A `cargo test` failure prints no file:line:col: line at all — the test's name
+# is the diagnostic: "test session::tests::wheel_zoom ... FAILED".
+test_failed = re.compile(r"^test (?P<name>\S+) \.\.\. FAILED")
+test_ok = re.compile(r"^test \S+ \.\.\. ok")
+
 short = re.compile(r"^(?P<file>[^:\s][^:]*?):(?P<line>\d+):(?P<col>\d+):\s+(?:error|warning)(?:\[\w+\])?:\s*(?P<msg>.*)$")
 plain = re.compile(r"^\s*(?:error|warning)(?:\[\w+\])?:\s*(?P<msg>\S.*)$")
 
@@ -72,7 +77,8 @@ for i, line in enumerate(lines):
 panic_block = []
 if first_panic < len(lines):
     panic_block = [("error", None, None, line[:900])
-                   for line in lines[first_panic:] if line.strip()][:6]
+                   for line in lines[first_panic:]
+                   if line.strip() and not test_ok.match(line)][:6]
     found = [d for d in found if "panicked at" not in d[3]]
 
 rest = found
