@@ -199,8 +199,18 @@ pub fn build(snapshot: Snapshot, title: String) -> Result<Built, String> {
         // has it: the camera, the GUI and M4's character binding read it there.
         if let Some(players) = dom.get_by_ref(player).map(|i| i.parent()) {
             if let Some(instance) = dom.get_by_ref_mut(players) {
+                // A snapshot usually carries this ref itself (rove's does), so
+                // binding it again must not count a third ref: `refs_bound` is
+                // how many distinct properties point somewhere, and the test's
+                // "LocalPlayer and Player.Character" is two.
+                let bound_already = matches!(
+                    instance.properties.get(&ustr("LocalPlayer")),
+                    Some(Variant::Ref(r)) if *r == player
+                );
                 instance.properties.insert(ustr("LocalPlayer"), Variant::Ref(player));
-                stats.refs_bound += 1;
+                if !bound_already {
+                    stats.refs_bound += 1;
+                }
             }
         }
     }
