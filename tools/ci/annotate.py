@@ -52,10 +52,13 @@ for i, line in enumerate(lines):
 print("annotate: %d diagnostic(s) in %s (page %d)" % (len(found), path, page))
 
 page_items = found[page * PER_PAGE : (page + 1) * PER_PAGE]
-if not page_items and page == 0:
-    print("annotate: no diagnostics found; here is the tail of the log")
-    for line in lines[-80:]:
-        print(line)
+if not page_items:
+    # Nothing that looks like a diagnostic: the failure was not one line of
+    # rustc output (a cargo manifest error, a linker, a runner). Emit the tail
+    # of the log as annotations instead, page by page, so it can be read back.
+    tail = [l for l in lines if l.strip()][-40:]
+    page_items = [("error", None, None, line[:900]) for line in tail[page * PER_PAGE : (page + 1) * PER_PAGE]]
+    print("annotate: no rustc diagnostics; tail page %d of %d line(s)" % (page, len(tail)))
 for level, file, line, msg in page_items:
     msg = msg[:900]
     if file and line:
