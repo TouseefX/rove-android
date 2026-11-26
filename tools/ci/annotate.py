@@ -24,10 +24,16 @@ plain = re.compile(r"^\s*(?:error|warning)(?:\[\w+\])?:\s*(?P<msg>\S.*)$")
 
 try:
     with open(path, errors="replace") as f:
-        lines = f.read().splitlines()
+        text = f.read()
 except OSError as e:
     print("annotate: cannot read %s: %s" % (path, e))
     sys.exit(0)
+
+# cargo runs with `CARGO_TERM_COLOR: always` in this workflow, so every
+# diagnostic is wrapped in SGR escapes: "\x1b[1mcrates/x.rs:1:2: \x1b[0m...".
+# Parsing has to start from the plain text or nothing matches at all.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+lines = [ANSI.sub("", line) for line in text.splitlines()]
 
 
 def escape(text):
