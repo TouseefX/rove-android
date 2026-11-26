@@ -1,9 +1,12 @@
-# Build outputs (rustudio's tree).
 target/
 shots/
 __pycache__/
+
+# Generated probes and editor lock files
+tools/parity_probe/*/runs/
 *.rbxlx.lock
-crates/rustudio-android/libs/**/*.so
+tools/fidelity/truss/build.log
+tools/fidelity/truss/tests.log
 
 # Wine prefixes and Studio data folders checks leave behind: their links lead
 # out of the tree (dosdevices/z: is /), and cargo walks every file git doesn't
@@ -12,12 +15,9 @@ crates/rustudio-android/libs/**/*.so
 checks/**/dosdevices/
 checks/**/waxley-data/
 
-# Generated probe output.
-tools/parity_probe/*/runs/
-tools/fidelity/truss/build.log
-tools/fidelity/truss/tests.log
-docs/fidelity/
+# Prebuilt Android libraries fetched by tools/android/fetch-turnip.sh
+crates/rustudio-android/libs/**/*.so
 
-# rove: the vendor/ directories are checked in on purpose (see
-# rove/THIRD_PARTY.md), including inner build/ directories, so nothing here
-# may be excluded by a bare "build/" pattern.
+# rove/ vendors crates with inner build/ directories (rove/vendor/mlua-sys
+# style layouts): a bare "build/" pattern would drop them, so nothing here
+# may ignore that name.

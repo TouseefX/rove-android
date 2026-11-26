@@ -395,8 +395,9 @@ Two further consequences worth stating now, because they shape M3:
   repo already has a newer equivalent: `api-dump.json` (955 classes, `Version
   1`, members with `Name/MemberType/Security/Serialization/ThreadSafety/
   Category/ValueType{Category,Name}/Capabilities/SimulationAccess`). The ported
-  loader must read **our** `api-dump.json`; rove's copy is preserved at
-  `rove/reference/class-parents-745.json` for comparison only.
+  loader must read **our** `api-dump.json`; rove's table is kept at
+  `rove/runtime/class-parents-745.json` (the `include_str!` its decoders use)
+  for comparison only.
 
 ## 9. Value boundary: rove JSON → `rbx_types::Variant`
 
