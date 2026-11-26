@@ -663,9 +663,12 @@ fn audio_duration(bytes: &[u8]) -> Option<f64> {
     // then exposed duration. Keep that behavior for local workspace assets.
     #[cfg(target_os = "macos")]
     {
-        return audio_duration_audio_toolbox(bytes);
+        // AudioToolbox is unavailable in some sandboxed processes; fall back
+        // to header/frame parsing when it cannot open the stream.
+        if let Some(duration) = audio_duration_audio_toolbox(bytes) {
+            return Some(duration);
+        }
     }
-    #[cfg(not(target_os = "macos"))]
     {
         if &bytes[..4] == b"RIFF" && bytes.get(8..12) == Some(b"WAVE") {
             let mut at = 12usize;

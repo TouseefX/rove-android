@@ -119,13 +119,14 @@ impl IssuedAllocation {
             SocketAddr::V4(address) => *address.ip(),
             SocketAddr::V6(_) => return Err(TransportError::InvalidEndpoint),
         };
+        // Servers without udmux fronting publish public host addresses, so a
+        // private backend is no longer required; only unusable ones reject.
         if !self.endpoint.is_ipv4()
             || self.endpoint.port() == 0
-            || (endpoint_ipv4.is_private() && !endpoint_ipv4.is_loopback())
             || endpoint_ipv4.is_unspecified()
             || endpoint_ipv4.is_multicast()
             || self.backend.is_unspecified()
-            || !self.backend.is_private()
+            || self.backend.is_multicast()
             || self.capabilities != 0 && self.capabilities != 0x10_0000
         {
             return if self.capabilities != 0 && self.capabilities != 0x10_0000 {

@@ -2286,6 +2286,25 @@ pub(crate) fn received_creation_complete(ctx: &WorldRef, id: &str) -> bool {
         .is_some_and(|node| node.received_creation_complete)
 }
 
+/// Find a Workspace child Model whose name matches `player_name`.
+fn character_named_for(world: &World, player_name: &str) -> Option<String> {
+    let mut found = None;
+    for node in world.nodes.values() {
+        if found.is_none()
+            && node.class_name == "Model"
+            && node.name == player_name
+            && node
+                .parent
+                .as_deref()
+                .and_then(|parent| world.nodes.class_name(parent))
+                == Some("Workspace")
+        {
+            found = Some(node.id.to_string());
+        }
+    }
+    found
+}
+
 pub(crate) fn get_property_from_world(world: &World, id: &str, key: &str) -> mlua::Result<Json> {
     if key == "BrickColor"
         && world.nodes.class_name(id).is_some_and(|class| {
@@ -2315,6 +2334,18 @@ pub(crate) fn get_property_from_world(world: &World, id: &str, key: &str) -> mlu
             .any(|c| c == "Attachment")
     {
         return super::movement::attachment_frame(node);
+    }
+    // Streaming servers often create the character model before setting the
+    // Player.Character reference. Resolve it by name so scripts and the
+    // prediction pipeline see the character as soon as it exists.
+    if key == "Character"
+        && node.class_name == "Player"
+        && node.properties.get("Character").is_none()
+        && node.local_overrides.get("Character").is_none()
+    {
+        if let Some(character) = character_named_for(world, &node.name) {
+            return Ok(json!({"$ref": character}));
+        }
     }
     if let Some(value) = node.local_overrides.get(key) {
         return Ok(value.clone());

@@ -14,7 +14,7 @@ mod deadline_interrupt;
 
 pub type SchedulerRef = Rc<RefCell<Scheduler>>;
 
-const MAX_PENDING: usize = 2048;
+const MAX_PENDING: usize = 16_384;
 const MAX_WAIT_SECONDS: f64 = 86_400.0;
 const NONYIELDING_LIMIT: Duration = Duration::from_secs(2);
 

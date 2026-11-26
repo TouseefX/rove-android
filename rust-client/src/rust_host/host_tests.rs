@@ -501,7 +501,7 @@ fn queue_snapshot_reports_real_ready_sleeping_waiting_and_limit_counts() {
     assert_eq!(snapshot.sleeping, 1);
     assert_eq!(snapshot.waiting, 1);
     assert_eq!(snapshot.running, 0);
-    assert_eq!(snapshot.queue_limit, 2048);
+    assert_eq!(snapshot.queue_limit, 16_384);
     assert!(!snapshot.ready_owner_attribution_available);
 }
 

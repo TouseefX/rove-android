@@ -683,16 +683,34 @@ pub fn request_allocation(
     let backend = join
         .get("MachineAddress")
         .and_then(Value::as_str)
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .filter(|ip| ip.is_private());
-    let token = join
-        .get("NetStackTokenValue")
-        .and_then(Value::as_str)
-        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        .and_then(|v| v.try_into().ok());
-    let (pins, port) = parse_net_stack(join);
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+    // Current allocations omit the routing token entirely; the header falls
+    // back to zeros when it is missing.
+    // Current allocations omit the routing token entirely; only an absent
+    // field falls back to zeros, an explicit malformed value still fails.
+    let token = match join.get("NetStackTokenValue").and_then(Value::as_str) {
+        None | Some("") => Some([0u8; 16]),
+        Some(text) => base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .ok()
+            .and_then(|v| v.try_into().ok()),
+    };
+    let (pins, netstack_port) = parse_net_stack(join);
+    let direct_port = join
+        .get("NetStackPort")
+        .and_then(value_u64)
+        .and_then(|p| u16::try_from(p).ok())
+        .or_else(|| {
+            join.get("ServerPort")
+                .and_then(value_u64)
+                .and_then(|p| u16::try_from(p).ok())
+        });
     let endpoint = endpoint_value
-        .and_then(|ip| port.and_then(|port| SocketAddr::new(IpAddr::V4(ip), port).into()));
+        .and_then(|ip| {
+            netstack_port
+                .or(direct_port)
+                .map(|port| SocketAddr::new(IpAddr::V4(ip), port))
+        });
     let tickets = SessionTicketMetadata {
         client_ticket: secret_field(join, "ClientTicket"),
         join_ticket: data
@@ -700,7 +718,7 @@ pub fn request_allocation(
             .and_then(Value::as_str)
             .map(|v| Secret(v.to_owned())),
     };
-    Ok(AllocationResult::Ready(IssuedJoinAllocation {
+    let issued = IssuedJoinAllocation {
         place_id: target.place_id,
         user_id,
         user_name,
@@ -725,7 +743,8 @@ pub fn request_allocation(
         tickets,
         game_join_fields: crate::login::retain_issued_game_fields(join),
         game_join_ticket: data.and_then(|d| d.get("joinTicket")).cloned(),
-    }))
+    };
+    Ok(AllocationResult::Ready(issued))
 }
 
 fn parse_private_routing_id(
@@ -869,19 +888,24 @@ pub(crate) fn test_issued_allocation() -> IssuedJoinAllocation {
     }
 }
 fn parse_endpoint(join: &serde_json::Map<String, Value>) -> Option<Ipv4Addr> {
-    let endpoints = join.get("UdmuxEndpoints")?.as_array()?;
-    let first = endpoints.first()?.as_object()?;
-    let addr = first
-        .get("Address")
-        .or_else(|| first.get("address"))?
-        .as_str()?
-        .parse::<Ipv4Addr>()
-        .ok()?;
-    if is_global_ipv4(addr) {
-        Some(addr)
-    } else {
-        None
+    if let Some(endpoints) = join.get("UdmuxEndpoints").and_then(Value::as_array) {
+        if let Some(addr) = endpoints
+            .first()
+            .and_then(Value::as_object)
+            .and_then(|first| first.get("Address").or_else(|| first.get("address")))
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<Ipv4Addr>().ok())
+            .filter(|addr| is_global_ipv4(*addr))
+        {
+            return Some(addr);
+        }
     }
+    // Servers without udmux fronting expose the game host directly; the join
+    // is reachable at that address on NetStackPort/ServerPort.
+    join.get("MachineAddress")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<Ipv4Addr>().ok())
+        .filter(|addr| is_global_ipv4(*addr))
 }
 fn parse_net_stack(join: &serde_json::Map<String, Value>) -> (Vec<[u8; 32]>, Option<u16>) {
     let Some(encoded) = join.get("NetStackConfig").and_then(Value::as_str) else {
