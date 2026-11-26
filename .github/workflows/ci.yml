@@ -107,13 +107,20 @@ jobs:
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Re-emit the diagnostics
         if: always()
+        shell: bash
         run: |
-          for log in /tmp/check.log /tmp/test.log; do
-            [ -f "$log" ] || continue
-            echo "=== $log"
-            for page in 0 1 2 3 4 5 6 7; do
-              python3 tools/ci/annotate.py "$log" "$page" || true
-            done
+          for log in "$RUNNER_TEMP/check.log" "$RUNNER_TEMP/test.log"; do
+            if [ ! -f "$log" ]; then
+              echo "::notice::$log: not written"
+              continue
+            fi
+            lines=$(wc -l < "$log")
+            echo "::notice::$log: $lines line(s)"
+            if [ "$lines" -le 200 ]; then
+              grep -v '^$' "$log" | tail -10 | sed 's/^/::error::log: /'
+            else
+              python3 tools/ci/annotate.py "$log" 0 || true
+            fi
           done
 
   # rustudio.app for Apple Silicon and Intel in one (ad-hoc signed, not
