@@ -113,13 +113,64 @@ software rasteriser's, not the player's. And the fixture is seven nodes: the
 scale numbers (1818 ≈ 5.6k nodes, Phantom Forces ≈ 89k) are M3's to measure,
 not M1's to claim.
 
-## What M2 adds
+## What M2 built (this milestone)
 
-The same converter and builder, fed by rove's live session instead of a file:
-`allocation`/`live_session` ported for the current gamejoin shape (no udmux,
-`UdmuxEndpoints` → `NetStackConfig` cert pins, zero-token path), the effect
-enum consumed on the network thread, replication ops converted on the network
-thread and drained on the gameplay thread under the 2 ms budget, streaming
-interest forwarded to rove (`replication_out::replication_focus`), and the
-`LocalPlayer` created by `create_player` replaced by the server's player — one
-player, one world, one frame loop.
+The live half, in `crates/rustudio-live/src/live.rs`: rove's own action
+vocabulary applied to a world that is already being drawn.
+
+| rove action | what the world does |
+|---|---|
+| `create` | one instance, under its parent if the world has it — else at the root, waiting |
+| `set` | properties written through the same `ValueConverter` the snapshot path uses; `fields.Parent` is an edge; `$ref` binds when its target has arrived, else is counted |
+| `remove` | the subtree is destroyed and every one of its ids forgotten, so no `$ref` can bind a dead ref |
+| `event` | counted here, dispatched by the engine |
+
+The rules M1 set are the rules here: a value is converted once at the boundary,
+a child whose parent has not arrived waits instead of being re-parented twice, a
+dangling `$ref` is dropped and counted, and classes come from `api-dump.json`.
+Seven tests pin the cases that only a live stream produces: a child journaled
+before its parent, a parent edge as a later `set`, a `$ref` before its target, a
+repeat `create` (rove re-sends on rejoin), and a `remove` that takes a subtree
+and its ids.
+
+**What is not wired, and why.** The packets are still rove's to decode, and that
+is the one thing M2 has not joined: `rove-client-core` as a workspace member
+needs its `transport` feature, whose `wtransport` dependency brings six crates
+(`pem`, `x509-parser`, `octets`, `httlib-huffman`, `wtransport`,
+`wtransport-proto`) that are not in `Cargo.lock`. The lock cannot be generated
+here (this environment has no cargo), and a hand-written lock entry for a crate
+I cannot resolve is not something to guess at. The work is otherwise staged:
+the recording format, its generator (`tools/ci/make_live_recording.py`, whose
+schema packet round-trips through a real zstd encoder and is written in the byte
+layout rove's own schema tests use), and the replay seam are described here and
+in `crates/rustudio-live/tests/fixtures/live_session.json`. Finishing it needs
+one environment with cargo (`cargo add rove-client-core --features transport`
+from the workspace root, then `cargo update`), after which `SessionCore::ingest`
+→ journal → `Live::apply` is a few dozen lines.
+
+## What M3 adds
+
+The same converter and apply path, fed by a real connection instead of a
+recording:
+
+- **the join**: rove's `allocation.rs` ported for the current gamejoin shape —
+  `/v1/join-game` and `/v1/join-game-instance`, `UdmuxEndpoints[0].Address` or
+  `MachineAddress`, the port from `NetStackConfig`/`NetStackPort`, certificate
+  pins (16 at most), and the zero-token path when `NetStackTokenValue` is absent.
+  rustudio has the editor's Team Create join (`crates/rustudio-net`); this is the
+  player's, which is the piece it does not have.
+- **the transport**: WebTransport to the allocated endpoint, through rove's
+  `transport` feature. `is_global_ipv4` refuses loopback, so an offline fake
+  server needs an explicit test allowance rather than a bend in that check.
+- **the frame loop**: `SessionCore::ingest` on the network thread, the journal
+  drained on the gameplay thread under the same 2 ms budget `RepMap` uses, and
+  the actions applied by `live::Live` — a burst is a hitch, not a freeze.
+- **the player**: the server's player replaces the one a world builds itself —
+  one `LocalPlayer`, one world, one frame loop.
+
+## Scale, unmeasured
+
+The fixture is seven nodes and the recording is a schema packet. The numbers M3
+has to stand behind — 1818 ≈ 5.6k nodes, BedWars ≈ 3.4k, Phantom Forces ≈ 89k —
+need a capture of each and a frame budget measured against them. Nothing here
+claims them.
