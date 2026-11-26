@@ -109,4 +109,38 @@ print()
 if failed:
     print("%d check(s) failed" % len(failed))
     sys.exit(1)
+
+# The numbers, again as annotations: this job's own log cannot be fetched back
+# in every environment, but check-run annotations can, and these are what M1 is
+# accepted on. GitHub allows ten notice annotations per step.
+report_line = report_lines[0] if report_lines else "(no bridge report line)"
+numbers = [
+    "bridge: " + report_line.strip(),
+    "nodes %s / instances %s / refs_bound %s / dangling %s / refused %s / roots %s"
+    % (
+        live.get("nodes"),
+        live.get("instances"),
+        live.get("refs_bound"),
+        live.get("dangling_refs"),
+        live.get("refused_values"),
+        (live.get("root_classes") or [])[:4],
+    ),
+    "frames %s, mean %.2f ms; png %s"
+    % (
+        count,
+        mean if isinstance(mean, (int, float)) else 0,
+        ", ".join("%s (%d bytes)" % (os.path.basename(p), os.path.getsize(p)) for p in pngs),
+    ),
+]
+bench_path = os.path.join(out, "bench.json")
+if os.path.exists(bench_path):
+    with open(bench_path) as f:
+        bench = json.load(f)
+    fm = bench.get("frame_ms") or {}
+    numbers.append(
+        "bench: frames %s, frame_ms median %s p90 %s p99 %s max %s"
+        % (bench.get("frames"), fm.get("median"), fm.get("p90"), fm.get("p99"), fm.get("max"))
+    )
+for line in numbers:
+    print("::notice::" + line.replace("%", "%25").replace("\n", "%0A"))
 print("all checks passed")
