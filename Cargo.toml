@@ -1,7 +1,7 @@
 [workspace]
 # The root package is a member by itself (Cargo adds it); listing it as "."
 # as well makes xbuild refuse the workspace ("Did not expect a [workspace]").
-members = ["crates/rustudio-profiler-ui", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net", "crates/rustudio-live", "crates/rustudio-android"]
+members = ["crates/rustudio-profiler-ui", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net", "crates/rustudio-live", "crates/rustudio-android", "rove/client-core"]
 resolver = "2"
 
 [workspace.package]
