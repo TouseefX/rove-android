@@ -41,11 +41,11 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "Build profile (debug, release, or both)"
+        description: "Build profile. Release unless asked otherwise: a debug APK is 314 MB (322 MB x86_64) and about 1 GB installed, a release APK ~40 MB"
         required: false
-        default: "both"
+        default: "release"
         type: choice
-        options: [debug, release, both]
+        options: [release, debug, both]
       turnip:
         description: "Ship the Turnip (Mesa) Vulkan driver + libadrenotools in the arm64 APK (docs/ANDROID.md, Turnip driver)"
         required: false
