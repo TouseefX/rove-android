@@ -50,12 +50,28 @@ adb install -r target/x/debug/android/rustudio-android.apk
 adb logcat -s rustudio RustStdoutStderr
 ```
 
-**Install the release APK to judge speed.** The debug one builds the
-editor at opt-level 1 with debug assertions and overflow checks in every
-crate (Cargo's dev profile): several times slower in the physics, the Luau
-runtime and the renderer's CPU side, and a phone shows it first. The
-start line in logcat says which one is running (`rustudio … starting
-(Android API 33; debug build, aarch64 android)` / `release build, …`).
+**Install the release APK to judge speed, and to test at all unless you
+are debugging natively.** Two reasons:
+
+- *Speed.* The debug one builds the editor at opt-level 1 with debug
+  assertions and overflow checks in every crate (Cargo's dev profile):
+  several times slower in the physics, the Luau runtime and the renderer's
+  CPU side, and a phone shows it first. The start line in logcat says which
+  one is running (`rustudio … starting (Android API 33; debug build, aarch64
+  android)` / `release build, …`).
+- *Size.* Measured on the aarch64 build of this tree: a debug APK is
+  **314 MB** (322 MB for x86_64) against a release APK's **~40 MB**, because
+  the dev profile carries full DWARF for every crate (Luau's C++ included).
+  Installed, the debug one takes about **1 GB** of the phone, which on a
+  phone with little free storage also means the *next* install fails until
+  it is removed. `CARGO_PROFILE_DEV_DEBUG=1` (line tables only) or `=0`
+  brings the APK back to an ordinary size while keeping backtraces
+  (`adb logcat -s rustudio RustStdoutStderr` still carries the panic
+  message, which is what a debug build is for).
+
+For that reason CI's `android.yml` builds **release only** unless a manual
+run asks for `profile: debug` (or `both`); the APK's size and its ten
+biggest entries are printed in the run's log.
 
 `x build` without `--pem` signs with xbuild's debug key (installs with
 adb). A release key goes in as `--pem key.pem` or the `X_PEM` environment

@@ -112,10 +112,13 @@ jobs:
       fail-fast: false
       matrix:
         arch: [arm64, x64]
-        # push / pull_request build both profiles; a manual run can narrow
-        # it to one (github.event.inputs is empty outside workflow_dispatch);
-        # a v* tag builds the release only.
-        profile: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["release"]' || github.event.inputs.profile == 'debug' && '["debug"]' || github.event.inputs.profile == 'release' && '["release"]' || '["debug", "release"]') }}
+        # Release only, for every push, pull request, tag and manual run
+        # unless a manual run asks for debug explicitly
+        # (github.event.inputs is empty outside workflow_dispatch). Debug
+        # is not a default: its APK is ~314 MB against ~40 MB, and the
+        # phone holds ~1 GB of it installed, which has to be removed
+        # again before the next install (docs/ANDROID.md).
+        profile: ${{ fromJSON(github.event.inputs.profile == 'debug' && '["debug"]' || github.event.inputs.profile == 'both' && '["debug", "release"]' || '["release"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -217,6 +220,11 @@ jobs:
           args=(build -p rustudio-android --platform android --arch "${{ matrix.arch }}" --format apk)
           if [ "${{ matrix.profile }}" = "release" ]; then
             args+=(--release)
+          else
+            # A debug build's full DWARF is most of its size (314 MB APK,
+            # ~1 GB installed): line tables only keep backtraces useful and
+            # the APK an ordinary size.
+            export CARGO_PROFILE_DEV_DEBUG=1
           fi
           x "${args[@]}"
           apk="target/x/${{ matrix.profile }}/android/rustudio-android.apk"
@@ -224,6 +232,13 @@ jobs:
           mkdir -p dist
           cp "$apk" "dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk"
           ls -l dist
+          size=$(stat -c %s "dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk")
+          echo "rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk: $((size / 1048576)) MB ($size bytes)"
+          echo "::notice::rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk is $((size / 1048576)) MB"
+          # What fills it, biggest first (lib/ is the app plus the Mesa
+          # drivers, assets/ carries api-dump.json): a number in the log,
+          # since an artifact is not readable from here.
+          unzip -l "$apk" | awk 'NR>3 && $1 ~ /^[0-9]+$/ {printf "%10d  %s\n", $1, $4}' | sort -rn | head -12
 
       - name: APK contents
         run: |
