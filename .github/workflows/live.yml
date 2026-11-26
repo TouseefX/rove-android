@@ -81,7 +81,7 @@ jobs:
           grep -E "^(test result|running|test )" /tmp/live-tests.log | head -40
           if [ "$status" -ne 0 ]; then
             echo "--- diagnostics as annotations:"
-            for page in 0 1 2; do
+            for page in 0 1 2 3 4; do
               python3 tools/ci/annotate.py /tmp/live-tests.log "$page" || true
             done
             exit "$status"
@@ -95,7 +95,7 @@ jobs:
           set -e
           if [ "$status" -ne 0 ]; then
             echo "--- diagnostics as annotations:"
-            for page in 0 1 2; do
+            for page in 0 1 2 3 4; do
               python3 tools/ci/annotate.py /tmp/build.log "$page" || true
             done
             exit "$status"
