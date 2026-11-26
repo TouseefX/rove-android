@@ -26,7 +26,7 @@
 //! counts as `default-only`.
 
 use rbx_dom_weak::types::{
-    BrickColor, Color3, Color3uint8, CFrame, Enum, Faces, Matrix3, Rect, UDim, UDim2, Variant,
+    Color3, Color3uint8, CFrame, Enum, Faces, Matrix3, Rect, UDim, UDim2, Variant,
     Vector2, Vector3,
 };
 use serde_json::{json, Value as J};
@@ -292,17 +292,11 @@ impl ValueConverter {
                 let a = f32s(4)?;
                 Variant::Rect(Rect::new(Vector2::new(a[0], a[1]), Vector2::new(a[2], a[3])))
             }
-            "$brickcolor" => {
-                let n = match inner {
-                    J::Number(_) => inner.as_f64().map(|n| n as u16),
-                    J::String(name) => BrickColor::from_name(name).map(|b| b.to_number()),
-                    _ => None,
-                }
-                .ok_or_else(|| format!("$brickcolor wants a number or a name {}", ctx()))?;
-                let color = BrickColor::from_number(n)
-                    .ok_or_else(|| format!("$brickcolor {n} is not a BrickColor {}", ctx()))?;
-                Variant::BrickColor(color)
-            }
+            // rove's replication writes `{"$brickcolor": number}`; a place
+            // file and a snapshot's name form are read by the same reader
+            // rather than a second one here (`BrickColor` has no `to_number`,
+            // and the number form is the one that arrives on the wire).
+            "$brickcolor" => via_place_value(class, property, inner)?,
             // Payload shapes a place file uses too: one reader, not two.
             "$number_range" | "$number_sequence" | "$color_sequence" | "$font" | "$axes"
             | "$physical_properties" => via_place_value(class, property, inner)?,
@@ -317,7 +311,16 @@ impl ValueConverter {
                     ("Front", Faces::FRONT),
                 ];
                 match inner {
-                    // rove's object form: {"Top": true, …}
+                    // rove's wire form: {"$faces": 63} — one byte, the bit
+                    // per face (replication.rs writes `r.u8()`).
+                    J::Number(_) => {
+                        bits = inner
+                            .as_u64()
+                            .filter(|b| *b <= u64::from(u8::MAX))
+                            .ok_or_else(|| format!("$faces wants one byte, got {inner} {}", ctx()))?
+                            as u8;
+                    }
+                    // A named form: {"Top": true, …}, as a place file spells it.
                     J::Object(o) => {
                         for (name, on) in o {
                             let bit = pairs
@@ -332,9 +335,11 @@ impl ValueConverter {
                     }
                     // A place file's list form is read by project_values.
                     J::Array(_) => return via_place_value(class, property, inner),
-                    _ => return Err(format!("$faces wants an object or a list of faces {}", ctx())),
+                    _ => return Err(format!("$faces wants a byte, an object or a list of faces {}", ctx())),
                 }
-                Variant::Faces(Faces::from_bits(bits).ok_or_else(|| format!("$faces has an invalid bit set {}", ctx()))?)
+                // from_bits is a Result, not an Option: a bit outside the six
+                // faces is a wrong world, said by name.
+                Variant::Faces(Faces::from_bits(bits).map_err(|_| format!("$faces has an invalid bit set {}: {bits}", ctx()))?)
             }
             "$enum" => match inner {
                 J::Number(_) => Variant::Enum(Enum::from_u32(

@@ -32,7 +32,9 @@ use serde_json::Value as J;
 use crate::snapshot::{self, Node, Snapshot, ValueConverter};
 
 /// A client world: the DataModel and the bridge's own bookkeeping.
-#[derive(Debug)]
+///
+/// Not `Debug`: `Document` is not `Debug`, and a world is inspected through
+/// `report`/`stats_json`, which are the strings the harness prints.
 pub struct World {
     pub doc: Document,
     pub dom: WeakDom,
@@ -75,7 +77,6 @@ pub struct Stats {
 }
 
 /// A built world and the one-paragraph report the harness prints.
-#[derive(Debug)]
 pub struct Built {
     pub world: World,
     pub report: String,

@@ -8,7 +8,7 @@
 //! small snapshots in place for the cases the seven-node fixture cannot show:
 //! ordering, dangling refs, refusals, a 90° rotation.
 
-use rbx_dom_weak::types::{CFrame, Matrix3, Variant, Vector3};
+use rbx_dom_weak::types::{Faces, Matrix3, Variant, Vector3};
 use rbx_dom_weak::ustr;
 use serde_json::{json, Value as J};
 
@@ -104,6 +104,71 @@ fn a_rotation_is_read_row_major_as_rove_writes_it() {
     assert_eq!(cf.orientation.z_axis, Vector3::new(1.0, 0.0, 0.0));
     // And the same CFrame read back through rustudio's own writer.
     assert_eq!(rustudio_core::project_values::to_json("Part", "CFrame", &Variant::CFrame(cf)).is_some(), true);
+}
+
+#[test]
+fn a_bitmask_faces_value_is_six_bits_in_one_byte() {
+    // rove's replication writes {"$faces": bits} as one byte
+    // (replication.rs), not a list of names: 63 is all six faces.
+    let mut conv = snapshot::ValueConverter::default();
+    let Variant::Faces(all) = conv.value("Faces", "Part", &json!({"$faces": 63})).unwrap() else {
+        panic!("not Faces")
+    };
+    assert!(all.contains(Faces::FRONT) && all.contains(Faces::BOTTOM) && all.contains(Faces::RIGHT));
+    let Variant::Faces(some) = conv.value("Faces", "Part", &json!({"$faces": 2})).unwrap() else {
+        panic!("not Faces")
+    };
+    assert!(some == Faces::TOP, "a single bit must be a single face");
+    // A bit outside the six faces is a wrong world, not a silent clipping.
+    assert!(conv.value("Faces", "Part", &json!({"$faces": 128})).is_err());
+    // The named form a place file uses still reads.
+    let Variant::Faces(named) = conv
+        .value("Faces", "Part", &json!({"$faces": ["Top", "Front"]}))
+        .unwrap()
+    else {
+        panic!("not Faces")
+    };
+    assert!(named.contains(Faces::TOP) && named.contains(Faces::FRONT) && !named.contains(Faces::LEFT));
+}
+
+#[test]
+fn a_brickcolor_is_its_number_or_its_name() {
+    // rove sends the number ({"$brickcolor": 194}); a hand-written snapshot may
+    // spell the name. Both are the same reader, so both must work.
+    let mut conv = snapshot::ValueConverter::default();
+    let by_number = conv.value("BrickColor", "Part", &json!({"$brickcolor": 194})).unwrap();
+    let by_name = conv
+        .value("BrickColor", "Part", &json!({"$brickcolor": "Medium stone grey"}))
+        .unwrap();
+    assert!(matches!(by_number, Variant::BrickColor(_)), "not a BrickColor");
+    assert_eq!(by_number, by_name);
+    // A number that is not a BrickColor is refused, not defaulted.
+    assert!(conv.value("BrickColor", "Part", &json!({"$brickcolor": 65535})).is_err());
+}
+
+#[test]
+fn every_remaining_tag_converts_to_the_type_its_property_has() {
+    let mut conv = snapshot::ValueConverter::default();
+    let v = |property: &str, value: serde_json::Value| {
+        conv.value(property, "Part", &value).unwrap_or_else(|e| panic!("{property}: {e}"))
+    };
+    assert!(matches!(v("Size", json!({"$udim": [3, 0]})), Variant::UDim(_)));
+    assert!(matches!(v("Size", json!({"$udim2": [[1, 0], [2, 0]]})), Variant::UDim2(_)));
+    assert!(matches!(v("Color", json!({"$color3": [0.5, 0.25, 0.0]})), Variant::Color3(_)));
+    assert!(matches!(v("Color", json!({"$color3uint8": [255, 128, 0]})), Variant::Color3uint8(_)));
+    assert!(matches!(v("Size", json!({"$rect": [0, 0, 4, 2]})), Variant::Rect(_)));
+    assert_eq!(v("Value", json!({"$number": 2.5})), Variant::Float64(2.5));
+    assert_eq!(v("Name", json!({"$string": "Part"})), Variant::String("Part".into()));
+    assert_eq!(v("Value", json!({"$shared_string": "shared"})), Variant::String("shared".into()));
+    assert_eq!(v("TextureID", json!({"$content": "rbxassetid://1"})), Variant::String("rbxassetid://1".into()));
+    assert!(matches!(v("Value", json!({"$enum": 3})), Variant::Enum(_)));
+    // $bytes_hex: the odd-length and non-hex forms are refused.
+    let Variant::BinaryString(blob) = v("Value", json!({"$bytes_hex": "00ff10"})) else {
+        panic!("not a BinaryString")
+    };
+    assert_eq!(AsRef::<[u8]>::as_ref(&blob), &[0x00, 0xff, 0x10]);
+    assert!(conv.value("Value", "Part", &json!({"$bytes_hex": "abc"})).is_err());
+    assert!(conv.value("Value", "Part", &json!({"$bytes_hex": "zz"})).is_err());
 }
 
 #[test]
@@ -349,7 +414,10 @@ fn a_world_with_no_local_player_binds_none() {
     let world = build_text(&text);
     assert_eq!(world.local_player, None);
     assert_eq!(world.stats.refs_bound, 0);
-    assert!(!world.report().contains("LocalPlayer:"));
+    // The report is built by `build()`; with no local player it must not claim
+    // one (a report nobody reads is how a bound player silently goes missing).
+    let built = world::build(snapshot::parse(&text).expect("parses"), "No Player".into()).expect("builds");
+    assert!(!built.report.contains("LocalPlayer:"), "report named a player that is not there");
 }
 
 #[test]

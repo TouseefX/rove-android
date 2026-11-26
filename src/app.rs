@@ -1027,11 +1027,15 @@ impl Editor {
                 self.info(report);
                 if let Some(rest) = stats.as_object() {
                     // The counts a wrong world hides in (dangling refs, values
-                    // that kept their defaults) are Output lines, not a panic.
+                    // that kept their defaults) are Output lines, not errors: a
+                    // snapshot of a real game may well name a property this
+                    // build does not convert yet, and that must not fail a run
+                    // (--fail-on-error, and the harness's own error count). The
+                    // report above already says which ones.
                     let refused = rest.get("refused_values").and_then(|v| v.as_u64()).unwrap_or(0);
                     let dangling = rest.get("dangling_refs").and_then(|v| v.as_u64()).unwrap_or(0);
                     if refused > 0 || dangling > 0 {
-                        self.error(format!(
+                        self.warn(format!(
                             "{dangling} ref(s) and {refused} value(s) could not be applied; the log says which"
                         ));
                     }
