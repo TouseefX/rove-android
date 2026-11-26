@@ -333,8 +333,24 @@ impl ValueConverter {
                             }
                         }
                     }
-                    // A place file's list form is read by project_values.
-                    J::Array(_) => return via_place_value(class, property, inner),
+                    // A place file's named-list form: ["Top", "Front"]. Read
+                    // here rather than by the class's descriptor, because the
+                    // property is spelled differently across classes (a Part
+                    // has no `Faces`; the selected faces live on `Handles`).
+                    J::Array(names) => {
+                        for name in names {
+                            let name = name.as_str().ok_or_else(|| {
+                                format!("$faces list wants face names {}", ctx())
+                            })?;
+                            let (_, bit) = pairs
+                                .iter()
+                                .find(|(n, _)| *n == name)
+                                .ok_or_else(|| {
+                                    format!("$faces names {name:?}, which is not a face {}", ctx())
+                                })?;
+                            bits |= bit.bits();
+                        }
+                    }
                     _ => return Err(format!("$faces wants a byte, an object or a list of faces {}", ctx())),
                 }
                 // from_bits answers None for a bit outside the six faces
