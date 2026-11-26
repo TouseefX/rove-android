@@ -130,6 +130,9 @@ pub struct Harness {
     pub plugin_dirs: Vec<PathBuf>,
     pub no_plugins: bool,
     pub plugins_started: bool,
+    /// `--live-snapshot FILE` run: the bridge's own report, for `--result`
+    /// (crates/rustudio-live). None on every other run.
+    pub live_world: Option<(String, serde_json::Value)>,
 }
 
 use crate::game::Game;
@@ -191,6 +194,7 @@ impl Harness {
             plugin_dirs: Vec::new(),
             no_plugins: false,
             plugins_started: false,
+            live_world: None,
         }
     }
 }
@@ -989,6 +993,12 @@ impl Editor {
         if crate::project::name_of(&path).ends_with(".project.json") {
             return self.open_project(&path);
         }
+        // A world snapshot from a live session (rove's WorldStore JSON): the
+        // bridge builds the client DataModel from it, so a world captured on
+        // a phone renders here without a network (crates/rustudio-live).
+        if path.file_name().is_some_and(|n| n == "world_snapshot.json") {
+            return self.open_world_snapshot(path);
+        }
         match Document::open(&path) {
             Ok(d) => {
                 let n = d.dom.descendants().count();
@@ -998,6 +1008,37 @@ impl Editor {
                 self.info(format!("Opened {} ({n} instances)", path.display()));
             }
             Err(e) => self.error(format!("Could not open {}: {e}", path.display())),
+        }
+    }
+
+    /// Opens a live session's world snapshot as the document to draw and run:
+    /// `rustudio_live::world::load` makes the client DataModel (ids → `Ref`s,
+    /// `$`-tagged values → `Variant`s, `LocalPlayer` and `Character` bound),
+    /// and the report of what it built goes into the Output.
+    pub fn open_world_snapshot(&mut self, path: PathBuf) {
+        match rustudio_live::world::load(&path, "Live world".to_string()) {
+            Ok(built) => {
+                let report = built.report.clone();
+                let stats = built.world.stats_json();
+                let instances = built.world.stats.instances;
+                self.harness.live_world = Some((report.clone(), stats.clone()));
+                self.set_document(built.world.doc);
+                rustudio_core::load_trace::mark("world snapshot built");
+                self.info(report);
+                if let Some(rest) = stats.as_object() {
+                    // The counts a wrong world hides in (dangling refs, values
+                    // that kept their defaults) are Output lines, not a panic.
+                    let refused = rest.get("refused_values").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let dangling = rest.get("dangling_refs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if refused > 0 || dangling > 0 {
+                        self.error(format!(
+                            "{dangling} ref(s) and {refused} value(s) could not be applied; the log says which"
+                        ));
+                    }
+                }
+                self.info(format!("Live world: {} ({instances} instances)", path.display()));
+            }
+            Err(e) => self.error(format!("Could not build the live world from {}: {e}", path.display())),
         }
     }
 
@@ -3486,10 +3527,18 @@ impl Editor {
             return;
         }
         crate::plugin_host::widgets_ui::on_exit();
+        let live = self.harness.live_world.clone();
         let extras = self.harness.run.result.as_ref().map(|_| [
             ("plugins", self.plugins.result_json()),
             ("plugin_toolbars", self.plugin_ui_json()),
             ("toolbox", self.toolbox.result_json()),
+            ("live_world", live.map(|(report, stats)| {
+                let mut stats = stats;
+                if let Some(object) = stats.as_object_mut() {
+                    object.insert("report".into(), serde_json::Value::String(report));
+                }
+                stats
+            }).unwrap_or(serde_json::Value::Null)),
         ]);
         self.harness.run.finish_run(&self.game, ctx, reason, extras.into_iter().flatten());
     }

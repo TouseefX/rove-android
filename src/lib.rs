@@ -126,6 +126,15 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        view at the window's size (no FILE-<t>s.view.png; the
                        .frames.json / .cursor.json beside it as in the editor)
   --play-only          --no-ui --play
+  --live-snapshot FILE a live session's world snapshot (rove's WorldStore JSON,
+                       as a phone captured it): the bridge (crates/rustudio-live)
+                       builds the client DataModel from it — rove ids become
+                       refs, $-tagged values Variants, Players.LocalPlayer and
+                       the player's Character bound — and the run opens that
+                       instead of a place. With --no-ui --screenshot it renders
+                       the world with no network at all; its report (nodes,
+                       instances, refusals) goes to the Output and --result's
+                       live_world. M1 measures this path.
   --overlays           with --no-ui in Edit state: keep the editor's overlays
   --headless           no window, no compositor, no display server (no gamescope
                        or Xvfb needed): frames are drawn offscreen at --window
@@ -1113,6 +1122,15 @@ pub fn run() -> eframe::Result<()> {
                 }
             }
             "--demo" => demo = true,
+            "--live-snapshot" => {
+                // The document is built from the snapshot, not opened as a
+                // place (src/app.rs open_world_snapshot).
+                open = args.next().map(PathBuf::from);
+                if open.is_none() {
+                    eprintln!("--live-snapshot: a file is needed");
+                    std::process::exit(2);
+                }
+            }
             "--play" => start_play = true,
             "--no-ui" => no_ui = true,
             "--play-only" => {
@@ -1215,6 +1233,7 @@ pub fn run() -> eframe::Result<()> {
         plugin_dirs,
         no_plugins,
         plugins_started: false,
+        live_world: None,
     };
     // No vsync when measuring, so frame times show the real cost.
     // (--fixed-dt: as fast as the machine allows)
