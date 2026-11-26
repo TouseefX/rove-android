@@ -1,0 +1,661 @@
+//! rove's live stream applied to a rustudio world.
+//!
+//! The offline half ([`crate::world`]) builds a whole world from a snapshot in
+//! one pass. This is the other case: instances arrive a piece at a time, in
+//! receipt order, and each piece is a small edit to a world that is already
+//! being drawn.
+//!
+//! The seam is rove's own vocabulary, not a copy of it. `rove-client-core`'s
+//! `SessionCore` takes the packets a live session receives (a schema, the
+//! globals, replication) and publishes them as journal records after decoding;
+//! the records carry world actions in the shape
+//!
+//! ```json
+//! {"sequence": 7, "kind": "create", "id": "3:12", "node": {…}}
+//! {"sequence": 8, "kind": "set", "id": "3:12", "fields": {"Size": {"$vector3": …}}}
+//! {"sequence": 9, "kind": "remove", "id": "3:12"}
+//! {"sequence": 10, "kind": "event", "id": "3:12", "event": "ChildAdded", …}
+//! ```
+//!
+//! that rove's `WorldStore` consumes. So the live path never re-decodes the
+//! wire (that would be a second decoder, drifting from rove's), and it never
+//! converts a value twice: [`crate::snapshot::ValueConverter`] is the one
+//! reader of rove's `$`-tagged values, whether they come from a snapshot or
+//! from a packet.
+//!
+//! What this module does only: **Refs**. rove names instances `scope:index`;
+//! the client names them `Ref`, and the mapping has to live somewhere. Here,
+//! in one place, with both directions and the counts that say whether it is
+//! keeping up.
+
+use std::collections::{HashMap, HashSet};
+
+use rbx_dom_weak::types::{Ref, Variant};
+use rbx_dom_weak::{ustr, InstanceBuilder};
+use rustudio_core::doc::Document;
+use serde_json::Value as J;
+
+use crate::snapshot::{self, ValueConverter};
+
+/// What a batch of rove actions did to the world, for the harness to print.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyStats {
+    /// Actions read from rove's journal.
+    pub actions: usize,
+    /// `create` actions that made an instance.
+    pub created: usize,
+    /// `create` actions whose rove id was already in the world (a re-send, not
+    /// a second instance: rove can repeat a create after a reconnect).
+    pub duplicate_creates: usize,
+    /// `set` actions that wrote at least one property.
+    pub sets: usize,
+    /// Properties written by `set` actions.
+    pub properties: usize,
+    /// `set` actions naming an id the world does not have (arrived after the
+    /// instance was removed, or before its create was journaled).
+    pub unknown_ids: usize,
+    /// `remove` actions that destroyed a subtree.
+    pub removed: usize,
+    /// Instances destroyed, the subtree included.
+    pub instances_removed: usize,
+    /// Parent edges adopted (`fields.Parent`, and a create's parent).
+    pub parents: usize,
+    /// Events carried by the journal (the Lua dispatch is the engine's).
+    pub events: usize,
+    /// Values the converter refused, so the property kept its default.
+    pub refused_values: usize,
+    /// Wall time this batch took.
+    pub duration_ms: f64,
+}
+
+impl ApplyStats {
+    pub fn add(&mut self, other: &ApplyStats) {
+        self.actions += other.actions;
+        self.created += other.created;
+        self.duplicate_creates += other.duplicate_creates;
+        self.sets += other.sets;
+        self.properties += other.properties;
+        self.unknown_ids += other.unknown_ids;
+        self.removed += other.removed;
+        self.instances_removed += other.instances_removed;
+        self.parents += other.parents;
+        self.events += other.events;
+        self.refused_values += other.refused_values;
+        self.duration_ms += other.duration_ms;
+    }
+
+    /// The one line the harness prints (and `--result` carries).
+    pub fn line(&self) -> String {
+        format!(
+            "{} actions: {} created ({} repeat), {} sets ({} properties), \
+             {} removed ({} instances), {} parents, {} events; {} unknown ids, \
+             {} values kept their default, in {:.2} ms",
+            self.actions,
+            self.created,
+            self.duplicate_creates,
+            self.sets,
+            self.properties,
+            self.removed,
+            self.instances_removed,
+            self.parents,
+            self.events,
+            self.unknown_ids,
+            self.refused_values,
+            self.duration_ms,
+        )
+    }
+
+    pub fn json(&self) -> J {
+        serde_json::json!({
+            "actions": self.actions,
+            "created": self.created,
+            "duplicate_creates": self.duplicate_creates,
+            "sets": self.sets,
+            "properties": self.properties,
+            "unknown_ids": self.unknown_ids,
+            "removed": self.removed,
+            "instances_removed": self.instances_removed,
+            "parents": self.parents,
+            "events": self.events,
+            "refused_values": self.refused_values,
+            "duration_ms": self.duration_ms,
+        })
+    }
+}
+
+/// The id ⇄ `Ref` mapping a live session adds to a built world, and the one
+/// place actions are applied.
+///
+/// It borrows nothing: the document is passed in on every call, because a live
+/// session's world is re-made by Play/Stop and must not be held here.
+pub struct Live {
+    ids: HashMap<String, Ref>,
+    refs: HashMap<Ref, String>,
+    /// rove ids whose create arrived before their parent's. A create's parent
+    /// may be journaled after the child (replication is ordered by receipt,
+    /// not by tree), so the child is made under the root and moved when the
+    /// parent arrives — the same deferral the snapshot build does.
+    waiting_for_parent: HashMap<String, String>,
+    /// Events too old to dispatch (their instances are gone).
+    dropped_events: usize,
+}
+
+impl Live {
+    pub fn new() -> Live {
+        Live {
+            ids: HashMap::new(),
+            refs: HashMap::new(),
+            waiting_for_parent: HashMap::new(),
+            dropped_events: 0,
+        }
+    }
+
+    /// Start from a world the snapshot build produced, so a joined session's
+    /// first delta applies to the instances the join already brought.
+    pub fn from_world(world: &crate::world::World) -> Live {
+        Live {
+            ids: world.ids.clone(),
+            refs: world.refs.clone(),
+            waiting_for_parent: HashMap::new(),
+            dropped_events: 0,
+        }
+    }
+
+    /// The `Ref` rove's id means in this world, if it has arrived.
+    pub fn referent(&self, id: &str) -> Option<Ref> {
+        self.ids.get(id).copied()
+    }
+
+    /// The rove id a `Ref` means (`$ref`, remotes and physics read this way).
+    pub fn id_of(&self, r: Ref) -> Option<&str> {
+        self.refs.get(&r).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// How many creates are still waiting for the parent they name.
+    pub fn waiting(&self) -> usize {
+        self.waiting_for_parent.len()
+    }
+
+    pub fn dropped_events(&self) -> usize {
+        self.dropped_events
+    }
+
+    /// One batch of journal records' world actions, applied to `doc`.
+    ///
+    /// `actions` is what `SessionRecord::world_delta` derefs to (`actions`), in
+    /// receipt order; the journal's own sequence decides the order, so a caller
+    /// must pass them in the order the records gave them and not re-sort by
+    /// anything else.
+    pub fn apply(&mut self, doc: &mut Document, actions: &[J], conv: &mut ValueConverter) -> ApplyStats {
+        let started = std::time::Instant::now();
+        let mut stats = ApplyStats::default();
+        for action in actions {
+            stats.actions += 1;
+            match action.get("kind").and_then(J::as_str) {
+                Some("create") => self.create(doc, action, conv, &mut stats),
+                Some("set") => self.set(doc, action, conv, &mut stats),
+                Some("remove") => self.remove(doc, action, &mut stats),
+                Some("event") => stats.events += 1,
+                // rove's vocabulary has exactly these four; anything else is a
+                // version skew worth counting rather than ignoring.
+                _ => stats.unknown_ids += 1,
+            }
+        }
+        // A create that named a parent which has now arrived.
+        self.attach_waiting(doc, &mut stats);
+        stats.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        stats
+    }
+
+    fn create(&mut self, doc: &mut Document, action: &J, conv: &mut ValueConverter, stats: &mut ApplyStats) {
+        let Some(id) = action.get("id").and_then(J::as_str) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        if self.ids.contains_key(id) {
+            // rove re-sends a create it has already journaled (after a
+            // reconnect); the world already has the instance.
+            stats.duplicate_creates += 1;
+            return;
+        }
+        let Some(node) = action.get("node") else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        let Some(class) = node.get("class_name").and_then(J::as_str) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        // The parent, if this delta brought one and the world has it; else the
+        // root, with a note for `attach_waiting`.
+        let wanted_parent = node.get("parent").and_then(parent_id);
+        let parent_ref = wanted_parent
+            .as_deref()
+            .and_then(|p| self.ids.get(p).copied())
+            .unwrap_or_else(|| doc.dom.root_ref());
+
+        let name = node
+            .get("properties")
+            .and_then(|p| p.get("Name"))
+            .and_then(name_of)
+            .or_else(|| node.get("name").and_then(name_of))
+            .unwrap_or_default();
+        let instance = InstanceBuilder::new(class);
+        let instance = if name.is_empty() {
+            instance
+        } else {
+            instance.with_name(name)
+        };
+        let r = doc.dom.insert(parent_ref, instance);
+        self.ids.insert(id.to_string(), r);
+        self.refs.insert(r, id.to_string());
+        stats.created += 1;
+        if parent_ref != doc.dom.root_ref() {
+            stats.parents += 1;
+        } else if let Some(parent) = wanted_parent {
+            self.waiting_for_parent.insert(id.to_string(), parent);
+        }
+
+        // The create's properties: the converter is the only reader of rove's
+        // tagged values, and the class decides an untagged one's type.
+        if let Some(properties) = node.get("properties").and_then(J::as_object) {
+            let mut values: Vec<(String, Variant)> = Vec::with_capacity(properties.len());
+            for (property, value) in properties {
+                if property == "Name" {
+                    continue;
+                }
+                match self.convert(property, class, value, conv) {
+                    Ok(v) => values.push((property.clone(), v)),
+                    Err(_) => stats.refused_values += 1,
+                }
+            }
+            if let Some(instance) = doc.dom.get_by_ref_mut(r) {
+                for (property, value) in values {
+                    instance.properties.insert(ustr(&property), value);
+                    stats.properties += 1;
+                }
+            }
+        }
+    }
+
+    fn set(&mut self, doc: &mut Document, action: &J, conv: &mut ValueConverter, stats: &mut ApplyStats) {
+        let Some(id) = action.get("id").and_then(J::as_str) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        let Some(&r) = self.ids.get(id) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        let Some(fields) = action.get("fields").and_then(J::as_object) else {
+            stats.sets += 1;
+            return;
+        };
+        let class = doc
+            .dom
+            .get_by_ref(r)
+            .map(|i| i.class.to_string())
+            .unwrap_or_else(|| "Instance".to_string());
+        stats.sets += 1;
+        for (property, value) in fields {
+            if property == "Parent" {
+                if let Some(parent) = parent_id(value) {
+                    self.reparent(doc, id, &parent, stats);
+                }
+                continue;
+            }
+            match self.convert(property, &class, value, conv) {
+                Ok(v) => {
+                    if let Some(instance) = doc.dom.get_by_ref_mut(r) {
+                        instance.properties.insert(ustr(property), v);
+                        stats.properties += 1;
+                    }
+                }
+                // `$ref`: a property that points at another instance (a
+                // Player's Character, a seat's Occupant). Resolved here, where
+                // the id map is, and dropped — counted — when the target is
+                // not in the world yet.
+                Err(ConvertError::Ref(target)) => match self.ids.get(&target).copied() {
+                    Some(target_ref) => {
+                        if let Some(instance) = doc.dom.get_by_ref_mut(r) {
+                            instance
+                                .properties
+                                .insert(ustr(property), Variant::Ref(target_ref));
+                            stats.properties += 1;
+                        }
+                    }
+                    None => stats.unknown_ids += 1,
+                },
+                Err(ConvertError::Value(_)) => stats.refused_values += 1,
+            }
+        }
+    }
+
+    fn remove(&mut self, doc: &mut Document, action: &J, stats: &mut ApplyStats) {
+        let Some(id) = action.get("id").and_then(J::as_str) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        let Some(&r) = self.ids.get(id) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        // The subtree goes with it; the id map must not keep the refs of
+        // instances that no longer exist, or a later `$ref` binds a dead ref.
+        let doomed: Vec<Ref> = doc.dom.descendants(r).collect();
+        for d in &doomed {
+            if let Some(id) = self.refs.remove(d) {
+                self.ids.remove(&id);
+                self.waiting_for_parent.remove(&id);
+            }
+        }
+        stats.removed += 1;
+        stats.instances_removed += doomed.len().saturating_sub(1);
+        if !doomed.is_empty() && r != doc.dom.root_ref() {
+            doc.dom.destroy(r);
+        }
+    }
+
+    /// `fields.Parent`, when the parent has arrived; else remembered.
+    fn reparent(&mut self, doc: &mut Document, id: &str, parent: &str, stats: &mut ApplyStats) {
+        let Some(&r) = self.ids.get(id) else {
+            stats.unknown_ids += 1;
+            return;
+        };
+        match self.ids.get(parent).copied() {
+            Some(parent_ref) => {
+                if r != parent_ref && r != doc.dom.root_ref() {
+                    doc.dom.transfer_within(r, parent_ref);
+                    stats.parents += 1;
+                    self.waiting_for_parent.remove(id);
+                }
+            }
+            None => {
+                self.waiting_for_parent.insert(id.to_string(), parent.to_string());
+            }
+        }
+    }
+
+    /// A create that named a parent which was not in the world yet, moved now
+    /// that it is. Bounded by the number of creates, so one pass is enough for
+    /// a chain that arrived in reverse.
+    fn attach_waiting(&mut self, doc: &mut Document, stats: &mut ApplyStats) {
+        if self.waiting_for_parent.is_empty() {
+            return;
+        }
+        let mut settled: Vec<(String, String)> = Vec::new();
+        for (id, parent) in &self.waiting_for_parent {
+            if self.ids.contains_key(parent) {
+                settled.push((id.clone(), parent.clone()));
+            }
+        }
+        for (id, parent) in settled {
+            self.reparent(doc, &id, &parent, stats);
+            self.waiting_for_parent.remove(&id);
+        }
+    }
+
+    fn convert(
+        &mut self,
+        property: &str,
+        class: &str,
+        value: &J,
+        conv: &mut ValueConverter,
+    ) -> Result<Variant, ConvertError> {
+        // `$ref` needs the id map, which the converter does not have.
+        if let Some(target) = value.get("$ref").and_then(J::as_str) {
+            return Err(ConvertError::Ref(target.to_string()));
+        }
+        conv.value(property, class, value)
+            .map_err(ConvertError::Value)
+    }
+
+    /// Events this batch carried, for the engine to dispatch to `LocalScript`s.
+    /// Returned as rove's own JSON so the dispatch reads the same shapes as
+    /// rove's `WorldStore` does.
+    pub fn events<'a>(&self, actions: &'a [J]) -> Vec<&'a J> {
+        actions
+            .iter()
+            .filter(|a| a.get("kind").and_then(J::as_str) == Some("event"))
+            .collect()
+    }
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Live::new()
+    }
+}
+
+enum ConvertError {
+    /// The value points at another instance (`$ref`).
+    Ref(String),
+    /// The converter refused it; the property keeps its default.
+    Value(String),
+}
+
+/// A parent in any of rove's spellings: a string, `{"$ref": id}`, or `null`.
+fn parent_id(v: &J) -> Option<String> {
+    match v {
+        J::String(s) => Some(s.clone()),
+        J::Object(o) => o.get("$ref").and_then(J::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A name from a property value: a plain string or rove's `{"$string": …}`.
+fn name_of(v: &J) -> Option<String> {
+    match v {
+        J::String(s) => Some(s.clone()),
+        J::Object(o) => o
+            .get("$string")
+            .or_else(|| o.get("$shared_string"))
+            .and_then(J::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Ids in the world that no longer answer to a live `Ref`: the check a
+/// disconnect uses to decide whether the map can be dropped.
+pub fn stale_ids(world_ids: &HashSet<String>, live: &Live) -> usize {
+    world_ids.iter().filter(|id| live.referent(id).is_none()).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::Snapshot;
+
+    fn empty_world() -> (Document, Live) {
+        let snapshot = crate::snapshot::parse(
+            r#"{"version":1,"sequence":0,"job_id":"live","services":{},"class_parents":{},"defaults":{},"default_origins":{},"nodes":[]}"#,
+        )
+        .expect("an empty snapshot parses");
+        let built = crate::world::build(snapshot, "Live".into()).expect("an empty world builds");
+        let live = Live::from_world(&built.world);
+        (built.world.doc, live)
+    }
+
+    fn action(v: J) -> J {
+        v
+    }
+
+    #[test]
+    fn a_create_makes_an_instance_under_its_parent() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let actions = vec![
+            action(serde_json::json!({
+                "sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Part", "parent": null,
+                         "properties": {"Name": "Floor", "Size": {"$vector3": [4, 1, 2]}}}
+            })),
+        ];
+        let stats = live.apply(&mut doc, &actions, &mut conv);
+        assert_eq!(stats.created, 1);
+        assert_eq!(stats.properties, 1, "Size (Name sets the instance's name)");
+        assert_eq!(live.len(), 1);
+        let r = live.referent("3:1").expect("the id maps to a Ref");
+        let instance = doc.dom.get_by_ref(r).expect("it exists");
+        assert_eq!(instance.name.as_str(), "Floor");
+        assert_eq!(instance.class.as_str(), "Part");
+        assert_eq!(
+            instance.properties.get(&ustr("Size")),
+            Some(&Variant::Vector3(rbx_dom_weak::types::Vector3::new(4.0, 1.0, 2.0)))
+        );
+    }
+
+    #[test]
+    fn a_child_created_before_its_parent_moves_when_the_parent_arrives() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        // The child's create is journaled first and names a parent the world
+        // does not have yet.
+        let first = vec![action(serde_json::json!({
+            "sequence": 1, "kind": "create", "id": "3:2",
+            "node": {"id": "3:2", "class_name": "Part", "parent": "3:1",
+                     "properties": {"Name": "Child"}}
+        }))];
+        let stats = live.apply(&mut doc, &first, &mut conv);
+        assert_eq!(stats.created, 1);
+        assert_eq!(live.waiting(), 1, "it is waiting for 3:1");
+        let child = live.referent("3:2").unwrap();
+        assert_eq!(
+            doc.dom.get_by_ref(child).unwrap().parent(),
+            doc.dom.root_ref(),
+            "an orphan waits at the root, as the snapshot build does"
+        );
+
+        // The parent arrives.
+        let second = vec![action(serde_json::json!({
+            "sequence": 2, "kind": "create", "id": "3:1",
+            "node": {"id": "3:1", "class_name": "Model", "parent": null,
+                     "properties": {"Name": "Model"}}
+        }))];
+        let stats = live.apply(&mut doc, &second, &mut conv);
+        assert_eq!(stats.parents, 1, "the waiting child was moved");
+        assert_eq!(live.waiting(), 0);
+        let parent = live.referent("3:1").unwrap();
+        assert_eq!(doc.dom.get_by_ref(child).unwrap().parent(), parent);
+    }
+
+    #[test]
+    fn a_set_writes_the_properties_it_names_and_adopts_a_parent() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let creates = vec![
+            action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Part", "properties": {"Name": "Floor"}}})),
+            action(serde_json::json!({"sequence": 2, "kind": "create", "id": "3:2",
+                "node": {"id": "3:2", "class_name": "Model", "properties": {"Name": "Model"}}})),
+        ];
+        live.apply(&mut doc, &creates, &mut conv);
+
+        let sets = vec![action(serde_json::json!({
+            "sequence": 3, "kind": "set", "id": "3:1",
+            "fields": {"Anchored": true, "Parent": "3:2"}
+        }))];
+        let stats = live.apply(&mut doc, &sets, &mut conv);
+        assert_eq!(stats.sets, 1);
+        assert_eq!(stats.parents, 1);
+        assert_eq!(stats.properties, 1, "Anchored; Parent is an edge, not a value");
+        let r = live.referent("3:1").unwrap();
+        assert_eq!(
+            doc.dom.get_by_ref(r).unwrap().properties.get(&ustr("Anchored")),
+            Some(&Variant::Bool(true))
+        );
+        assert_eq!(
+            doc.dom.get_by_ref(r).unwrap().parent(),
+            live.referent("3:2").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_ref_field_binds_when_its_target_has_arrived_and_is_dropped_otherwise() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Model", "properties": {"Name": "M"}}}))],
+            &mut conv,
+        );
+        // Target absent: counted, not bound.
+        let stats = live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 2, "kind": "set", "id": "3:1",
+                "fields": {"PrimaryPart": {"$ref": "3:9"}}}))],
+            &mut conv,
+        );
+        assert_eq!(stats.unknown_ids, 1);
+        assert!(doc
+            .dom
+            .get_by_ref(live.referent("3:1").unwrap())
+            .unwrap()
+            .properties
+            .get(&ustr("PrimaryPart"))
+            .is_none());
+    }
+
+    #[test]
+    fn a_remove_destroys_the_subtree_and_forgets_its_ids() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        live.apply(
+            &mut doc,
+            &[
+                action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                    "node": {"id": "3:1", "class_name": "Model", "properties": {}}})),
+                action(serde_json::json!({"sequence": 2, "kind": "create", "id": "3:2",
+                    "node": {"id": "3:2", "class_name": "Part", "parent": "3:1", "properties": {}}})),
+            ],
+            &mut conv,
+        );
+        let stats = live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 3, "kind": "remove", "id": "3:1"}))],
+            &mut conv,
+        );
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.instances_removed, 1, "the child went with the model");
+        assert!(live.referent("3:1").is_none());
+        assert!(live.referent("3:2").is_none(), "no dead refs stay in the map");
+        assert_eq!(live.len(), 0);
+    }
+
+    #[test]
+    fn a_repeat_create_is_not_a_second_instance() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let create = action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+            "node": {"id": "3:1", "class_name": "Part", "properties": {}}}));
+        live.apply(&mut doc, &[create.clone()], &mut conv);
+        let stats = live.apply(&mut doc, &[create], &mut conv);
+        assert_eq!(stats.duplicate_creates, 1);
+        assert_eq!(stats.created, 0);
+        assert_eq!(live.len(), 1);
+    }
+
+    #[test]
+    fn a_set_for_an_unknown_id_is_counted_not_applied() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let stats = live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 1, "kind": "set", "id": "9:9",
+                "fields": {"Anchored": true}}))],
+            &mut conv,
+        );
+        assert_eq!(stats.unknown_ids, 1);
+        assert_eq!(stats.properties, 0);
+    }
+}

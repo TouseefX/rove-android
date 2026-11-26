@@ -169,8 +169,9 @@ pub fn parse(text: &str) -> Result<Snapshot, String> {
 /// rove's `$`-tagged JSON → `rbx_types::Variant`, once per property.
 ///
 /// A converter is per world so its counters mean something for that world; none
-/// of it runs per frame.
-#[derive(Debug, Default)]
+/// of it runs per frame. `Clone` so a world that is replaced (Play, then a
+/// rejoin) can start from a converter whose totals the report still has.
+#[derive(Debug, Default, Clone)]
 pub struct ValueConverter {
     /// Values that went through a `$` tag.
     pub converted: usize,

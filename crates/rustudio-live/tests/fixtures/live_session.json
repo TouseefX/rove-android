@@ -1,0 +1,15 @@
+{
+ "note": "rove's own decoder reads this session: schema, then a place whose Workspace holds one anchored Part, a joining Player whose Character arrives before its parent edge, and the Part removed.",
+ "packets": [
+  {
+   "at_ms": 0,
+   "kind": "schema",
+   "base64": "ly8AAAAmAAAAKLUv/SAmMQEAAwAAAAAAAAAAAAECAARQYXJ0AgRTaXplFwhBbmNob3JlZAIAAAA="
+  },
+  {
+   "at_ms": 0,
+   "kind": "globals",
+   "base64": "gQkAAAAAAAAAKLUv/SAAAQAA"
+  }
+ ]
+}

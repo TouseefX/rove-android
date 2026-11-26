@@ -999,6 +999,11 @@ impl Editor {
         if path.file_name().is_some_and(|n| n == "world_snapshot.json") {
             return self.open_world_snapshot(path);
         }
+        // A recorded live session (a `packets` array of base64 payloads): the
+        // live path replayed through rove's decoder, offline.
+        if path.file_name().is_some_and(|n| n == "live_session.json") {
+            return self.open_live_recording(path);
+        }
         match Document::open(&path) {
             Ok(d) => {
                 let n = d.dom.descendants().count();
@@ -1043,6 +1048,52 @@ impl Editor {
                 self.info(format!("Live world: {} ({instances} instances)", path.display()));
             }
             Err(e) => self.error(format!("Could not build the live world from {}: {e}", path.display())),
+        }
+    }
+
+    /// Replays a recorded live session into the document to draw and run:
+    /// `rustudio_live::replay` feeds the recording's payloads to rove's own
+    /// decoder and applies what commits (creates, sets, parent edges, removes),
+    /// so the live path is exercised end to end with no network at all. The
+    /// report of what the session did goes into the Output.
+    pub fn open_live_recording(&mut self, path: PathBuf) {
+        // An empty world to replay into: the session's first packets make every
+        // instance, so nothing is assumed about the place beforehand.
+        let empty = r#"{"version":1,"sequence":0,"job_id":"replay","services":{},"class_parents":{},"defaults":{},"default_origins":{},"nodes":[]}"#;
+        let built = match rustudio_live::snapshot::parse(empty)
+            .map_err(|e| e.to_string())
+            .and_then(|s| rustudio_live::world::build(s, "Live session".to_string()))
+        {
+            Ok(built) => built,
+            Err(e) => {
+                self.error(format!("Could not start a live session: {e}"));
+                return;
+            }
+        };
+        let mut doc = built.world.doc;
+        let mut live = rustudio_live::live::Live::from_world(&built.world);
+        let mut converter = rustudio_live::snapshot::ValueConverter::default();
+        match rustudio_live::replay::load_and_replay(&path, &mut doc, &mut live, &mut converter) {
+            Ok((recording, replay)) => {
+                let instances = replay.instances;
+                let line = replay.line();
+                self.harness.live_world = Some((format!("{}\n{}", recording.note, line), replay.json()));
+                self.set_document(doc);
+                rustudio_core::load_trace::mark("live recording replayed");
+                self.info(format!("{}\n{line}", recording.note));
+                if replay.refused_packets > 0 {
+                    self.warn(format!(
+                        "{} packet(s) could not be read; the first was: {}",
+                        replay.refused_packets,
+                        replay.first_refusal.unwrap_or_else(|| "(no detail)".into())
+                    ));
+                }
+                self.info(format!(
+                    "Live session: {} ({instances} instances)",
+                    path.display()
+                ));
+            }
+            Err(e) => self.error(format!("Could not replay {}: {e}", path.display())),
         }
     }
 

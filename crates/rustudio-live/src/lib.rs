@@ -8,10 +8,19 @@
 //! `rustudio_engine::replicate::initial_client` produces for a local Play
 //! session (docs/M0-UNDERSTANDING.md §3).
 //!
-//! M1 is the offline half: [`snapshot`] parses the world JSON rove's
+//! The offline half is M1: [`snapshot`] parses the world JSON rove's
 //! `WorldStore` normalises replication into, and [`world::build`] makes the
-//! document from it. The live half (M2) feeds the replica a world built from
-//! the same shapes, so the parser and the value converter are shared.
+//! document from it in one pass.
+//!
+//! The live half is M2: [`live::Live`] applies rove's replication as it
+//! arrives — a create, a set, a parent edge, a remove — to a world that is
+//! already being drawn, and [`session::Session`] owns rove's decoder so the
+//! packets are read by rove's own code instead of a second copy of it. Both
+//! halves share [`snapshot::ValueConverter`] and the id ⇄ `Ref` map.
+//!
+//! [`replay`] is how the live half is evidenced without a network: a recording
+//! of the payloads one connection received, fed to rove's decoder and applied,
+//! so a bug in the bridge is reproduced from a file rather than from Roblox.
 //!
 //! The rules this crate keeps (docs/LIVE-JOIN.md):
 //!
@@ -25,6 +34,9 @@
 //!   follow it);
 //! - classes come from `api-dump.json`, not from a list in this crate.
 
+pub mod live;
+pub mod replay;
+pub mod session;
 pub mod snapshot;
 pub mod world;
 
