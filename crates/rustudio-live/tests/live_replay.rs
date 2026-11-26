@@ -146,17 +146,17 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
 
     // The globals packet's containers are the world's roots; the replication
     // packet's Part hangs off Workspace.
-    assert_eq!(doc.get_by_ref(workspace).name, "Workspace");
-    assert_eq!(doc.get_by_ref(players).name, "Players");
-    assert_eq!(doc.get_by_ref(datamodel).name, "DataModel");
+    assert_eq!(doc.get_by_ref(workspace).unwrap().name, "Workspace");
+    assert_eq!(doc.get_by_ref(players).unwrap().name, "Players");
+    assert_eq!(doc.get_by_ref(datamodel).unwrap().name, "DataModel");
     let part = live
         .referent(&id(&recording, "part"))
         .expect("the Part is bound");
-    assert_eq!(doc.get_by_ref(part).parent(), Some(workspace));
+    assert_eq!(doc.get_by_ref(part).unwrap().parent(), workspace);
 
     // The properties came through the converter with their real types: the
     // packet carries a Vector3 and a bool, not a JSON float array.
-    let instance = doc.get_by_ref(part);
+    let instance = doc.get_by_ref(part).expect("the Part");
     assert_eq!(
         instance.properties.get(&"Size".into()),
         Some(&Variant::Vector3(Vector3::new(4.0, 1.0, 2.0))),
@@ -175,7 +175,7 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
         0,
         "no create is still waiting for its parent"
     );
-    assert_eq!(doc.get_by_ref(players).parent(), Some(workspace));
+    assert_eq!(doc.get_by_ref(players).unwrap().parent(), workspace);
 }
 
 #[test]
@@ -185,8 +185,8 @@ fn the_character_is_bound_to_players_even_though_it_arrived_first() {
     let players = live.referent(&id(&recording, "players")).unwrap();
     let character = live.referent(&id(&recording, "character")).unwrap();
     assert_eq!(
-        doc.get_by_ref(character).parent(),
-        Some(players),
+        doc.get_by_ref(character).unwrap().parent(),
+        players,
         "the child arrived with no parent and was given its edge later"
     );
 }
