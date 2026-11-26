@@ -34,7 +34,7 @@ rustc-hash = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 flate2 = "1"
 # services domain: HttpService (real HTTP), EncodingService (zstd, hashes).
-ureq = "3"
+ureq = "3.5"
 # HttpService:CreateWebStreamClient (WebSocket type).
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 zstd = "0.13"

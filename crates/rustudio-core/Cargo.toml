@@ -32,7 +32,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 rustc-hash = "2"
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "edgebreaker_valence_decode", "legacy_bitstream_decode"] }
 # Studio content download (studio_content.rs)
-ureq = "3"
+ureq = "3.5"
 dirs = "6"
 chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
 

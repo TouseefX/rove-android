@@ -6,7 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ureq = { version = "3", features = ["json"] }
+# 3.5 for ConfigBuilder::timeout_per_read (session.rs:450, api.rs:271): 3.4.2
+# has no per-read timeout, and a stalled asset download then hangs the call.
+ureq = { version = "3.5", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
