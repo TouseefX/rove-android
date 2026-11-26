@@ -504,6 +504,12 @@ defines the gap kinds (`missing`, `call-unimplemented`, `default-only`,
 Legends Battlegrounds' gaps in those terms with `api-dump.json` citations.
 M7's APK-size and GPU work starts from `docs/ANDROID.md` (Turnip/PanVK,
 `ANDROID_SIGNING_PEM`, `x build`), and the CI to build it is described next.
+One measurement is already done, because it decides which APK is worth
+installing: on this tree a **debug** APK is **314 MB** (aarch64) / **322 MB**
+(x86_64) and about 1 GB installed, against a **release** APK's **39 MB** /
+**30 MB** — so `android.yml` now builds release only (debug on request), and a
+push that changes `src/`, `crates/`, `vendor/` or `Cargo.*` starts an APK build
+while a `rove/`- or `docs/`-only push does not.
 
 **10.9 CI, as it stands in this tree.** Two workflows: `.github/workflows/ci.yml`
 (desktop `check` on ubuntu+windows, tests on macOS only — the Linux runner has no
