@@ -73,13 +73,34 @@ jobs:
       # minute, not after a long build.
       - name: Bridge tests (a rove snapshot in, a DataModel out)
         run: |
-          set -o pipefail
-          cargo test -p rustudio-live -- --nocapture 2>&1 | tee /tmp/live-tests.log
+          set +e
+          cargo test -p rustudio-live --message-format=short -- --nocapture 2>&1 | tee /tmp/live-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
           echo "--- summary:"
-          grep -E "^(test result|running)" /tmp/live-tests.log
+          grep -E "^(test result|running|test )" /tmp/live-tests.log | head -40
+          if [ "$status" -ne 0 ]; then
+            echo "--- diagnostics as annotations:"
+            for page in 0 1 2; do
+              python3 tools/ci/annotate.py /tmp/live-tests.log "$page" || true
+            done
+            exit "$status"
+          fi
 
       - name: Build the player
-        run: cargo build --release -p rustudio
+        run: |
+          set +e
+          cargo build --release -p rustudio --message-format=short 2>&1 | tee /tmp/build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "--- diagnostics as annotations:"
+            for page in 0 1 2; do
+              python3 tools/ci/annotate.py /tmp/build.log "$page" || true
+            done
+            exit "$status"
+          fi
+          tail -5 /tmp/build.log
 
       # --headless: no window and no compositor (frames are drawn to an
       # offscreen target and read back — the offscreen path in the player), so
