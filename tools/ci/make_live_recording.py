@@ -8,12 +8,19 @@ the byte layout rove's decoder reads — the layout rove's own schema tests
 encode (`rove/client-core/src/schema.rs`, `fn schema_bytes`):
 zstd frames, LEB128 varints, little-endian class/property ids.
 
-What it writes so far is the schema packet: one class (Part) with two
-properties, the ids rove's decoder assigns. The replication packets that make
-the place — a Workspace holding an anchored Part, a Player whose Character
-arrives before its parent edge, and the Part removed — are what M2 adds next;
-the actions the bridge applies are already tested against that vocabulary in
-crates/rustudio-live/src/live.rs.
+It writes three packets, in the order a join receives them:
+
+1. schema   - three classes (DataModel, Workspace, Part) with the property ids
+              rove's decoder assigns;
+2. globals  - the top containers (DataModel, Workspace, Players), which is what
+              makes the world's roots;
+3. replication - the place itself: a Part created under Workspace, a second Part
+              and a Player created with a null parent, then a packet that gives
+              both of them their parent (the "arrives before its parent edge"
+              case the bridge defers), and finally the removal of the first
+              Part (the bridge destroys its subtree and forgets its id).
+
+Every id in this file is a key as rove spells it, "<scope>:<id>"
 
 Usage (writes the fixture in place):
 
@@ -80,24 +87,93 @@ def packet(kind, expanded):
 # One class (Part) with two properties. Property names are what the bridge hands
 # the converter, so they are spelled as rustudio's api-dump.json spells them.
 def schema_bytes():
+    """The schema packet's expanded payload.
+
+    Three classes, in the order ids are assigned: 0 DataModel, 1 Workspace,
+    2 Part. Property ids are global in rove's schema and run on across classes,
+    so Part's two are 0 and 1. There is no enum table and no ISR section: the
+    reader takes "payload finished" for "no more sections", and an enum table
+    would make type id 7 mean "enum" rather than a varint.
+    """
     out = bytearray()
     out += varuint(3)                     # schema version
     out += struct.pack("<Q", 0)           # flags
-    # enum table: none. Our decoder treats a string table as optional
-    # trailing data it rejects, so no enums means no enum-id references.
     out += varuint(0)                     # enums
-    out += varuint(1)                     # classes
-    out += varuint(2)                     # properties
+    out += varuint(3)                     # classes
+    out += varuint(2)                     # properties, counted over all classes
     out += varuint(0)                     # events
-    out += string("Part")
-    out += varuint(2)                     # this class's properties
-    out += string("Size")                 # property name
-    out += bytes([23])                    # type id: a datatype-sized blob
-    out += string("Anchored")
-    out += bytes([2])                     # type id: bool
-    out += struct.pack("<H", 0)           # the class's unknown u16
-    out += varuint(0)                     # this class's events
+
+    for name, props in (
+        ("DataModel", ()),
+        ("Workspace", ()),
+        # The names rustudio's api-dump.json spells, so the bridge's converter
+        # is handed the real ones. 22 is Vector3 and 9 is bool, the type ids
+        # rove's value reader switches on.
+        ("Part", (("Size", 22), ("Anchored", 9))),
+    ):
+        out += string(name)
+        out += varuint(len(props))
+        for prop_name, type_id in props:
+            out += string(prop_name)
+            out += bytes([type_id])
+        out += struct.pack("<H", 0)       # the class's unknown u16
+        out += varuint(0)                 # its events
     return bytes(out)
+
+
+def globals_bytes(scope, containers):
+    """The globals packet: the world's top containers (parent NULL)."""
+    out = bytearray()
+    out += bytes([1, 1, 0, 0, 0, 0, 0])   # seven boolean flags
+    out += varuint(scope)                 # client scope
+    out += varuint(len(containers))
+    for key, class_id, flags in containers:
+        out += varuint(key[0])            # scope
+        out += struct.pack("<I", key[1])  # instance id
+        out += struct.pack("<H", class_id)
+        out += bytes([flags[0], flags[1]])
+    return bytes(out)
+
+
+def key(scope, instance):
+    return varuint(scope) + struct.pack("<I", instance)
+
+
+def create(scope, instance, class_id, properties, parent):
+    """One create item: 2, key, class, [prop order, value] ..., 255, 255, parent.
+
+    The two 255s end the instance's two property lists (rove reads both), and
+    `parent` is a key or None for "no parent yet".
+    """
+    out = bytearray([2])
+    out += key(scope, instance)
+    out += struct.pack("<H", class_id)
+    for prop_id, encoded in properties:
+        out += bytes([prop_id])
+        out += encoded
+    out += bytes([255, 255])
+    out += key(*parent) if parent else b"\x00"
+    return bytes(out)
+
+
+def vector3(x, y, z):
+    return bytes([22]) + struct.pack("<3f", x, y, z)
+
+
+def boolean(value):
+    return bytes([9, 1 if value else 0])
+
+
+def replication_packet(*items):
+    out = bytearray([131])
+    for item in items:
+        out += item
+    out += bytes([0])                     # packet terminator
+    return bytes(out)
+
+
+def remove(scope, instance):
+    return bytes([1]) + key(scope, instance)
 
 
 def b64(raw):
@@ -105,17 +181,50 @@ def b64(raw):
 
 
 def main():
+    # The ids are rove's own spelling of a key: "<scope>:<instance>". The scope
+    # is the client's, which the globals packet declares.
+    SCOPE = 1
+    DM, WORKSPACE, PLAYERS, PART, CHARACTER = 0, 1, 2, 3, 4
+
+    schema = packet(151, schema_bytes())
+    globals_ = packet(129, globals_bytes(
+        SCOPE,
+        [((SCOPE, DM), 0, (1, 0)),        # DataModel
+         ((SCOPE, WORKSPACE), 1, (1, 0)),  # Workspace
+         ((SCOPE, PLAYERS), 1, (1, 0))],   # Players
+    ))
+    # 3: a Part created under Workspace.
+    # 4 and 2: a second Part and a Player created with no parent yet.
+    joins = replication_packet(
+        create(SCOPE, PART, 2, [(0, vector3(4.0, 1.0, 2.0)), (1, boolean(True))],
+               (SCOPE, WORKSPACE)),
+        create(SCOPE, CHARACTER, 2, [(0, vector3(1.0, 1.0, 1.0))], None),
+    )
+    # 5: their parent edges arrive in a later packet, which is the case the
+    # bridge has to hold: a child before its parent would be dropped.
+    edges = replication_packet(
+        create(SCOPE, PLAYERS, 0, [], (SCOPE, WORKSPACE)),
+    )
+    # 6: the first Part is destroyed (the bridge removes its subtree).
+    removals = replication_packet(remove(SCOPE, PART))
+
     packets = [
-        {"at_ms": 0, "kind": "schema", "base64": b64(packet(151, schema_bytes()))},
-        # TODO(globals + replication): the ids below are the ones rove's
-        # decoder assigns, and the values use rove's $ tags so the bridge's
-        # converter is exercised with the real shapes.
-        {"at_ms": 0, "kind": "globals", "base64": b64(packet(129, b""))},
+        {"at_ms": 0, "kind": "schema", "base64": b64(schema)},
+        {"at_ms": 0, "kind": "globals", "base64": b64(globals_)},
+        {"at_ms": 40, "kind": "replication", "base64": b64(joins)},
+        {"at_ms": 60, "kind": "replication", "base64": b64(edges)},
+        {"at_ms": 80, "kind": "replication", "base64": b64(removals)},
     ]
     recording = {
-        "note": "rove's own decoder reads this session: schema, then a place "
-                "whose Workspace holds one anchored Part, a joining Player whose "
-                "Character arrives before its parent edge, and the Part removed.",
+        "note": "A join as a recording: rove's own decoder reads the schema "
+                "(DataModel, Workspace, Part), the globals (the place's top "
+                "containers), then the place itself — a Part under Workspace, a "
+                "Player and a second Part whose parent edges arrive in a later "
+                "packet, and the first Part destroyed.",
+        "scope": SCOPE,
+        "ids": {"datamodel": "%d:%d" % (SCOPE, DM), "workspace": "%d:%d" % (SCOPE, WORKSPACE),
+                "players": "%d:%d" % (SCOPE, PLAYERS), "part": "%d:%d" % (SCOPE, PART),
+                "character": "%d:%d" % (SCOPE, CHARACTER)},
         "packets": packets,
     }
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
