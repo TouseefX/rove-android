@@ -82,7 +82,8 @@ jobs:
           # Copy the log where the annotation step can always reach it, then
           # fail: the step that emits annotations must not be the step that ran
           # out of output first.
-          cp /tmp/live-tests.log out/live-tests.log 2>/dev/null || true
+          mkdir -p out
+          cp /tmp/live-tests.log out/live-tests.log 2>/dev/null || echo "could not copy the test log"
           exit "$status"
 
       # Runs whatever happened above, and reads the logs back as annotations:
@@ -91,13 +92,19 @@ jobs:
       - name: Re-emit the build's diagnostics
         if: always()
         run: |
+          ls -l out/ || true
+          found=0
           for log in out/live-tests.log out/build.log; do
             [ -f "$log" ] || continue
+            found=$((found+1))
             echo "=== $log"
             for page in 0 1 2 3 4 5 6 7; do
               python3 tools/ci/annotate.py "$log" "$page" || true
             done
           done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no build log was copied into out/; the compile step failed before it could"
+          fi
 
       - name: Build the player
         run: |
@@ -105,7 +112,8 @@ jobs:
           cargo build --release --locked -p rustudio --message-format=short 2>&1 | tee /tmp/build.log
           status=${PIPESTATUS[0]}
           set -e
-          cp /tmp/build.log out/build.log 2>/dev/null || true
+          mkdir -p out
+          cp /tmp/build.log out/build.log 2>/dev/null || echo "could not copy the build log"
           exit "$status"
           tail -5 /tmp/build.log
 
