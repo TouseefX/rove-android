@@ -77,7 +77,7 @@ if page == 0:
     page_items = panic_block if panic_block else rest[:PER_PAGE]
     printed = len(page_items) if panic_block else min(len(rest), PER_PAGE)
     if panic_block:
-        print("annotate: where the failure starts (and %d diagnostic(s) after it)" % len(rest))
+        print("annotate: found %d diagnostic(s); page 0 = where the failure starts" % len(rest))
     else:
         print("annotate: diagnostics page 1 of %d (%d diagnostic(s))" % (max(diag_pages, 1), len(rest)))
     rest = rest[0:] if panic_block else rest[PER_PAGE:]
