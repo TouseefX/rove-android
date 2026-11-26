@@ -8,7 +8,7 @@
 //! small snapshots in place for the cases the seven-node fixture cannot show:
 //! ordering, dangling refs, refusals, a 90° rotation.
 
-use rbx_dom_weak::types::{Faces, Matrix3, Variant, Vector3};
+use rbx_dom_weak::types::{Faces, Variant, Vector3};
 use rbx_dom_weak::ustr;
 use serde_json::{json, Value as J};
 
@@ -72,7 +72,11 @@ fn rove_value_tags_become_rbx_types_values() {
         panic!("not a CFrame")
     };
     assert_eq!(cf.position, Vector3::new(1.0, 2.0, 3.0));
-    assert_eq!(cf.orientation, Matrix3::identity());
+    // The identity, as its columns: compared component-wise because whether
+    // Matrix3 itself derives PartialEq is not something this crate can see
+    // (rbx_types is not vendored).
+    assert_eq!((cf.orientation.x, cf.orientation.y, cf.orientation.z),
+               (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)));
     assert_eq!(
         conv.value("Size", "Part", &json!({"$vector3": [4, 1, 2]})).unwrap(),
         Variant::Vector3(Vector3::new(4.0, 1.0, 2.0))
@@ -98,10 +102,12 @@ fn a_rotation_is_read_row_major_as_rove_writes_it() {
     let cframe = json!({"$cframe": {"position": [0, 5, 0], "rotation": [0, 0, 1, 0, 1, 0, -1, 0, 0]}});
     let mut conv = snapshot::ValueConverter::default();
     let Variant::CFrame(cf) = conv.value("CFrame", "Part", &cframe).unwrap() else { panic!() };
-    // Column 0 of a Y-90° rotation is +Z (x_axis), column 2 is -X.
-    assert_eq!(cf.orientation.x_axis, Vector3::new(0.0, 0.0, -1.0));
-    assert_eq!(cf.orientation.y_axis, Vector3::new(0.0, 1.0, 0.0));
-    assert_eq!(cf.orientation.z_axis, Vector3::new(1.0, 0.0, 0.0));
+    // Matrix3's x, y, z are its columns: for a Y-90° rotation column 0 is
+    // (0, 0, -1) and column 2 is (1, 0, 0). (rove writes row-major into a
+    // column-major CFrame, which is what makes the columns the axes.)
+    assert_eq!(cf.orientation.x, Vector3::new(0.0, 0.0, -1.0));
+    assert_eq!(cf.orientation.y, Vector3::new(0.0, 1.0, 0.0));
+    assert_eq!(cf.orientation.z, Vector3::new(1.0, 0.0, 0.0));
     // And the same CFrame read back through rustudio's own writer.
     assert_eq!(rustudio_core::project_values::to_json("Part", "CFrame", &Variant::CFrame(cf)).is_some(), true);
 }
@@ -149,7 +155,7 @@ fn a_brickcolor_is_its_number_or_its_name() {
 #[test]
 fn every_remaining_tag_converts_to_the_type_its_property_has() {
     let mut conv = snapshot::ValueConverter::default();
-    let v = |property: &str, value: serde_json::Value| {
+    let mut v = |property: &str, value: serde_json::Value| {
         conv.value(property, "Part", &value).unwrap_or_else(|e| panic!("{property}: {e}"))
     };
     assert!(matches!(v("Size", json!({"$udim": [3, 0]})), Variant::UDim(_)));
@@ -437,6 +443,7 @@ fn a_ninety_degree_cframe_survives_a_round_trip_through_the_document() {
     );
     let world = build_text(&text);
     let Some(Variant::CFrame(cf)) = world.stored("scope:p", "CFrame") else { panic!() };
-    assert_eq!(cf.orientation.x_axis, Vector3::new(0.0, 0.0, -1.0));
-    let _ = CFrame::identity();
+    assert_eq!(cf.orientation.x, Vector3::new(0.0, 0.0, -1.0));
+    assert_eq!(cf.orientation.z, Vector3::new(1.0, 0.0, 0.0));
+    assert_eq!(cf.position, Vector3::new(0.0, 5.0, 0.0));
 }
