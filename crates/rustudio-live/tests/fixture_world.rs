@@ -267,9 +267,13 @@ fn the_build_reports_what_it_did() {
     assert_eq!(built.world.stats.dangling_refs, 0);
     assert_eq!(built.world.stats.refused_values, 0);
     assert!(built.world.stats.duration_ms >= 0.0);
+    // Printed, not just asserted: a failing assertion here says which number
+    // was wrong, and this line says all of them.
+    println!("report: {}", built.report);
+    println!("stats:  {}", built.world.stats_json());
     assert!(built.report.contains("7 nodes"), "{}", built.report);
-    assert!(built.report.contains("8 instances"), "{}", built.report);
-    assert!(built.report.contains("LocalPlayer: FixturePlayer"), "{}", built.report);
+    assert!(built.report.contains("8 instances"), "report: {}", built.report);
+    assert!(built.report.contains("LocalPlayer: FixturePlayer"), "report: {}", built.report);
     // --result carries the same numbers.
     let json = built.world.stats_json();
     assert_eq!(json["nodes"], 7);
@@ -297,7 +301,7 @@ fn a_child_of_a_node_the_snapshot_lacks_is_kept_at_the_root_and_counted() {
     root["nodes"].as_array_mut().unwrap().retain(|n| n["id"] != "scope:character-1");
     let built = world::build(snapshot::parse(&root.to_string()).unwrap(), "Orphaned".into()).unwrap();
     assert_eq!(built.world.stats.orphans, 2, "Humanoid and HumanoidRootPart");
-    assert!(built.report.contains("2 instances had no parent"), "{}", built.report);
+    assert!(built.report.contains("2 instances had no parent"), "report: {}", built.report);
     // They exist and are reachable, not dropped.
     assert!(built.world.dom.get_by_ref(built.world.ids["scope:root-1"]).is_some());
 }

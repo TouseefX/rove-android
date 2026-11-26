@@ -34,6 +34,13 @@ def escape(text):
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+# The tail starts at the first "panicked at": the assertion's own message (the
+# left/right of an assert_eq!) is the line after it, and it is what a reader
+# needs. Everything after it is short.
+first_panic = next(
+    (i for i, line in enumerate(lines) if "panicked at" in line or "FAILED" in line),
+    max(0, len(lines) - 120),
+)
 found = []
 for i, line in enumerate(lines):
     m = short.match(line)
@@ -55,7 +62,7 @@ for i, line in enumerate(lines):
 # test that panicked prints no `file:line:col:` line at all — its FAILED list
 # and "test result:" line are the end of the output).
 diag_pages = (len(found) + PER_PAGE - 1) // PER_PAGE
-tail = [line for line in lines if line.strip()][-60:][::-1]
+tail = [line for line in lines[first_panic:] if line.strip()][-150:][::-1]
 
 if page < diag_pages:
     page_items = found[page * PER_PAGE : (page + 1) * PER_PAGE]
