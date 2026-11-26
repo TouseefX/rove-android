@@ -129,28 +129,6 @@ jobs:
           echo "--- run log (tail):"
           tail -40 out/run.log || true
 
-      # The M2 live path, offline: a recorded session's payloads replayed through
-      # rove's own decoder into a world, then drawn. No network anywhere.
-      - name: Replay a recorded live session (rove's decoder, no network)
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          ./target/release/rustudio \
-              --live-recording crates/rustudio-live/tests/fixtures/live_session.json \
-              --no-ui --headless \
-              --screenshot out/live-session.png \
-              --shot-after 3 \
-              --seconds 5 \
-              --fixed-dt 0.0166667 \
-              --result out/live-session.json \
-              --log out/live-session.log \
-            > out/live-session.stdout.log 2>&1 || { echo "--- the replay failed; log:"; tail -120 out/live-session.stdout.log; exit 1; }
-          echo "--- replay report (Output lines):"
-          grep -h "rustudio-live\|recorded\|Live session" out/live-session.log out/live-session.stdout.log 2>/dev/null || true
-          echo "--- replay result:"
-          python3 tools/ci/bench_line.py out/live-session.json 2>/dev/null || cat out/live-session.json
-
       # The same scene timed. --bench prints its report to stdout and writes it
       # beside the shots; this runner draws with lavapipe, a CPU rasteriser, so
       # the number is a floor, not the phone's.

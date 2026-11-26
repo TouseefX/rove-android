@@ -1,11 +1,7 @@
 [workspace]
 # The root package is a member by itself (Cargo adds it); listing it as "."
 # as well makes xbuild refuse the workspace ("Did not expect a [workspace]").
-members = ["crates/rustudio-profiler-ui", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net", "crates/rustudio-live", "crates/rustudio-android", "rove/client-core"]
-
-# rove's own crates keep their manifests; only client-core is a member, so the
-# live path can use its decoder. Its tests and examples need the transport
-# feature, which is not on by default.
+members = ["crates/rustudio-profiler-ui", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net", "crates/rustudio-live", "crates/rustudio-android"]
 resolver = "2"
 
 [workspace.package]
@@ -147,10 +143,6 @@ draco-core = { version = "2.3", default-features = false, features = ["decoder",
 
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
-# rove's WebTransport client (feature `transport`) is pinned to its fork of
-# quinn-proto, which rove vendors. `[patch]` is read from the workspace root
-# only, so it belongs here and covers every member.
-quinn-proto = { path = "rove/vendor/quinn-proto" }
 # Luau 745 (crates.io luau0-src 0.23.0+luau745): its compiler reuses dead
 # locals' registers, without which Place A' Weapons client (3k lines)
 # runs out of the 200 local registers. mlua-sys 0.13.0 is vendored only to

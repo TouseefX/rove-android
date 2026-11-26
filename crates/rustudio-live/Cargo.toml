@@ -12,9 +12,3 @@ rbx_dom_weak = "4"
 rbx_types = "3"
 serde_json = { version = "1", features = ["preserve_order"] }
 rustc-hash = "2"
-base64 = "0.22"
-
-# rove decodes the wire; this crate never does. `rove-client-core` is a
-# workspace member (its transport feature stays off: the live session owns
-# that, and the transport brings a second rustls/sha2 major).
-rove-client-core = { path = "../../rove/client-core" }

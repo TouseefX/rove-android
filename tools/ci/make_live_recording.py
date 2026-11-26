@@ -8,12 +8,12 @@ the byte layout rove's decoder reads — the layout rove's own schema tests
 encode (`rove/client-core/src/schema.rs`, `fn schema_bytes`):
 zstd frames, LEB128 varints, little-endian class/property ids.
 
-The session it writes is a small place: a Workspace holding an anchored Part,
-then (as a player joins) a Player whose Character arrives as a bare id with its
-parent set afterwards, a Humanoid inside it, and finally the Part is destroyed —
-so the replay proves not just that creates and sets arrive, but that a child may
-arrive before its parent, that a parent edge can be a later `set`, and that a
-removal forgets the ids it destroyed.
+What it writes so far is the schema packet: one class (Part) with two
+properties, the ids rove's decoder assigns. The replication packets that make
+the place — a Workspace holding an anchored Part, a Player whose Character
+arrives before its parent edge, and the Part removed — are what M2 adds next;
+the actions the bridge applies are already tested against that vocabulary in
+crates/rustudio-live/src/live.rs.
 
 Usage (writes the fixture in place):
 

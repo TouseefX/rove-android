@@ -12,15 +12,13 @@
 //! `WorldStore` normalises replication into, and [`world::build`] makes the
 //! document from it in one pass.
 //!
-//! The live half is M2: [`live::Live`] applies rove's replication as it
-//! arrives — a create, a set, a parent edge, a remove — to a world that is
-//! already being drawn, and [`session::Session`] owns rove's decoder so the
-//! packets are read by rove's own code instead of a second copy of it. Both
-//! halves share [`snapshot::ValueConverter`] and the id ⇄ `Ref` map.
-//!
-//! [`replay`] is how the live half is evidenced without a network: a recording
-//! of the payloads one connection received, fed to rove's decoder and applied,
-//! so a bug in the bridge is reproduced from a file rather than from Roblox.
+//! The live half is M2: [`live::Live`] applies replication as it arrives — a
+//! create, a set, a parent edge, a remove — to a world that is already being
+//! drawn, in rove's own action vocabulary (`create`/`set`/`remove`/`event`).
+//! It shares [`snapshot::ValueConverter`] and the id ⇄ `Ref` map with the
+//! offline half, so a value or an id means the same thing whichever way it
+//! arrived.
+
 //!
 //! The rules this crate keeps (docs/LIVE-JOIN.md):
 //!
@@ -35,8 +33,6 @@
 //! - classes come from `api-dump.json`, not from a list in this crate.
 
 pub mod live;
-pub mod replay;
-pub mod session;
 pub mod snapshot;
 pub mod world;
 

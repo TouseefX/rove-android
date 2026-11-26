@@ -126,9 +126,6 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        view at the window's size (no FILE-<t>s.view.png; the
                        .frames.json / .cursor.json beside it as in the editor)
   --play-only          --no-ui --play
-  --live-recording FILE
-                      replay a recorded live session through rove's decoder and
-                      open the world it builds (the M2 live path, offline)
   --live-snapshot FILE a live session's world snapshot (rove's WorldStore JSON,
                        as a phone captured it): the bridge (crates/rustudio-live)
                        builds the client DataModel from it — rove ids become
@@ -715,9 +712,6 @@ pub fn run() -> eframe::Result<()> {
         rustudio_core::studio_content::spawn_background_install_if_missing();
     }
     let mut open: Option<PathBuf> = None;
-    // A recorded live session to replay (--live-recording), handled before
-    // `open` because it makes its own world rather than reading a place.
-    let mut recording: Option<PathBuf> = None;
     let mut screenshot: Option<PathBuf> = None;
     let mut selftest: Option<PathBuf> = None;
     let mut ui_shots: Option<PathBuf> = None;
@@ -1128,15 +1122,6 @@ pub fn run() -> eframe::Result<()> {
                 }
             }
             "--demo" => demo = true,
-            "--live-recording" => {
-                // A recorded live session is replayed through rove's decoder
-                // (src/app.rs open_live_recording), not opened as a place.
-                recording = args.next().map(PathBuf::from);
-                if recording.is_none() {
-                    eprintln!("--live-recording: a file is needed");
-                    std::process::exit(2);
-                }
-            }
             "--live-snapshot" => {
                 // The document is built from the snapshot, not opened as a
                 // place (src/app.rs open_world_snapshot).
@@ -1182,10 +1167,6 @@ pub fn run() -> eframe::Result<()> {
         std::process::exit(2);
     }
     // The screenshot shows the editor with something in it to look at.
-    // A recording replays into the app's document, so it takes the same route a
-    // place does (`open`), with the intercept in src/app.rs open_path deciding
-    // what to make of the file.
-    let open = open.or(recording);
     if screenshot.is_some() && open.is_none() {
         demo = true;
     }
