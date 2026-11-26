@@ -74,7 +74,7 @@ jobs:
       - name: Bridge tests (a rove snapshot in, a DataModel out)
         run: |
           set +e
-          cargo test -p rustudio-live --message-format=short -- --nocapture 2>&1 | tee /tmp/live-tests.log
+          cargo test -p rustudio-live --locked --message-format=short -- --nocapture 2>&1 | tee /tmp/live-tests.log
           status=${PIPESTATUS[0]}
           set -e
           echo "--- summary:"
@@ -90,7 +90,7 @@ jobs:
       - name: Build the player
         run: |
           set +e
-          cargo build --release -p rustudio --message-format=short 2>&1 | tee /tmp/build.log
+          cargo build --release --locked -p rustudio --message-format=short 2>&1 | tee /tmp/build.log
           status=${PIPESTATUS[0]}
           set -e
           if [ "$status" -ne 0 ]; then

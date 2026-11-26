@@ -4231,6 +4231,7 @@ dependencies = [
  "rustudio-account",
  "rustudio-core",
  "rustudio-engine",
+ "rustudio-live",
  "rustudio-net",
  "rustudio-physics",
  "rustudio-player",
@@ -4342,6 +4343,18 @@ dependencies = [
  "tungstenite",
  "ureq",
  "zstd",
+]
+
+[[package]]
+name = "rustudio-live"
+version = "0.5.2"
+dependencies = [
+ "log",
+ "rbx_dom_weak",
+ "rbx_types",
+ "rustc-hash 2.1.3",
+ "rustudio-core",
+ "serde_json",
 ]
 
 [[package]]
