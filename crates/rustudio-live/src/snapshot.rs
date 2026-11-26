@@ -337,9 +337,13 @@ impl ValueConverter {
                     J::Array(_) => return via_place_value(class, property, inner),
                     _ => return Err(format!("$faces wants a byte, an object or a list of faces {}", ctx())),
                 }
-                // from_bits is a Result, not an Option: a bit outside the six
-                // faces is a wrong world, said by name.
-                Variant::Faces(Faces::from_bits(bits).map_err(|_| format!("$faces has an invalid bit set {}: {bits}", ctx()))?)
+                // from_bits answers None for a bit outside the six faces
+                // (project_values' own reader `?`s it in an Option function):
+                // a wrong world, said by name rather than clipped.
+                Variant::Faces(
+                    Faces::from_bits(bits)
+                        .ok_or_else(|| format!("$faces has an invalid bit set {}: {bits}", ctx()))?,
+                )
             }
             "$enum" => match inner {
                 J::Number(_) => Variant::Enum(Enum::from_u32(
@@ -399,12 +403,15 @@ fn via_place_value(class: &str, property: &str, v: &J) -> Result<Variant, String
 }
 
 /// A value for an error line: a big blob does not belong in a log.
+///
+/// Cut on a character boundary, never a byte one: a property whose text is not
+/// ASCII must not panic the build while it is being reported.
 fn short(v: &J) -> String {
+    const LIMIT: usize = 120;
     let s = v.to_string();
-    if s.len() <= 120 {
-        s
-    } else {
-        format!("{}…", &s[..120])
+    match s.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s,
     }
 }
 
