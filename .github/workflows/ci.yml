@@ -74,7 +74,7 @@ jobs:
             # reads as noise in an annotation.
             plain=$(mktemp)
             sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" \
-              | grep -vE '^$|generated [0-9]+ warning|^ *$|^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain"
+              | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain"
             echo "--- first lines"
             head -5 "$plain" | sed 's/^/::error::log: /'
             echo "--- last lines"
@@ -125,7 +125,7 @@ jobs:
             # reads as noise in an annotation.
             plain=$(mktemp)
             sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" \
-              | grep -vE '^$|generated [0-9]+ warning|^ *$|^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain"
+              | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain"
             echo "--- first lines"
             head -5 "$plain" | sed 's/^/::error::log: /'
             echo "--- last lines"
