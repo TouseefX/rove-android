@@ -49,16 +49,27 @@ for i, line in enumerate(lines):
     if m and not line.strip().startswith("="):
         found.append(("error", None, None, m.group("msg")))
 
-print("annotate: %d diagnostic(s) in %s (page %d)" % (len(found), path, page))
 
-page_items = found[page * PER_PAGE : (page + 1) * PER_PAGE]
-if not page_items:
-    # Nothing that looks like a diagnostic: the failure was not one line of
-    # rustc output (a cargo manifest error, a linker, a runner). Emit the tail
-    # of the log as annotations instead, page by page, so it can be read back.
-    tail = [l for l in lines if l.strip()][-40:]
-    page_items = [("error", None, None, line[:900]) for line in tail[page * PER_PAGE : (page + 1) * PER_PAGE]]
-    print("annotate: no rustc diagnostics; tail page %d of %d line(s)" % (page, len(tail)))
+# Pages are emitted in order and only the first ones are sure to be read, so
+# the order is: the compiler's own diagnostics, then the end of the log (a
+# test that panicked prints no `file:line:col:` line at all — its FAILED list
+# and "test result:" line are the end of the output).
+diag_pages = (len(found) + PER_PAGE - 1) // PER_PAGE
+tail = [line for line in lines if line.strip()][-60:][::-1]
+
+if page < diag_pages:
+    page_items = found[page * PER_PAGE : (page + 1) * PER_PAGE]
+    print("annotate: diagnostics page %d of %d" % (page + 1, diag_pages))
+    if page == 0:
+        print("annotate: %d diagnostic(s) in %s" % (len(found), path))
+else:
+    tail_page = page - diag_pages
+    page_items = [
+        ("error", None, None, line[:900])
+        for line in tail[tail_page * PER_PAGE : (tail_page + 1) * PER_PAGE]
+    ]
+    print("annotate: end of the log, page %d (%d line(s))" % (tail_page + 1, len(page_items)))
+
 for level, file, line, msg in page_items:
     msg = msg[:900]
     if file and line:
