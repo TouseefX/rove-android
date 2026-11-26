@@ -8,29 +8,31 @@ name: Live world
 #
 # The numbers matter more than the picture: an artifact cannot be read back
 # from here, so every measurement is printed into the log — the bridge's own
-# report (nodes, instances, refs bound, refusals), the frame statistics from
-# `--result`, and the size of each PNG written. An assertion that fails (no
-# fixture world, no frames, no picture) fails the job.
+# report (nodes, instances, refs bound, refusals), frame statistics from
+# `--bench`, and the size of each PNG written. tools/ci/m1_acceptance.py is
+# the assertion step.
 
 on:
   push:
-    branches: ['**']
+    branches: ["**"]
     paths:
       - "crates/rustudio-live/**"
-      - "crates/rustudio-player/**"
       - "crates/rustudio-core/**"
       - "crates/rustudio-engine/**"
+      - "crates/rustudio-player/**"
       - "crates/rustudio-render/**"
+      - "crates/rustudio-physics/**"
       - "src/**"
       - "Cargo.toml"
-      - "Cargo.lock"
       - "build.rs"
       - "rove/tests/fixtures/**"
+      - "tools/ci/**"
       - ".github/workflows/live.yml"
   pull_request:
     paths:
       - "crates/rustudio-live/**"
       - "rove/tests/fixtures/**"
+      - "tools/ci/**"
       - ".github/workflows/live.yml"
   workflow_dispatch:
 
@@ -69,21 +71,22 @@ jobs:
 
       # The bridge's own tests first: a broken conversion fails here in a
       # minute, not after a long build.
-      - name: Bridge tests (rove snapshot in, DataModel out)
+      - name: Bridge tests (a rove snapshot in, a DataModel out)
         run: |
           set -o pipefail
-          cargo test -p rustudio-live --locked -- --nocapture 2>&1 | tee /tmp/live-tests.log
+          cargo test -p rustudio-live -- --nocapture 2>&1 | tee /tmp/live-tests.log
           echo "--- summary:"
           grep -E "^(test result|running)" /tmp/live-tests.log
 
       - name: Build the player
-        run: cargo build --release --locked -p rustudio
+        run: cargo build --release -p rustudio
 
       # --headless: no window and no compositor (frames are drawn to an
-      # offscreen target and read back — src/offscreen.rs), so this needs no
-      # gamescope and no Xvfb. --live-snapshot opens the snapshot as the
-      # document (src/app.rs open_world_snapshot); --no-ui leaves the scene
-      # alone; --fixed-dt makes the frame clock the process's own.
+      # offscreen target and read back — the offscreen path in the player), so
+      # this needs no gamescope and no Xvfb. --live-snapshot opens the snapshot
+      # as the document (src/app.rs open_world_snapshot); --no-ui leaves the
+      # scene alone; --fixed-dt makes the frame clock the process's own; --log
+      # writes the Output lines the report is read from.
       - name: Render the fixture world (headless)
         timeout-minutes: 20
         run: |
@@ -101,43 +104,13 @@ jobs:
               --fixed-dt 0.0166667 \
               --result out/live-world.json \
               --log out/live-world.log \
-            > out/run.log 2>&1 || { echo "--- the run failed; log:"; tail -120 out/run.log; exit 1; }
+            > out/run.log 2>&1 || { echo "--- the run failed; log:"; tail -150 out/run.log; exit 1; }
           echo "--- run log (tail):"
           tail -40 out/run.log || true
 
-      # Everything a person or a later run needs, as text.
-      - name: Numbers
-        run: |
-          set -euo pipefail
-          echo "=== files ==="
-          ls -l out/ || true
-          echo
-          echo "=== picture ==="
-          python3 - <<'PY'
-import glob, os, struct
-for path in sorted(glob.glob("out/*.png")):
-    with open(path, "rb") as f:
-        head = f.read(33)
-    if head[:8] != b"\x89PNG\r\n\x1a\n":
-        print(f"{path}: not a PNG")
-        continue
-    width, height = struct.unpack(">II", head[16:24])
-    print(f"{path}: {os.path.getsize(path)} bytes, {width}x{height}")
-PY
-          echo
-          echo "=== bridge report (Output lines) ==="
-          grep -h "rustudio-live" out/live-world.log out/run.log 2>/dev/null || echo "(no report line found)"
-          echo
-          echo "=== --result ==="
-          cat out/live-world.json || { echo "no --result file"; exit 1; }
-          echo
-          echo "=== bench sections in the log (if any) ==="
-          grep -hE "^(APITOTAL|APISECT|HITCH)" out/*.log 2>/dev/null | head -20 || true
-
-      # The same scene timed: `--bench` prints its report to stdout (the JSON
-      # the numbers are read from) and writes it beside the shots. The mean and
-      # 1%-low frame times here are the M1 "stable FPS" evidence; this runner
-      # draws with lavapipe, a CPU rasteriser, so treat the number as a floor.
+      # The same scene timed. --bench prints its report to stdout and writes it
+      # beside the shots; this runner draws with lavapipe, a CPU rasteriser, so
+      # the number is a floor, not the phone's.
       - name: Frame statistics (--bench)
         timeout-minutes: 20
         run: |
@@ -148,77 +121,18 @@ PY
               --bench out/bench.json \
               --seconds 5 \
               --fixed-dt 0.0166667 \
-            > out/bench.stdout.log 2>&1 || { echo "--- bench failed; log:"; tail -60 out/bench.stdout.log; exit 1; }
+            > out/bench.stdout.log 2>&1 || { echo "--- bench failed; log:"; tail -80 out/bench.stdout.log; exit 1; }
           echo "=== bench report (stdout) ==="
           cat out/bench.stdout.log
           echo
           echo "=== frame statistics, one line ==="
-          python3 - <<'PY2'
-import json, os
-path = "out/bench.json"
-if not os.path.exists(path):
-    print("no bench.json"); raise SystemExit(1)
-b = json.load(open(path))
-f = b.get("frame_ms") or {}
-w = b.get("work_ms") or {}
-print(f"frames {int(b.get('frames', 0))}  frame_ms median {f.get('median')} p99 {f.get('p99')} max {f.get('max')}"
-      f"  work_ms median {w.get('median')}")
-for key in ("gameplay_lua", "physics", "render"):
-    if key in b:
-        print(f"{key}: {json.dumps(b[key])[:400]}")
-PY2
+          python3 tools/ci/bench_line.py out/bench.json
 
-      # The acceptance criteria, in the job's own language.
-      - name: Acceptance
+      # Everything a person or a later run needs, as text, then the verdict.
+      - name: Numbers and acceptance
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-import glob, json, os, sys
-
-failed = []
-def check(ok, what):
-    print(("PASS  " if ok else "FAIL  ") + what)
-    if not ok:
-        failed.append(what)
-
-if not os.path.exists("out/live-world.json"):
-    print("FAIL  no --result file")
-    sys.exit(1)
-r = json.load(open("out/live-world.json"))
-live = r.get("live_world") or {}
-
-# 1. The bridge built rove's world, not an empty document.
-check(live.get("nodes") == 7, f"snapshot has 7 nodes (got {live.get('nodes')})")
-check(live.get("instances") == 8, f"document has 8 instances incl. the root (got {live.get('instances')})")
-check(bool(live.get("local_player")), "Players.LocalPlayer bound")
-check(live.get("refs_bound", 0) >= 2, f"LocalPlayer and Player.Character bound (got {live.get('refs_bound')})")
-check(live.get("dangling_refs") == 0, "no ref into nowhere")
-check(live.get("refused_values") == 0, "no value kept its default")
-check((live.get("root_classes") or [])[:1] == ["Workspace"], f"Workspace is at the root (got {live.get('root_classes')})")
-
-# 2. The picture: a file that is a drawn scene, not a stub.
-pngs = sorted(p for p in glob.glob("out/*.png") if not p.endswith(".view.png"))
-check(len(pngs) >= 1, f"a screenshot was written (got {pngs})")
-for p in pngs:
-    size = os.path.getsize(p)
-    check(size > 20_000, f"{p} is a drawn scene, not an empty frame ({size} bytes)")
-
-# 3. Frames were drawn, and their statistics are numbers.
-frames = r.get("frames") or {}
-count = frames.get("count", 0)
-mean = frames.get("mean_ms") or 0
-check(count > 10, f"frames drawn (got {count})")
-check(0 < mean < 1000, f"mean frame time is a number: {mean:.2f} ms")
-
-# 4. Nothing errored.
-check(r.get("errors", 0) == 0, f"no error lines in the Output (got {r.get('errors')})")
-
-print()
-if failed:
-    print(f"{len(failed)} check(s) failed")
-    sys.exit(1)
-print("all checks passed")
-PY
+          python3 tools/ci/m1_acceptance.py out
 
       - name: Upload the picture and the numbers
         if: always()
