@@ -22,12 +22,22 @@ zstd = "=0.13.4"
 blake2 = "=0.10.6"
 libc = "=0.2.191"
 getrandom = "=0.3.4"
-tokio = { version = "=1.50.0", optional = true, features = ["rt", "net", "macros", "sync", "time", "io-util"] }
+tokio = { version = "=1.54.1", optional = true, features = ["rt", "net", "macros", "sync", "time", "io-util"] }
 quinn-proto = { version = "=0.11.19", optional = true, default-features = false }
 quinn = { version = "=0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "=0.23.37", optional = true, default-features = false, features = ["ring", "std"] }
+# Three of the exact pins above are raised to the versions the rest of this
+# workspace already builds against (rustls 0.23.46, tokio 1.54.1, bytes 1.12.1),
+# because rove's own pins do not merely lower them:
+# - rustls =0.23.37 leaves no selected version for the root's vendor/rustls
+#   patch (0.23.46) to replace, so the RbxTransport TLS extension 0xff00 —
+#   accepted code, rustudio-net transport.rs:204 — stops existing, and
+#   rustudio-account's ureq path loses ConfigBuilder::timeout_per_read with it;
+# - ureq is what loses it: 3.5.0 needs the newer rustls, so the resolver fell
+#   back to 3.4.2, which has no per-read timeout.
+# The pins stay exact; only their values match this workspace.
+rustls = { version = "=0.23.46", optional = true, default-features = false, features = ["ring", "std"] }
 sha2 = { version = "=0.10.9", optional = true }
-bytes = { version = "=1.11.0", optional = true }
+bytes = { version = "=1.12.1", optional = true }
 wtransport = { path = "../vendor/wtransport", optional = true, default-features = false, features = ["ring", "quinn"] }
 
 [target.'cfg(windows)'.dependencies]
