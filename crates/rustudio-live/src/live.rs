@@ -352,7 +352,7 @@ impl Live {
         // instances that no longer exist, or a later `$ref` binds a dead ref.
         // `descendants` yields `&Instance` (the ref is `referent()`), and a
         // whole map is dropped per batch rather than per instance.
-        let doomed: Vec<Ref> = doc.dom.descendants(r).map(|i| i.referent()).collect();
+        let doomed: Vec<Ref> = doc.dom.descendants_of(r).map(|i| i.referent()).collect();
         for d in &doomed {
             if let Some(id) = self.refs.remove(d) {
                 self.ids.remove(&id);
