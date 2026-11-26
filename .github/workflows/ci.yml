@@ -69,11 +69,15 @@ jobs:
               python3 tools/ci/annotate.py "$log" "$page" || true
             done
             # No diagnostic and no FAILED line means the log itself is the only
-            # evidence, and the annotations are the only channel back.
-            if ! grep -qE "FAILED|panicked at|^error" "$log"; then
-              tail -12 "$log" | while IFS= read -r line; do
-                echo "::error::log tail: $line"
-              done
+            # evidence, and the annotations are the only channel back. A short
+            # log is quoted whole: at that size the one line that says what
+            # went wrong is cheaper to read than to pattern-match.
+            if ! grep -qE "FAILED|panicked at|^error|: error" "$log"; then
+              if [ "$(wc -l < "$log")" -le 200 ]; then
+                awk 'NF {print "::error::log: " $0}' "$log" | head -10
+              else
+                tail -12 "$log" | awk 'NF {print "::error::log tail: " $0}'
+              fi
             fi
           done
 
