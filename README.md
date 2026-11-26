@@ -1,48 +1,39 @@
-# rove
+# Rove — a native Roblox client for Android, in Rust
 
-a roblox client i'm working on in rust, using the official luau vm. it has world replication, scripting, local physics and a browser preview. the new engine bindings and vm host are in rust too.
+This repository is the native Android Roblox **client**: it joins a public
+place, renders the world, runs the client's Luau, moves a character and draws
+Roblox's own CoreGui. It is not an executor, not a script injector and not an
+editor front end; there is no anti-cheat bypass anywhere in it.
 
-### Stellar env logger
+It is two projects joined at a single seam:
 
-[Download the Windows x64 Player integration](stellar-sandbox/player/downloads/Rove-Stellar-Player-Windows-x64.zip). Extract the ZIP and run `.\rove-stellar.exe` in PowerShell for the logger commands. [Integration guide](stellar-sandbox/player/README.md)
+- **[rustudio](README-RUSTUDIO.md)** (this tree, outside `rove/`) — the client
+  shell: the Android app (`crates/rustudio-android`), the player viewport and
+  GUI (`crates/rustudio-player`), the renderer, physics, the DataModel
+  (`crates/rustudio-core`), the engine and its Luau runtime
+  (`crates/rustudio-engine`), and the asset/account/Android plumbing.
+- **[rove](rove/README-MIRROR.md)** (`rove/`) — the network backend reference,
+  pinned at `alexkkork/rove@70b24c3b7d94`: the gamejoin parsing for the current
+  join shape, the WebTransport/QUIC transport, the replication decoder and the
+  live-session state machine. Only its `client-core` and its session/transport
+  code are ported; its VM, executor shell, terminal and browser UI are not.
 
-### sunc update
+The seam is a bridge that turns rove's replication into DataModel mutations
+through the same bounded, journalled path rustudio's own Play replication uses —
+one Luau VM, one world, one frame loop. Design and ground rules:
+[`docs/LIVE-JOIN.md`](docs/LIVE-JOIN.md); milestone notes:
+[`docs/M0-UNDERSTANDING.md`](docs/M0-UNDERSTANDING.md).
 
-more of the runtime is in rust now. this brings the latest scheduler fixes, script tracking, debug helpers, signals, and replicated property updates. there's also a terminal ui with game search, a luau console, and ram/ping graphs.
+## Building
 
-sunc compatibility is still being worked on. [test results and known issues](docs/sunc-update.md).
+Everything is built in CI; see `.github/workflows/android.yml` (APKs for
+arm64 and x86_64) and `.github/workflows/ci.yml` (desktop checks and the
+headless render harness). rustudio's own documentation —
+[`README-RUSTUDIO.md`](README-RUSTUDIO.md), `docs/DEVELOPING.md`,
+`docs/ANDROID.md` — describes the editor, the harness and the Android build
+in the detail it was written with.
 
-you'll need rust 1.88+, cmake and a c++17 compiler for the official vm. the rust host is the default build:
+## Licence
 
-on windows, use the msvc toolchain and visual studio c++ build tools, then run `.\build-windows.ps1`. [windows setup and commands](docs/windows.md) cover the executable, preview, and private console files.
-
-```sh
-cargo build --release --locked --manifest-path rust-client/Cargo.toml --bin rove
-rust-client/target/release/rove run --snapshot tests/fixtures/world_snapshot.json --script examples/hello.luau --json
-```
-
-that runs a tiny script against a local test world. for the browser preview:
-
-```sh
-rust-client/target/release/rove serve --snapshot tests/fixtures/world_snapshot.json
-```
-
-`client-core` holds the world and networking, `rust-client/src/rust_host` has the engine and host, `rust-runtime-sys` links the official vm, and `ui` has the preview. `animation-codec` decodes assets directly inside the rust client; [animation loading](docs/animation-loading.md) has a quick test.
-
-the old c++ host stays in `runtime` for comparison with `--no-default-features`. it is not compiled by the normal build. some legacy compatibility helpers are still unported; [the migration notes](docs/rust-host.md) list the gaps and the local engine smoke command.
-
-`--lightweight` is optional on live joins. it drops visual/audio asset properties to save ram, so scripts can't read those properties in that mode. this is still a work in progress.
-
-to run the rust tests:
-
-```sh
-cargo test --locked --manifest-path client-core/Cargo.toml --features transport-test
-cargo test --locked --manifest-path rust-client/Cargo.toml -- --test-threads=1
-cargo test --locked --manifest-path rust-runtime-sys/Cargo.toml --test vm_boundary
-```
-
-upstream code and notices are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
-
-for the terminal ui, see [terminal/README.md](terminal/README.md). the optional `decompile` helper needs the separately installed, pinned Tovek backend; its executable isn't included here.
-
-original rove code is licensed under [MIT](LICENSE), copyright (c) 2026 alexkkork. you can modify, redistribute and sell it; keep the copyright and license notice with copies or substantial portions. third-party code and assets keep their own licenses.
+rustudio: MIT OR Apache-2.0. rove: see `rove/LICENSE-rove`. Third-party
+notices: `rove/THIRD_PARTY.md` and rustudio's bundled crate licences.

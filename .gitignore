@@ -1,30 +1,23 @@
-# local stuff stays local
-/secrets/
-/outputs/
-/dist/
+# Build outputs (rustudio's tree).
 target/
-build/
-# this dependency calls its checked-in build scripts "build" too
-!/rust-runtime-sys/vendor/mlua-sys/build/
-!/rust-runtime-sys/vendor/mlua-sys/build/**
-node_modules/
+shots/
 __pycache__/
-.venv/
-.DS_Store
-*.py[cod]
-*.log
-*.pcap
-*.pcapng
-*.i64
-*.idb
-.env
-.env.*
-roblox-cookie*.txt
-discord-bot-token*.txt
-private-server-link*.txt
-/.rove-platform.json
+*.rbxlx.lock
+crates/rustudio-android/libs/**/*.so
 
-# only the public verification map belongs here
-/inputs/*
-!/inputs/bytecode-signature-v1-public.bin
-!/inputs/bytecode-signature-v1-public.json
+# Wine prefixes and Studio data folders checks leave behind: their links lead
+# out of the tree (dosdevices/z: is /), and cargo walks every file git doesn't
+# ignore the first time a profile builds ("failed to determine package
+# fingerprint ... Permission denied").
+checks/**/dosdevices/
+checks/**/waxley-data/
+
+# Generated probe output.
+tools/parity_probe/*/runs/
+tools/fidelity/truss/build.log
+tools/fidelity/truss/tests.log
+docs/fidelity/
+
+# rove: the vendor/ directories are checked in on purpose (see
+# rove/THIRD_PARTY.md), including inner build/ directories, so nothing here
+# may be excluded by a bare "build/" pattern.

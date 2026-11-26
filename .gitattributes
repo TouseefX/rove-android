@@ -4,10 +4,14 @@
 *.luac -text
 *.bin -text
 *.rbxp -text
-ui/avatar-viewer.js -whitespace linguist-generated=true
-ui/world-viewer.js -whitespace linguist-generated=true
+*.dex -text
+
+# Vendored crates and rove's fixtures are not our source; keep GitHub's
+# language statistics and diff rendering out of them.
 vendor/** -whitespace linguist-vendored=true
-runtime/vendor/** -whitespace linguist-vendored=true
-rust-runtime-sys/vendor/** -whitespace linguist-vendored=true
-vendor/roblox-player-scripts-745/** -text
-rust-client/vendor/** -whitespace linguist-vendored=true
+rove/vendor/** -whitespace linguist-vendored=true linguist-generated=true
+rove/rust-runtime-sys/vendor/** -whitespace linguist-vendored=true
+rove/rust-client/vendor/** -whitespace linguist-vendored=true
+rove/vendor/roblox-player-scripts-745/** -text
+checks/** linguist-documentation=true
+docs/** linguist-documentation=true
