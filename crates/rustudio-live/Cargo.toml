@@ -12,6 +12,9 @@ rbx_dom_weak = "4"
 rbx_types = "3"
 serde_json = { version = "1", features = ["preserve_order"] }
 rustc-hash = "2"
+
 # rove's decoder, from the vendored clone: the offline replay in tests/ decodes
-# recorded payloads with the same code the live path uses.
+# recorded payloads with the same code a live connection runs. Test-only: the
+# library itself takes rove's journal through the caller, not as a dependency.
+[dev-dependencies]
 rove-client-core = { path = "../../rove/client-core" }
