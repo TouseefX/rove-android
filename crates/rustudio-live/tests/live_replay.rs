@@ -10,8 +10,10 @@
 //! decoder is rove's — `rove-client-core`, the same code a live session runs —
 //! the bytes are a file, and what is asserted is rustudio's world afterwards.
 
-use rbx_dom_weak::types::{Variant, Vector3};
-use rbx_dom_weak::{Ref, WeakDom};
+// `Ref` lives under `types` in the vendored rbx_dom_weak 4.2 (live.rs imports it
+// the same way); the crate root has no `Ref`.
+use rbx_dom_weak::types::{Ref, Variant, Vector3};
+use rbx_dom_weak::WeakDom;
 use rove_client_core::session::{IngestOutcome, SessionCore};
 use rustudio_live::live::{ApplyStats, Live};
 use rustudio_live::snapshot::ValueConverter;
@@ -210,7 +212,7 @@ fn the_removal_takes_the_subtree_and_forgets_the_id() {
         let mut stack: Vec<Ref> = doc.root().children().to_vec();
         while let Some(r) = stack.pop() {
             let instance = doc.get_by_ref(r).expect("live ref");
-            if instance.class == "Part" {
+            if instance.class.as_str() == "Part" {
                 found.push(instance.name.clone());
             }
             stack.extend(instance.children().iter().copied());
