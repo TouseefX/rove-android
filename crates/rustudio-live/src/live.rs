@@ -881,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ref_field_binds_when_its_target_has_arrived_and_is_dropped_otherwise() {
+    fn a_ref_field_binds_when_its_target_has_arrived_and_is_held_otherwise() {
         let (mut doc, mut live) = empty_world();
         let mut conv = ValueConverter::default();
         live.apply(
@@ -890,21 +890,40 @@ mod tests {
                 "node": {"id": "3:1", "class_name": "Model", "properties": {"Name": "M"}}}))],
             &mut conv,
         );
-        // Target absent: counted, not bound.
+        // Target absent: **held**, not counted as an unknown id and not written
+        // as a ref into nowhere. This is the case that used to drop a
+        // `Player.Character` and every `Model.PrimaryPart` whose part was
+        // created by a later action, and the report from the phone listed 101
+        // of them. `bind_pending_refs` writes it when the target arrives.
         let stats = live.apply(
             &mut doc,
             &[action(serde_json::json!({"sequence": 2, "kind": "set", "id": "3:1",
                 "fields": {"PrimaryPart": {"$ref": "3:9"}}}))],
             &mut conv,
         );
-        assert_eq!(stats.unknown_ids, 1);
-        assert!(doc
-            .dom
-            .get_by_ref(live.referent("3:1").unwrap())
-            .unwrap()
-            .properties
-            .get(&ustr("PrimaryPart"))
-            .is_none());
+        assert_eq!(stats.unknown_ids, 0, "a late target is not an unknown id");
+        assert_eq!(live.refs_pending(), 1, "it is waiting for 3:9");
+        let model = live.referent("3:1").expect("the model");
+        // The property is `Ref::none()` while it waits: the DOM's own "unset",
+        // so nothing follows it into an instance that does not exist yet.
+        assert_eq!(
+            doc.prop(model, "PrimaryPart"),
+            Some(Variant::Ref(Ref::none())),
+            "held as an unset reference, not a ref into nowhere"
+        );
+        // And when the target arrives, the same batch writes it.
+        let stats = live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 3, "kind": "create", "id": "3:9",
+                "node": {"id": "3:9", "class_name": "Part", "parent": "3:1",
+                         "properties": {"Name": "Base"}}}))],
+            &mut conv,
+        );
+        assert_eq!(live.refs_pending(), 0, "settled");
+        assert_eq!(live.refs_bound(), 1);
+        assert!(stats.properties >= 1, "the held property was written: {stats:?}");
+        let part = live.referent("3:9").expect("the part");
+        assert_eq!(doc.prop(model, "PrimaryPart"), Some(Variant::Ref(part)));
     }
 
     #[test]
