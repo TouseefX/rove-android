@@ -168,9 +168,21 @@ asserts rustudio's world after the replay: the roots, a `Vector3` `Size` and a
 resolved, and the removal gone from the tree with its id forgotten. A truncated
 replication packet is refused by the decoder and counted, never half applied.
 
+**The order CI runs in.** The lock is the gate: `lockfile` (cargo fetch, minimal
+refresh, committed back on a push) is a `needs` of every building job, and each of
+them checks out `github.ref` rather than `github.sha`, because a refresh commit is
+one ahead of the commit that started the run. So one push resolves the lock and
+then builds the tree it describes — no dispatch, no second round trip. A pull
+request is the one case CI cannot fix (read-only token), and `lockfile` says so
+there instead of six jobs each failing on a lock they were told not to resolve.
+
+macOS is the long pole: about an hour, because it is the only runner that runs
+the whole test suite (`cargo test --workspace`). Nothing waits on it — every other
+job runs in parallel — but its verdict arrives long after the rest.
+
 **The run.** CI on this branch at the time of writing: `check (ubuntu-latest)`,
-`check (windows-latest)`, `linux-release`, `windows-release` and the `lockfile`
-job are green — the two checks compile the whole workspace including
+`check (windows-latest)`, `linux-release`, `windows-release`, `macos-app` and the
+`lockfile` job are green — the two checks compile the whole workspace including
 `rove-client-core` and `tests/live_replay.rs`, and the release jobs link the
 tests. The macOS jobs (the two `check`es and `macos-app`) sit in the runner
 backlog, which is where they were for M1 and the accepted M2 run as well. The
