@@ -258,6 +258,12 @@ impl Live {
         self.ids.insert(id.to_string(), r);
         self.refs.insert(r, id.to_string());
         stats.created += 1;
+        // A new instance is new to every reader of the document, not only to the
+        // one that made it: `Scene::sync` learns about changes from the journal's
+        // marks, so a create without a mark is an instance in the world that
+        // nothing draws. One mark for one subtree — never `mark_all`, which
+        // rebuilds the whole place.
+        doc.mark_tree(r);
         if parent_ref != doc.dom.root_ref() {
             stats.parents += 1;
         } else if let Some(parent) = wanted_parent {
@@ -314,10 +320,15 @@ impl Live {
             }
             match self.convert(property, &class, value, conv) {
                 Ok(v) => {
+                    let key = ustr(property);
                     if let Some(instance) = doc.dom.get_by_ref_mut(r) {
-                        instance.properties.insert(ustr(property), v);
+                        instance.properties.insert(key, v);
                         stats.properties += 1;
                     }
+                    // The mark is what tells the scene, the physics and the
+                    // Properties panel that this instance changed. Without it a
+                    // moving part is a part that never moves on screen.
+                    doc.mark_prop(r, key);
                 }
                 // `$ref`: a property that points at another instance (a
                 // Player's Character, a seat's Occupant). Resolved here, where
@@ -325,12 +336,12 @@ impl Live {
                 // not in the world yet.
                 Err(ConvertError::Ref(target)) => match self.ids.get(&target).copied() {
                     Some(target_ref) => {
+                        let key = ustr(property);
                         if let Some(instance) = doc.dom.get_by_ref_mut(r) {
-                            instance
-                                .properties
-                                .insert(ustr(property), Variant::Ref(target_ref));
+                            instance.properties.insert(key, Variant::Ref(target_ref));
                             stats.properties += 1;
                         }
+                        doc.mark_prop(r, key);
                     }
                     None => stats.unknown_ids += 1,
                 },
@@ -363,6 +374,10 @@ impl Live {
         // The subtree minus the instance itself, which `destroy` takes with it.
         stats.instances_removed += doomed.len().saturating_sub(1);
         if !doomed.is_empty() && r != doc.dom.root_ref() {
+            // Marked before the destruction: a reader that looks the ref up to
+            // find out what was there finds nothing once it is gone, so the
+            // scene is told first and re-checks the subtree while it can.
+            doc.mark_tree(r);
             doc.dom.destroy(r);
         }
     }
@@ -377,6 +392,9 @@ impl Live {
             Some(parent_ref) => {
                 if r != parent_ref && r != doc.dom.root_ref() {
                     doc.dom.transfer_within(r, parent_ref);
+                    // A move changes the tree, not a property: the old parent
+                    // has lost a child and the new one has gained one.
+                    doc.mark_tree(r);
                     stats.parents += 1;
                     self.waiting_for_parent.remove(id);
                 }

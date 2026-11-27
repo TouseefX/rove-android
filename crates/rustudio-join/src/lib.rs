@@ -44,6 +44,9 @@ pub mod login;
 // the live transport is, but what a session *does* with bytes is testable
 // everywhere, and that is the half the recording proves.
 pub mod session;
+// The handover that makes a join *stay* joined (M3): the document moves between
+// the session's thread and the renderer's instead of being copied or diffed.
+pub mod live_world;
 
 #[cfg(feature = "live")]
 pub mod http;

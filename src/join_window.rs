@@ -73,6 +73,26 @@ pub struct JoinWindow {
     /// (`crate::start_page::home`). Not persisted yet: a device's own record of
     /// what it played is enough for the card to be one tap.
     pub recent: Vec<crate::start_page::home::RecentJoin>,
+    /// The session's counters as of the last handover (M3): the overlay draws
+    /// these while the place keeps arriving, so a working session and a stalled
+    /// one never look the same.
+    pub live: Option<rustudio_join::live_world::Counters>,
+    /// When `live` was last written to the console: one line a second, not one
+    /// a frame.
+    live_logged_at: Option<Instant>,
+    /// The live handover, kept here (and not on `Join`) so the editor can hold
+    /// it after the join object is dropped: a stopped join still has a world.
+    live_world: Option<rustudio_join::live_world::LiveWorld>,
+    /// The editor's own half of a live session's world (M3): the same `Live`
+    /// the session applies with, so a delta means the same thing on both sides.
+    /// `None` until a live join starts, and dropped when one stops.
+    pub live_local: Option<rustudio_live::live::Live>,
+    /// The one reader of rove's tagged values, for the editor's half.
+    pub live_converter: rustudio_live::snapshot::ValueConverter,
+    /// How many instance writes the editor's half has made: the number that
+    /// says the two documents are in step, and that a session is *drawing*
+    /// rather than merely receiving.
+    pub live_applied: usize,
     /// A world was installed and the session it came from should be *played*:
     /// F5 is pressed on the tick after `set_document`, because Play reads the
     /// document and the join window must not hold the editor mutably while it
@@ -97,6 +117,12 @@ impl JoinWindow {
             show_text: false,
             copied_at: None,
             recent: Vec::new(),
+            live: None,
+            live_logged_at: None,
+            live_world: None,
+            live_local: None,
+            live_converter: Default::default(),
+            live_applied: 0,
             play_next_tick: false,
         }
     }
@@ -112,6 +138,103 @@ impl JoinWindow {
 }
 
 impl Editor {
+    /// Keep a live session's world in front of the person who joined (M3).
+    ///
+    /// Called every frame from the editor's own frame, whether or not the join
+    /// window is open — closing the window must not stop the place arriving, and
+    /// a world that only moved while a window was drawn would freeze the moment
+    /// someone started playing.
+    ///
+    /// What arrives is a batch of rove's journal actions, and it is applied here
+    /// with the same `Live` the session applies to its own copy. That is the
+    /// whole design: two documents, one delta stream, one implementation of what
+    /// a delta means. The instances written here are **marked**, so `Scene::sync`
+    /// redraws them and nothing else. `mark_all()` is never called on this path:
+    /// a full rebuild every frame is the opposite of a live session.
+    pub fn live_join_frame(&mut self) {
+        let Some(join) = self.join_win.join.as_ref() else {
+            return;
+        };
+        let Some(live) = join.live().cloned() else {
+            return;
+        };
+        // Nothing waiting: the common case, and the reason this is cheap enough
+        // to ask every frame.
+        if live.pending() == 0 {
+            self.join_win.live = Some(live.counters());
+            return;
+        }
+        // Taken in one go rather than batched by hand: the queue is already in
+        // journal order, and `Live` handles a create whose parent has not
+        // arrived (`attach_waiting`).
+        let batches = live.take();
+        // The editor's own `Live`, made once per session: it holds the id map
+        // between rove's `scope:index` names and this document's refs, and a
+        // fresh one per batch would lose every id it has already seen.
+        //
+        // Taken out of the window for the length of the loop and put back, so
+        // the borrow checker sees one mutable borrow of the editor at a time:
+        // `game.doc` is written while the `Live` that writes into it is in hand.
+        let mut live_local = self.join_win.live_local.take().unwrap_or_default();
+        let mut converter = std::mem::take(&mut self.join_win.live_converter);
+        let mut written = 0usize;
+        for batch in batches {
+            let stats = live_local.apply(&mut self.game.doc, &batch.actions, &mut converter);
+            written += stats.created + stats.properties + stats.removed;
+            self.join_win.live = Some(batch.counters);
+        }
+        self.join_win.live_local = Some(live_local);
+        self.join_win.live_converter = converter;
+        self.live_applied += written;
+        if !self.join_win.installed {
+            // The first instances are in the editor: from here on this is a
+            // place being played, not a join being watched.
+            self.join_win.installed = true;
+            if let Some(place) = self.join_win.place() {
+                self.remember_join(place, true);
+            }
+            self.info(format!(
+                "join: the world is here ({} instance(s)); it keeps arriving while you play",
+                self.game.doc.dom.len()
+            ));
+        }
+        self.live_join_overlay();
+    }
+
+    /// The overlay's line while a session runs: packets, instances, rows.
+    ///
+    /// Drawn into the console so it is in the log a person copies, once a second
+    /// — the console is a scrolling log, not a progress bar.
+    fn live_join_overlay(&mut self) {
+        let Some(counters) = self.join_win.live.clone() else {
+            return;
+        };
+        let due = self
+            .join_win
+            .live_logged_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+        if !due {
+            return;
+        }
+        self.join_win.live_logged_at = Some(Instant::now());
+        let dropped = self
+            .join_win
+            .live_world
+            .as_ref()
+            .map(|live| live.dropped())
+            .unwrap_or(0);
+        self.info(format!(
+            "join live: {} · {} written here{}",
+            counters.line(),
+            self.live_applied,
+            if dropped > 0 {
+                format!(" · {dropped} batch(es) dropped")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
     /// The join window, drawn over the editor while it is open.
     pub fn join_window(&mut self, ctx: &egui::Context) {
         // A joined world is installed on one frame and played on the next: F5
@@ -337,7 +460,12 @@ impl Editor {
             }
         }
         if install {
-            self.install_join_world();
+            // A button press on a session that is *live* means "show me the
+            // world now", and the world is already in the editor: the swap in
+            // `live_join_frame` put it there the moment the session had one.
+            if !self.join_win.installed {
+                self.install_join_world();
+            }
         }
         if play {
             // Deferred for the same reason the automatic path is: the install
@@ -372,13 +500,17 @@ impl Editor {
         // only sign of a successful session was a number in a report — the
         // place stayed empty until a button was found. The report still says
         // what happened, and the window stays up over the world.
-        if has_world && world_worth_opening(stats.as_ref()) {
+        // A live session has been showing the place since its first instance:
+        // there is nothing to install, and `installed` is already true.
+        if !self.join_win.installed && has_world && world_worth_opening(stats.as_ref()) {
             self.install_join_world();
-            // A joined place is played, not opened as a project: the person
-            // pressed Join on someone else's place, and the thing that says the
-            // join worked is their character standing in it.
-            self.join_win.play_next_tick = true;
         }
+        // A *bounded* join (M2) is played when it finishes: the place arrived in
+        // one piece and the session is over, so F5 on the result is what shows
+        // it working. A live session is not played that way — the world it draws
+        // is the server's, still changing under it, and pressing F5 would copy
+        // it into a *local* server DataModel that the server knows nothing
+        // about. A live join keeps the world in the editor and keeps it live.
         if let Some(place) = self.join_win.place() {
             if !self.join_win.recent.iter().any(|r| r.place_id == place) {
                 self.remember_join(place, self.join_win.installed);
@@ -395,14 +527,48 @@ impl Editor {
     fn start_join(&mut self, place: u64) {
         self.join_win.place_text = place.to_string();
         self.join_win.open = true;
-        self.join_win.join = Some(rustudio_join::join::start(
+        // A live session: no deadline (`0`), and a world handover so the place
+        // is drawn from the first instance the server sends rather than after a
+        // session has ended. M2's bounded join — thirty seconds, then the world
+        // — is still reachable for a harness (`RUSTUDIO_JOIN_SECONDS`), and is
+        // what a report is taken from.
+        let seconds = std::env::var("RUSTUDIO_JOIN_SECONDS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let live = rustudio_join::live_world::LiveWorld::new();
+        self.join_win.live_world = Some(live.clone());
+        self.join_win.live = None;
+        self.join_win.live_logged_at = None;
+        // A new session's deltas describe a world built from nothing, so the
+        // editor's half starts from nothing too. Carrying the id map across
+        // would bind this session's `scope:index` to the previous one's refs.
+        self.join_win.live_local = Some(Default::default());
+        self.join_win.live_converter = Default::default();
+        self.join_win.live_applied = 0;
+        // The world the deltas are applied to has to be the one they were built
+        // against: a session starts from an empty DataModel, so the editor's
+        // document is emptied the same way. `Document::empty()` and not
+        // `set_document`, which also tears down the project, the tabs and the
+        // selection — a join is not a file being opened, and the place it
+        // replaces is a scratch one until the server's arrives.
+        self.game.doc = rustudio_core::doc::Document::empty();
+        self.join_win.join = Some(rustudio_join::join::start_live(
             place,
-            SESSION_SECONDS,
+            seconds,
             cookie_source(),
+            Some(live),
         ));
         self.join_win.started = Some(Instant::now());
         self.join_win.installed = false;
-        self.info(format!("join {place}: signing in"));
+        self.info(format!(
+            "join {place}: signing in (the place arrives while it runs{})",
+            if seconds == 0 {
+                String::new()
+            } else {
+                format!(", for at most {seconds} s")
+            }
+        ));
     }
 
     /// Remember a place this device joined, newest first, one entry per place.
@@ -422,6 +588,12 @@ impl Editor {
     }
 
     /// Install the world a finished session built into the editor.
+    ///
+    /// The end of a *bounded* join (M2): the session collected the place and
+    /// hands it over once. A live session's world is already being drawn — its
+    /// handover has been swapping it in every frame — so this is only reached
+    /// when there is nothing to swap and the session has ended, which is the
+    /// one case where `take_document` still has a place in it.
     fn install_join_world(&mut self) {
         // Both taken before anything else touches `self`: `join` borrows the
         // window, and `set_document` needs the editor mutably.

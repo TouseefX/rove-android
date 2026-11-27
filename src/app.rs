@@ -2871,6 +2871,12 @@ impl RustudioApp {
         }
         ed.project_windows(&ctx);
         ed.sync_explorer_to_selection();
+        // A live join's world changes hands *before* the scene reads it, so a
+        // session that arrived this frame is in the frame being drawn. Doing it
+        // after would show every update one frame late for as long as the
+        // session ran. (M3; without the feature there is no live join.)
+        #[cfg(feature = "live")]
+        ed.live_join_frame();
         {
             let _p = rustudio_core::bench::scope("scene_sync");
             ed.game.scene.sync(&mut ed.game.doc);

@@ -134,7 +134,14 @@ pub struct Join {
     shared: Arc<Mutex<Shared>>,
     /// The session's document, once there is one. `None` until then, so a
     /// caller can wait for a world before replacing what it shows.
+    ///
+    /// For a *live* join this is the fallback, not the path: `handover` carries
+    /// the world every frame the session runs, and this holds it only when the
+    /// session has ended.
     document: Arc<Mutex<Option<rustudio_core::doc::Document>>>,
+    /// The world handover, for a caller that draws while the session runs
+    /// (M3). `None` for a bounded join, which has nothing to hand over.
+    handover: Option<crate::live_world::LiveWorld>,
 }
 
 impl Join {
@@ -170,6 +177,13 @@ impl Join {
             .unwrap_or(false)
     }
 
+    /// The live world channel, for a caller that applies the deltas and asks
+    /// for a stop. Cloned rather than borrowed: the editor needs it while it
+    /// also holds `self` mutably, and it is an `Arc` handle.
+    pub fn live(&self) -> Option<crate::live_world::LiveWorld> {
+        self.handover.clone()
+    }
+
     /// The world the session built, if it has one worth showing.
     ///
     /// Taken rather than borrowed: the caller installs it into its editor, and
@@ -190,6 +204,20 @@ pub fn start(
     seconds: u64,
     cookie: impl FnOnce() -> Option<String> + Send + 'static,
 ) -> Join {
+    start_live(place_id, seconds, cookie, None)
+}
+
+/// Join and stay joined: the same session, with a world handover so a caller can
+/// draw it while it runs (M3).
+///
+/// `seconds` is a bound, not a length: `0` runs until the connection ends or the
+/// caller asks it to stop through [`Join::live`].
+pub fn start_live(
+    place_id: u64,
+    seconds: u64,
+    cookie: impl FnOnce() -> Option<String> + Send + 'static,
+    handover: Option<crate::live_world::LiveWorld>,
+) -> Join {
     let shared = Arc::new(Mutex::new(Shared {
         report: Report::begin(place_id),
         stats: Stats::default(),
@@ -198,9 +226,17 @@ pub fn start(
     let document = Arc::new(Mutex::new(None));
     let worker_shared = Arc::clone(&shared);
     let worker_document = Arc::clone(&document);
+    let worker_handover = handover.clone();
 
     std::thread::spawn(move || {
-        let outcome = run(place_id, seconds, cookie, &worker_shared, &worker_document);
+        let outcome = run(
+            place_id,
+            seconds,
+            cookie,
+            &worker_shared,
+            &worker_document,
+            worker_handover,
+        );
         let mut shared = match worker_shared.lock() {
             Ok(shared) => shared,
             Err(_) => return,
@@ -216,7 +252,11 @@ pub fn start(
         log::info!("join {}: {}", place_id, shared.report.stage);
     });
 
-    Join { shared, document }
+    Join {
+        shared,
+        document,
+        handover,
+    }
 }
 
 fn run(
@@ -225,6 +265,7 @@ fn run(
     cookie: impl FnOnce() -> Option<String>,
     shared: &Mutex<Shared>,
     document: &Mutex<Option<rustudio_core::doc::Document>>,
+    handover: Option<crate::live_world::LiveWorld>,
 ) -> Result<(), String> {
     // 1. Sign in. The value is used here and nowhere else.
     let mut account = match cookie() {
@@ -347,6 +388,10 @@ fn run(
         .build()
         .map_err(|_| "the transport runtime could not be started".to_owned())?;
     let mut world = session::Session::new();
+    // The world goes to the caller as it is built, when there is somewhere to
+    // put it (M3). Without one the session collects the place and this hands it
+    // over at the end, exactly as M2 did.
+    world.handover = handover.clone();
     let seen = shared.clone();
     let ran = runtime.block_on(async {
         // `session::run` reports the stage it reached even when it fails, so
@@ -465,9 +510,26 @@ fn run(
         .collect();
     // The world is handed over before the counters: a caller that sees a
     // finished report can then take a consistent document.
-    let place = world.take_document();
-    if let Ok(mut slot) = document.lock() {
-        *slot = Some(place);
+    //
+    // A live session has already given its world away — the caller has been
+    // drawing it for as long as the session ran — so there is nothing left to
+    // take here, and taking it would replace a world the caller is using with
+    // an empty one. `document` stays for the bounded join (M2), where the place
+    // genuinely does arrive at the end.
+    if let Some(live) = handover {
+        // A live session has been publishing deltas the whole time, and the
+        // editor has been applying them: there is no document to hand over at
+        // the end. Taking it here would only empty a world the editor is
+        // already drawing, so the final counters are what says the session is
+        // over.
+        let _ = world.take_document();
+        live.set_counters(world.overlay_counters());
+        let _ = document;
+    } else {
+        let place = world.take_document();
+        if let Ok(mut slot) = document.lock() {
+            *slot = Some(place);
+        }
     }
     if let Ok(mut shared) = shared.lock() {
         shared.stats = Stats {

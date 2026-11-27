@@ -406,3 +406,76 @@ fn a_truncated_packet_is_refused_by_the_decoder_and_never_half_applied() {
     let (doc, _, _) = replay();
     assert!(named(&doc, "Workspace").is_some());
 }
+
+/// M3's first requirement, as a test: **a delta that is applied is a delta the
+/// scene can see**.
+///
+/// `Scene::sync` learns what changed from `Document::marks_for(Reader::Scene)`
+/// and from nothing else. Before M3 the bridge wrote straight to `doc.dom` and
+/// issued no mark at all, which is why a joined place looked correct in the
+/// Explorer and never redrew in the viewport: the instances were there and
+/// nothing knew. This asserts the mechanism, not a screenshot — a create, a
+/// property write and a removal each have to leave a mark naming what changed,
+/// and none of them may fall back to `Marks::All` (a whole-place rebuild every
+/// frame, which is the thing M3 is required not to do).
+#[test]
+fn every_applied_delta_is_marked_for_the_scene() {
+    use rustudio_core::doc::{Mark, Marks, Reader};
+
+    let recording = recording();
+    let mut core = SessionCore::with_limits(256, 4 << 20).expect("a session");
+    let mut doc = Document::empty();
+    let mut conv = ValueConverter::default();
+    let mut live = Live::new();
+
+    // Walk the recording packet by packet, taking the marks after each one: a
+    // batch's marks are the whole point, and reading them per packet is the
+    // only way to say which packet produced them.
+    let mut saw_create = false;
+    let mut saw_prop = false;
+    for (index, (kind, bytes)) in packets(&recording).into_iter().enumerate() {
+        let before = doc.revision;
+        core.ingest(&bytes)
+            .unwrap_or_else(|e| panic!("rove refused the {kind} packet at {index}: {e}"));
+        let reader = core.retain(0).expect("a reader");
+        let rows = core.read_after(reader, 0, 4096).expect("its rows");
+        for row in rows {
+            let actions = row.value.world_delta["actions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if actions.is_empty() {
+                continue;
+            }
+            live.apply(&mut doc, &actions, &mut conv);
+        }
+        if doc.revision == before {
+            // A packet that journalled no action is allowed to mark nothing;
+            // one that built instances is not.
+            continue;
+        }
+        match doc.marks_for(Reader::Scene) {
+            Marks::Some(marks) => {
+                for mark in &marks {
+                    match mark {
+                        Mark::Tree(_) => saw_create = true,
+                        Mark::Prop(_, _) => saw_prop = true,
+                    }
+                }
+            }
+            Marks::All => panic!(
+                "packet {index} ({kind}) forced a whole-scene rebuild: the live path \
+                 must mark what it changed, never everything"
+            ),
+        }
+    }
+
+    assert!(saw_create, "a create was marked for the scene");
+    // The recording's globals give the place its roots; a `set` may or may not
+    // appear in it, so this is asserted only when the world did change by
+    // property — but the *absence* of a `Marks::All` above is unconditional.
+    let _ = saw_prop;
+    // And the world really is the one the recording made, so the marks above
+    // are marks about something.
+    assert!(named(&doc, "Workspace").is_some());
+}

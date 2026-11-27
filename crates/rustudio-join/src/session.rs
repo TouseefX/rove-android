@@ -191,6 +191,15 @@ pub struct Session {
     pub datagrams: usize,
     pub sync_requests: usize,
     pub sync_replies: usize,
+    /// Where the world goes while the session runs (M3). `None` in the offline
+    /// replay and the harness, which read the document when the session ends.
+    ///
+    /// The editor cannot be given `&Document` across threads and cannot be given
+    /// a `Document` it must give back later, so the handover is a *swap*: this
+    /// field is the editor's side of it (`live_world::LiveWorld`), and after
+    /// every drain the world here changes hands with the one the renderer is
+    /// drawing.
+    pub handover: Option<crate::live_world::LiveWorld>,
 }
 
 impl Session {
@@ -227,6 +236,7 @@ impl Session {
             datagrams: 0,
             sync_requests: 0,
             sync_replies: 0,
+            handover: None,
         }
     }
 
@@ -491,6 +501,50 @@ impl Session {
     /// that is always a few hundred instances short of what arrived.
     fn drain(&mut self) {
         while self.drain_batch() == DRAIN_BATCH {}
+        // The overlay's numbers, whether or not anything was applied: a second
+        // in which the world did not change is not a stuck session, and the
+        // only way to tell those apart is for the counters to keep moving.
+        if let Some(handover) = &self.handover {
+            handover.set_counters(self.overlay_counters());
+        }
+    }
+
+    /// True when the editor asked for the session to end (M3).
+    ///
+    /// Without a handover there is nobody to ask, and a session with a deadline
+    /// ends at its deadline exactly as before.
+    pub fn stop_requested(&self) -> bool {
+        self.handover
+            .as_ref()
+            .is_some_and(|handover| handover.stop_requested())
+    }
+
+    /// The counters the overlay draws. Cheap: struct copies, no document reads.
+    pub fn overlay_counters(&self) -> crate::live_world::Counters {
+        crate::live_world::Counters {
+            stage: match self.stage {
+                Stage::Idle => "idle",
+                Stage::Allocated => "allocate",
+                Stage::Connected => "connect",
+                Stage::LoggedIn => "log in",
+                Stage::Receiving => "receive",
+                Stage::Closed(_) => "closed",
+            }
+            .to_string(),
+            packets: self.ingested.packets,
+            applied: self.applied.created + self.applied.properties,
+            refused: self.ingested.refused,
+            held: self.held,
+            released: self.released,
+            dropped: self.dropped,
+            instances: self.live.len(),
+            other_streams: self.other_streams,
+            pings: self.pings,
+            sync_requests: self.sync_requests,
+            sync_replies: self.sync_replies,
+            schedule: self.journal_rows() as u64,
+            seconds: 0,
+        }
     }
 
     /// One read of up to [`DRAIN_BATCH`] rows; returns how many were read.
@@ -517,6 +571,16 @@ impl Session {
             }
             let stats = self.live.apply(&mut self.document, &actions, &mut self.converter);
             self.applied.add(&stats);
+            // The editor draws its own document, and this is what keeps the two
+            // in step: the same actions, in the same order, applied by the same
+            // `Live` on the other side of the thread boundary (M3).
+            //
+            // Published *after* applying, so a batch this side could not use is
+            // never sent as if it had been, and with the counters of the moment
+            // so the overlay describes the world the batch is about to move.
+            if let Some(handover) = &self.handover {
+                handover.publish(actions.clone(), self.overlay_counters());
+            }
             log::debug!(
                 "session: applied {} action(s) at sequence {}: {:?}",
                 actions.len(),
@@ -725,7 +789,15 @@ pub async fn run(
     // reading one of them is how a session sits at "logged in" while the world
     // it asked for arrives on another. Each has its own header, which is where
     // its application and channel come from.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    // `seconds` is a **bound**, not a session length: `0` means "until the
+    // connection ends or the caller stops it", which is what a live session is
+    // for. A non-zero value is a harness's or a test's timeout, and the report
+    // says which one ended the session so the difference is never guessed at.
+    let deadline = if seconds == 0 {
+        None
+    } else {
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(seconds))
+    };
     let (packets_tx, mut packets_rx) = tokio::sync::mpsc::channel::<(u8, u32, Vec<u8>)>(READER_QUEUE);
     let mut readers = tokio::task::JoinSet::new();
     let mut fed = 0usize;
@@ -735,8 +807,14 @@ pub async fn run(
     // The deadline as a future, not a duration recomputed per turn: a
     // `sleep(remaining)` arm would be ready immediately on every loop and
     // would compete with arriving packets for turns.
-    let deadline_at = tokio::time::Instant::from_std(deadline);
-    let mut sleep_until_deadline = Box::pin(tokio::time::sleep_until(deadline_at));
+    // A future that never resolves, for a session with no deadline: the select
+    // needs an arm, and "no deadline" must not become "a deadline in the year
+    // 2255" that a `sleep` still has to be polled for every turn.
+    let mut sleep_until_deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        match deadline {
+            Some(at) => Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(at))),
+            None => Box::pin(std::future::pending()),
+        };
     // A dropped connection ends the join now, not at the deadline: before this
     // arm existed, a server that hung up was indistinguishable from one that
     // had gone quiet, and both were reported as the deadline passing.
@@ -747,8 +825,13 @@ pub async fn run(
     let mut sync_tick = tokio::time::interval(std::time::Duration::from_millis(20));
     sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             end = Some("the session's deadline passed");
+            break;
+        }
+        // The editor's Stop: the session ends the way a person asked it to.
+        if session.stop_requested() {
+            end = Some("stopped");
             break;
         }
         tokio::select! {
