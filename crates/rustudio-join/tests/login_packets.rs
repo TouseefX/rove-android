@@ -134,44 +134,21 @@ fn the_empty_server_id_packet_is_two_bytes() {
 }
 
 #[test]
-fn the_port_agrees_with_rove_wherever_the_vectors_reach() {
-    // rove's own encoder, compiled in as a dev-dependency: same input, same
-    // bytes. A drift in a branch the vectors do not cover shows up here.
+fn the_checksum_and_hash_match_the_independent_vectors() {
+    // These are the numbers the Python implementation produced, so agreeing
+    // with them is agreeing with something that never saw this code. The
+    // branch-by-branch comparison against rove's own Rust encoder lives in
+    // `examples/crosscheck.rs` (it includes both encoders rather than making a
+    // whole client crate a dependency of this one).
     let vectors = vectors();
-    let join = &vectors["protocol_sync"]["input_join"];
-    let ticket = &vectors["protocol_sync"]["join_ticket"];
+    let join = &vectors["ticket"]["join"];
     assert_eq!(
-        protocol_sync(join, Some(ticket), Some((13, 14))).unwrap(),
-        headless_luau::login::protocol_sync(join, Some(ticket), Some((13, 14))).unwrap(),
-        "protocol sync"
-    );
-    let ticket_join = &vectors["ticket"]["join"];
-    assert_eq!(
-        ticket_packet(ticket_join).unwrap(),
-        headless_luau::login::ticket_packet(ticket_join).unwrap(),
-        "ticket packet"
+        ticket_packet(join).unwrap(),
+        unhex(vectors["ticket"]["packet_hex"].as_str().unwrap())
     );
     assert_eq!(
-        server_id_packet(),
-        headless_luau::login::server_id_packet(),
-        "server id"
-    );
-    let early = &vectors["early_auth"]["ticket"].as_str().unwrap();
-    assert_eq!(
-        issued_early_auth(early).unwrap(),
-        headless_luau::login::issued_early_auth(early).unwrap(),
-        "early auth"
-    );
-    for value in [0i64, -1, 1, i64::MIN, i64::MAX, 1234567890] {
-        assert_eq!(
-            encode_signed(value),
-            headless_luau::login::encode_signed(value),
-            "signed {value}"
-        );
-    }
-    assert_eq!(
-        encode_unsigned(624_485).unwrap(),
-        headless_luau::login::encode_unsigned(624_485).unwrap()
+        ticket_hash(b"", 0) as u64,
+        vectors["ticket"]["hash_empty_seed0"].as_u64().unwrap()
     );
 }
 

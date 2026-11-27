@@ -656,6 +656,14 @@ pub fn verification_packet() -> Result<Vec<u8>, LoginCodecError> {
     Ok(verification_with_nonce(nonce))
 }
 
+/// [`verification_with_nonce`] for the cross-check example, which compares the
+/// packet to rove's recorded vectors (its reference shares this crate's nonce
+/// source, so the packet itself is the thing to check).
+#[doc(hidden)]
+pub fn verification_with_nonce_for_check(nonce: u32) -> Vec<u8> {
+    verification_with_nonce(nonce)
+}
+
 fn verification_with_nonce(nonce: u32) -> Vec<u8> {
     let constant = 0x1f5e_a79e_u32 ^ 0x1149_6016;
     let value = (u64::from(nonce) << 32) | u64::from(nonce ^ constant);

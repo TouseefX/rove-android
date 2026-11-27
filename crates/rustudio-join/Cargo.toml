@@ -43,5 +43,13 @@ optional = true
 # The world the replay builds is inspected through rustudio's own document,
 # whose nodes are rbx_dom_weak instances.
 rbx_dom_weak = "4"
-# rove's login encoder is the reference the ported one is checked against.
-headless-luau = { path = "../../rove/rust-client", default-features = false }
+
+# rove's own login encoder is the reference the ported one is checked against.
+# It is not a dev-dependency: `rove/rust-client` is a whole client target, and
+# pulling it into this crate's test graph changes the cargo feature resolution
+# of the workspace (ureq's `tungstenite` pulls native-tls, which is not in the
+# lock). `examples/crosscheck.rs` includes both encoders instead — see the
+# comment at the top of it.
+[[example]]
+name = "crosscheck"
+path = "examples/crosscheck.rs"

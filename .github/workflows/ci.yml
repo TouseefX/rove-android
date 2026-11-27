@@ -140,6 +140,13 @@ jobs:
           cargo test -p rustudio-join --locked --message-format=short 2>&1 \
             | tee "$RUNNER_TEMP/join.log"
           grep -E "^(running|test result)" "$RUNNER_TEMP/join.log" || true
+      - name: The ported codec against rove's own encoder (both included)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run -p rustudio-join --example crosscheck --locked \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/join-crosscheck.log"
+          tail -1 "$RUNNER_TEMP/join-crosscheck.log"
       - name: The live feature compiles (WebTransport, sign in, join-game)
         shell: bash
         run: |
