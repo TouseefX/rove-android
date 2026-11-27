@@ -98,15 +98,16 @@ fn protocol_sync_has_the_layout_rove_documents() {
     // So the byte-for-byte check here is rove's *encoder* against this port's
     // (examples/crosscheck.rs, which compiles both), and the vector is used for
     // what it does still describe: the header, the platform strings and the
-    // constants. The vector's own header is
-    // `90 01 24 00 00 00 0d 0e 00 00` (packet, version 36 as LE, range, 0).
+    // constants. The header is `90 01 24 00 00 00 0d 0e 00 00`: id 144, the
+    // flag byte 0x01, VERSION 36 as one byte (0x24), the two "not teleported /
+    // no vr" bytes, the range, and a zero.
     let vectors = vectors();
     let vector = &vectors["protocol_sync"];
     let join = &vector["input_join"];
     let ticket = &vector["join_ticket"];
 
     let packet = protocol_sync(join, Some(ticket), Some((13, 14))).unwrap();
-    assert_eq!(&packet[..10], &[0x90, 0x01, 24, 0x00, 0x00, 0x00, 13, 14, 0x00, 0x00]);
+    assert_eq!(&packet[..10], &[0x90, 0x01, 36, 0x00, 0x00, 0x00, 13, 14, 0x00, 0x00]);
     // The six constants the packet ends with, from the vector's own tail.
     assert_eq!(
         &packet[packet.len() - 24..],
