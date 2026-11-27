@@ -341,9 +341,16 @@ fn run(
         // callback publishes the counters *while* the session runs: before it,
         // the overlay read the initial `Stats` for the whole join and a working
         // session looked exactly like a stalled one.
-        session::run(&issued, &mut world, seconds, |session| publish(&seen, session)).await
+        // The callback takes `&Session` from its argument, not from the
+        // closure's environment: capturing `world` here would borrow it for the
+        // whole of `block_on` and keep the `applied` read below from working.
+        session::run(&issued, &mut world, seconds, |running| publish(&seen, running)).await
     });
     let stage = world.stage.clone();
+    // Taken before the report below: a session that applied rows while it ran
+    // has its world in `applied`, and the report has to read the same numbers
+    // the stats are built from.
+    let applied = world.applied.clone();
     match tag(&stage) {
         ALLOCATED => settle(shared, |report| report.failed("connect", "the dial did not start")),
         CONNECTED => settle(shared, |report| {
@@ -418,7 +425,6 @@ fn run(
 
     // Copied, not moved: `Session` implements `Drop` (it releases a journal
     // lease), and a partly-moved value cannot be dropped.
-    let applied = world.applied.clone();
     let ingested = world.ingested;
     let journal_rows = world.journal_rows();
     let stage_tag = tag(&world.stage);
