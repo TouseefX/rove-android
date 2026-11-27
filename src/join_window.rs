@@ -32,6 +32,15 @@ pub const DEFAULT_PLACE: u64 = 1818;
 /// world, short enough that a test run ends by itself.
 const SESSION_SECONDS: u64 = 30;
 
+/// Whether a finished session's world is worth installing by itself.
+///
+/// An auto-install of an empty world would replace whatever the person had
+/// open with nothing, so this asks for instances; a session that only read a
+/// schema and ended is reported, not installed.
+fn world_worth_opening(stats: rustudio_join::join::Stats) -> bool {
+    stats.created > 0
+}
+
 /// The cookie as the app's own session holds it, for the join's worker.
 ///
 /// Read inside the closure, on the worker thread, so the value exists only for
@@ -56,6 +65,10 @@ pub struct JoinWindow {
     /// A world already installed: the overlay then only shows the report, and
     /// closing it leaves the place open.
     pub installed: bool,
+    /// The report shown as selectable text (the copy's fallback).
+    pub show_text: bool,
+    /// When the report was last copied, for the "copied" note.
+    pub copied_at: Option<Instant>,
     /// The places this device has joined, newest first — the home page's cards
     /// (`crate::start_page::home`). Not persisted yet: a device's own record of
     /// what it played is enough for the card to be one tap.
@@ -76,6 +89,8 @@ impl JoinWindow {
             join: None,
             started: None,
             installed: false,
+            show_text: false,
+            copied_at: None,
             recent: Vec::new(),
         }
     }
@@ -97,6 +112,8 @@ impl Editor {
         let mut start = false;
         let mut install = false;
         let mut close = false;
+        let mut copy_report: Option<String> = None;
+        let mut show_text = self.join_win.show_text;
         if !open {
             return;
         }
@@ -121,6 +138,10 @@ impl Editor {
             .and_then(|report| report.verdict());
         let finished = self.join_win.join.is_some() && !running;
         let installed = self.join_win.installed;
+        // A world exists as soon as the session created an instance; it is
+        // handed over by `take_document` (once), after which `installed` is
+        // true and this stops mattering.
+        let has_world = stats.created > 0 || stats.packets > 0;
         let waited = self
             .join_win
             .started
@@ -186,11 +207,36 @@ impl Editor {
                             );
                         }
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Copy the report").clicked() {
-                            ctx.copy_text(lines.join("\n"));
+                    if let Some(at) = self.join_win.copied_at {
+                        if at.elapsed().as_secs() < 4 {
+                            ui.label(
+                                egui::RichText::new("copied — paste it back (a chat, a note)")
+                                    .color(rustudio_engine::theme::SELECT),
+                            );
                         }
-                        if stats.packets > 0 && !installed {
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Copy the report")
+                            .on_hover_text("Puts the report on the system clipboard")
+                            .clicked()
+                        {
+                            copy_report = Some(lines.join("\n"));
+                        }
+                        if ui
+                            .button("Show as text")
+                            .on_hover_text("If a copy does not reach the clipboard, select this by hand")
+                            .clicked()
+                        {
+                            show_text = !show_text;
+                        }
+                        // Offered whenever the session built *any* world — a
+                        // join that replicated a handful of instances and then
+                        // ended is still a join, and the world it built is
+                        // what says so. (Before this, only a session with
+                        // packets *and* a finished report offered it, so a
+                        // session still finishing showed nothing at all.)
+                        if has_world && !installed {
                             if ui
                                 .button("Open the place")
                                 .on_hover_text("Install the world the session built into the editor")
@@ -203,6 +249,19 @@ impl Editor {
                             close = true;
                         }
                     });
+                }
+                if show_text {
+                    ui.add_space(6.0);
+                    // Not wrapped, not truncated: a plain box whose text can be
+                    // selected, for the case where the clipboard does not take
+                    // the copy. Scrolls sideways, as a terminal would.
+                    let mut text = lines.join("\n");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .desired_rows(8)
+                            .code_editor()
+                            .desired_width(f32::INFINITY),
+                    );
                 }
                 if started {
                     ui.add_space(4.0);
@@ -231,16 +290,40 @@ impl Editor {
         if install {
             self.install_join_world();
         }
-        // A running join repaints itself; a finished one stops asking — and a
-        // finished session that replicated anything is remembered for the home
-        // page, whether or not its world was installed.
+        self.join_win.show_text = show_text;
+        if let Some(report) = copy_report.clone() {
+            // Straight to the system clipboard, not through egui's output
+            // commands: the window that runs this is drawn after the frame's
+            // copy hook, and the report is the one thing on this page that a
+            // person has to be able to get out of the app.
+            #[cfg(target_os = "android")]
+            crate::android::clipboard::set(report.clone());
+            ctx.copy_text(report.clone());
+            self.join_win.copied_at = Some(Instant::now());
+            self.info(format!(
+                "join report copied ({} characters)",
+                report.chars().count()
+            ));
+        }
+        // A running join repaints itself; a finished one stops asking.
         if self.join_win.running() {
             ctx.request_repaint_after(Duration::from_millis(150));
-        } else if !installed && finished && stats.packets > 0 {
-            if let Some(place) = self.join_win.place() {
-                if !self.join_win.recent.iter().any(|r| r.place_id == place) {
-                    self.remember_join(place, false);
-                }
+            return;
+        }
+        if !finished || installed {
+            return;
+        }
+        // A finished session that built instances **installs them by itself**:
+        // the world is the evidence that the join worked, and before this the
+        // only sign of a successful session was a number in a report — the
+        // place stayed empty until a button was found. The report still says
+        // what happened, and the window stays up over the world.
+        if has_world && world_worth_opening(stats) {
+            self.install_join_world();
+        }
+        if let Some(place) = self.join_win.place() {
+            if !self.join_win.recent.iter().any(|r| r.place_id == place) {
+                self.remember_join(place, self.join_win.installed);
             }
         }
     }

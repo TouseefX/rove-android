@@ -902,10 +902,27 @@ pub fn request_allocation_until_ready_with(
     expected_user_id: u64,
     mut wait: impl FnMut(usize),
 ) -> Result<AllocationResult, AllocationError> {
+    #[cfg_attr(not(feature = "live"), allow(unused_mut, unused_variables))]
+    let mut refreshed_version = false;
     for attempt in 0..8 {
         let result = request_allocation(http, target, invite, attempt_id, expected_user_id)?;
         if matches!(result, AllocationResult::Pending { .. }) && attempt < 7 {
             wait(attempt);
+            continue;
+        }
+        // Status 12 is the launcher's refusal of the client identity, and a
+        // stale `User-Agent` version is the common cause (rove learned this:
+        // "gamejoin rejects unknown agents with status 12"). Refetch the
+        // version once and ask again, rather than reporting a refusal that was
+        // only ever about the version string.
+        #[cfg(feature = "live")]
+        if !refreshed_version
+            && matches!(result, AllocationResult::Rejected { status: Some(12), .. })
+            && attempt < 7
+        {
+            refreshed_version = true;
+            crate::client_version::invalidate();
+            log::info!("allocate: status 12; refetching the client version and retrying");
             continue;
         }
         return Ok(result);

@@ -25,15 +25,15 @@ use crate::allocation::{
     valid_csrf_token, AllocationError, HttpClient, Reply, ALLOWED_HOSTS, MAX_RESPONSE,
 };
 
-/// What a native Roblox client says it is, in the header the launcher reads to
-/// decide whether a join request may have a server at all.
+/// What a join request says it is.
 ///
-/// Not a lie about being Roblox's own binary on the wire — every join after
-/// this one is this client's own WebTransport session with this client's own
-/// pins — but the launcher's admission test is about *the kind of client*, and
-/// a browser identity is refused (status 12) while a native one is admitted.
+/// `gamejoin` validates the `User-Agent`: *any* version it does not recognise
+/// is refused with status 12, which is why rove's client fetches the live one
+/// (`crate::client_version`). The `rbx-user-agent` header names the kind of
+/// client, which is the other half of the admission test — a web identity is
+/// refused and a native one admitted (H644b/Roblox-Public-Web-Play-Join
+/// measured that on the live endpoint).
 const NATIVE_IDENTITY: &str = "Roblox/Darwin";
-const NATIVE_USER_AGENT: &str = "RobloxPlatform/0.744.0.7441080";
 
 const MAX_COOKIE: usize = 32 * 1024;
 const MAX_REQUEST: usize = 1024 * 1024;
@@ -121,7 +121,9 @@ impl AccountSession {
             // No redirects: the Cookie header must never follow a 3xx to a host
             // that is not on the allowlist above.
             .max_redirects(0)
-            .user_agent(NATIVE_USER_AGENT)
+            // The live client version, not a pinned constant: the launcher
+            // refuses an unknown agent (see `crate::client_version`).
+            .user_agent(crate::client_version::user_agent())
             .build();
         let agent: ureq::Agent = config.into();
         Ok(Self {
@@ -178,6 +180,9 @@ impl AccountSession {
                 // including that the HTTP `User-Agent` alone changes nothing:
                 // it is this header).
                 ("rbx-user-agent".into(), NATIVE_IDENTITY.into()),
+                // Present on real client traffic; some endpoints key off them.
+                ("Accept-Language".into(), "en-US,en;q=0.9".into()),
+                ("Roblox-Browser-Asset-Request".into(), "false".into()),
                 ("Origin".into(), "https://www.roblox.com".into()),
                 ("Referer".into(), "https://www.roblox.com/".into()),
             ];

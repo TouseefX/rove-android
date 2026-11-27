@@ -47,6 +47,9 @@ pub mod session;
 
 #[cfg(feature = "live")]
 pub mod http;
+// The version in the `User-Agent` the launcher checks for (behind `live`: it is
+// fetched over HTTPS).
+pub mod client_version;
 
 pub use allocation::{
     new_join_attempt_id, request_allocation_until_ready, AllocationError, AllocationResult,
