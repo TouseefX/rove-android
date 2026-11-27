@@ -30,11 +30,11 @@ pub const PING_CHANNEL: u32 = 3;
 /// `PingCounts::from_packet` refuses anything else, and `0x83` is what a *reply*
 /// to the marker handshake starts with — the two are easy to confuse, and
 /// reading one as the other is a silent no-op.
-const HEADER: u8 = 131;
+pub const PING_HEADER: u8 = 131;
 const ITEM_REQUEST: u8 = 5;
 const ITEM_RESPONSE: u8 = 6;
 /// The reply's item kind/sub pair, as rove writes it.
-const REPLY_PREFIX: [u8; 3] = [HEADER, ITEM_RESPONSE, 1];
+const REPLY_PREFIX: [u8; 3] = [0x83, ITEM_RESPONSE, 1];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PingKind {
@@ -178,7 +178,7 @@ pub fn decode_ping_packet(payload: &[u8]) -> Result<Vec<PingItem>, PingCodecErro
         return Err(PingCodecError::PacketTooLarge);
     }
     let mut reader = Reader::new(payload);
-    if reader.u8().map_err(|_| PingCodecError::Truncated)? != HEADER {
+    if reader.u8().map_err(|_| PingCodecError::Truncated)? != PING_HEADER {
         return Err(PingCodecError::InvalidHeader);
     }
     let mut items = Vec::with_capacity(4);
@@ -282,7 +282,7 @@ mod tests {
 
     /// A plain request, built the way a server builds one.
     fn request(timestamp: u64, request_word: u32, unreliable: bool) -> Vec<u8> {
-        let mut bytes = vec![HEADER, ITEM_REQUEST, 0];
+        let mut bytes = vec![PING_HEADER, ITEM_REQUEST, 0];
         bytes.extend_from_slice(&timestamp.to_le_bytes());
         bytes.extend_from_slice(&request_word.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn a_reply_packet_gets_no_answer() {
         // A response item: it is the server answering *us*, or our own echo.
-        let mut payload = vec![HEADER, ITEM_RESPONSE, 0];
+        let mut payload = vec![PING_HEADER, ITEM_RESPONSE, 0];
         payload.extend_from_slice(&0u64.to_le_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes());
@@ -384,27 +384,27 @@ mod tests {
             PingCodecError::InvalidHeader
         );
         assert_eq!(
-            decode_ping_packet(&[HEADER, ITEM_REQUEST, 0]).expect_err("truncated"),
+            decode_ping_packet(&[PING_HEADER, ITEM_REQUEST, 0]).expect_err("truncated"),
             PingCodecError::Truncated
         );
         // A terminated packet with bytes after the terminator.
         assert_eq!(
-            decode_ping_packet(&[HEADER, 0, 1]).expect_err("trailing"),
+            decode_ping_packet(&[PING_HEADER, 0, 1]).expect_err("trailing"),
             PingCodecError::TrailingBytes
         );
         // No terminator at all: a header and nothing else.
         assert_eq!(
-            decode_ping_packet(&[HEADER]).expect_err("unterminated"),
+            decode_ping_packet(&[PING_HEADER]).expect_err("unterminated"),
             PingCodecError::MissingTerminator
         );
         // A header and a terminator is a well-formed packet with no items — the
         // server's "nothing to say", not an error.
-        assert_eq!(decode_ping_packet(&[HEADER, 0]).expect("empty"), Vec::new());
+        assert_eq!(decode_ping_packet(&[PING_HEADER, 0]).expect("empty"), Vec::new());
     }
 
     #[test]
     fn several_requests_are_all_read_and_the_first_answered() {
-        let mut payload = vec![HEADER];
+        let mut payload = vec![PING_HEADER];
         for timestamp in [10u64, 20] {
             payload.push(ITEM_REQUEST);
             payload.push(0);
