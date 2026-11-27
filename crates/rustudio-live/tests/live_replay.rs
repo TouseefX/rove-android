@@ -84,6 +84,12 @@ fn packets(recording: &Value) -> Vec<(String, Vec<u8>)> {
 /// Replay the whole recording the way a live connection would: ingest, read the
 /// receipt the journal just committed, apply its actions.
 fn replay() -> (Document, Live, Vec<(String, ApplyStats)>) {
+    replay_through(usize::MAX)
+}
+
+/// The same replay, stopped before the packet at `limit`: the place as it
+/// arrived, with the Part still in it.
+fn replay_through(limit: usize) -> (Document, Live, Vec<(String, ApplyStats)>) {
     let recording = recording();
     let mut core = SessionCore::with_limits(256, 4 << 20).expect("a session");
     // An empty place: a DataModel with no children, which is what the
@@ -93,7 +99,10 @@ fn replay() -> (Document, Live, Vec<(String, ApplyStats)>) {
     let mut live = Live::new();
     let mut applied = Vec::new();
 
-    for (kind, bytes) in packets(&recording) {
+    for (index, (kind, bytes)) in packets(&recording).into_iter().enumerate() {
+        if index == limit {
+            break;
+        }
         let outcome = core
             .ingest(&bytes)
             .unwrap_or_else(|e| panic!("rove's decoder refused the {kind} packet: {e}"));
@@ -202,24 +211,39 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
         doc.dom.root_ref(),
         "and the packet's DataModel sits beside it, not above it"
     );
-    let part = live
-        .referent(&id(&recording, "part"))
-        .expect("the Part is bound");
-    assert_eq!(doc.dom.get_by_ref(part).unwrap().parent(), workspace);
-
-    // The properties came through the converter with their real types: the
-    // packet carries a Vector3 and a bool, not a JSON float array.
-    let instance = doc.dom.get_by_ref(part).expect("the Part");
-    assert_eq!(
-        instance.properties.get(&"Size".into()),
-        Some(&Variant::Vector3(Vector3::new(4.0, 1.0, 2.0))),
-        "Size is a Vector3 with the packet's values"
-    );
-    assert_eq!(
-        instance.properties.get(&"Anchored".into()),
-        Some(&Variant::Bool(true)),
-        "Anchored is the packet's boolean"
-    );
+    // The Part is created under Workspace by the third packet and destroyed by
+    // the fifth, so its shape is asserted on the world as it arrived — the
+    // replay stopped before the removal. The world after the removal is the
+    // last test's subject.
+    {
+        let (arrived, _, _) = replay_through(4);
+        let workspace_ref = arrived.dom.root().children().iter().copied().find(|r| {
+            arrived.dom.get_by_ref(*r).map(|i| i.class.as_str()) == Some("Workspace")
+        });
+        let workspace_ref = workspace_ref.expect("Workspace");
+        let part = arrived
+            .dom
+            .get_by_ref(workspace_ref)
+            .expect("Workspace")
+            .children()
+            .iter()
+            .copied()
+            .find(|r| arrived.dom.get_by_ref(*r).map(|i| i.class.as_str()) == Some("Part"));
+        let part = part.expect("the Part arrived under Workspace");
+        // The properties came through the converter with their real types: the
+        // packet carries a Vector3 and a bool, not a JSON float array.
+        let instance = arrived.dom.get_by_ref(part).expect("the Part");
+        assert_eq!(
+            instance.properties.get(&"Size".into()),
+            Some(&Variant::Vector3(Vector3::new(4.0, 1.0, 2.0))),
+            "Size is a Vector3 with the packet's values"
+        );
+        assert_eq!(
+            instance.properties.get(&"Anchored".into()),
+            Some(&Variant::Bool(true)),
+            "Anchored is the packet's boolean"
+        );
+    }
 
     // Nothing is left waiting, and each deferred edge was settled the way the
     // packet expressed it: Players by an item-19 edge in the same packet that
