@@ -27,6 +27,10 @@ use template_prefs::{Custom, Entry, TemplatePrefs};
 use templates::{Kind, Source, TemplateInfo};
 
 mod builtin;
+// The player's home page (who you are, a place, Join), used by `start_page_ui`
+// in a build with the transport.
+#[cfg(feature = "live")]
+pub mod home;
 mod group_cache;
 pub mod template_prefs;
 #[cfg(test)]
@@ -579,6 +583,19 @@ impl Editor {
     /// Draws the Start Page over the whole window. False once it has gone
     /// (something was opened): the editor draws this frame instead.
     pub fn start_page_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        // The player's home (src/start_page/home.rs): who you are, a place, and
+        // Join. Compiled only with the transport, because the button joins.
+        #[cfg(feature = "live")]
+        if self.home_ui(ui) {
+            // The page replaces the chrome, but its own windows still open
+            // over it: the account (sign in / paste a cookie) and the join's
+            // report.
+            let ctx = ui.ctx().clone();
+            self.confirm_ui(&ctx);
+            self.account_window(&ctx);
+            self.join_window(&ctx);
+            return true;
+        }
         if !self.start.visible {
             return false;
         }

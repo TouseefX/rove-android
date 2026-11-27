@@ -56,6 +56,10 @@ pub struct JoinWindow {
     /// A world already installed: the overlay then only shows the report, and
     /// closing it leaves the place open.
     pub installed: bool,
+    /// The places this device has joined, newest first — the home page's cards
+    /// (`crate::start_page::home`). Not persisted yet: a device's own record of
+    /// what it played is enough for the card to be one tap.
+    pub recent: Vec<crate::start_page::home::RecentJoin>,
 }
 
 impl Default for JoinWindow {
@@ -72,6 +76,7 @@ impl JoinWindow {
             join: None,
             started: None,
             installed: false,
+            recent: Vec::new(),
         }
     }
 
@@ -226,9 +231,17 @@ impl Editor {
         if install {
             self.install_join_world();
         }
-        // A running join repaints itself; a finished one stops asking.
+        // A running join repaints itself; a finished one stops asking — and a
+        // finished session that replicated anything is remembered for the home
+        // page, whether or not its world was installed.
         if self.join_win.running() {
             ctx.request_repaint_after(Duration::from_millis(150));
+        } else if !installed && finished && stats.packets > 0 {
+            if let Some(place) = self.join_win.place() {
+                if !self.join_win.recent.iter().any(|r| r.place_id == place) {
+                    self.remember_join(place, false);
+                }
+            }
         }
     }
 
@@ -251,6 +264,22 @@ impl Editor {
         self.info(format!("join {place}: signing in"));
     }
 
+    /// Remember a place this device joined, newest first, one entry per place.
+    fn remember_join(&mut self, place: u64, world_installed: bool) {
+        let _ = world_installed;
+        let entries = &mut self.join_win.recent;
+        entries.retain(|r| r.place_id != place);
+        entries.insert(
+            0,
+            crate::start_page::home::RecentJoin {
+                place_id: place,
+                label: format!("Place {place}"),
+                ago_s: 0,
+            },
+        );
+        entries.truncate(8);
+    }
+
     /// Install the world a finished session built into the editor.
     fn install_join_world(&mut self) {
         // Both taken before anything else touches `self`: `join` borrows the
@@ -269,6 +298,9 @@ impl Editor {
         };
         self.set_document(world);
         self.join_win.installed = true;
+        if let Some(place) = self.join_win.place() {
+            self.remember_join(place, true);
+        }
         self.info(format!(
             "join: {} instance(s) created, {} removed, {} propert{} written",
             stats.created,
