@@ -129,7 +129,7 @@ impl Session {
     /// A session over an empty place. The document is a bare DataModel, which
     /// is what a join's globals packet fills with the place's roots.
     pub fn new() -> Self {
-        let core = SessionCore::with_limits(4096, 8 << 20).expect("a session with sane limits");
+        let mut core = SessionCore::with_limits(4096, 8 << 20).expect("a session with sane limits");
         let reader = core.retain(0).expect("a journal reader");
         Self {
             core,
