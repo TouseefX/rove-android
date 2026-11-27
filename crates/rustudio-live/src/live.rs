@@ -506,7 +506,9 @@ impl Live {
                         // follow one) and not nil-as-a-real-target either — it
                         // is what an unset reference is in this DOM.
                         if let Some(instance) = doc.dom.get_by_ref_mut(r) {
-                            instance.properties.insert(ustr(property), Variant::Ref(Ref::none()));
+                            instance
+                                .properties
+                                .insert(ustr(property.as_str()), Variant::Ref(Ref::none()));
                         }
                     }
                 }
@@ -658,10 +660,13 @@ impl Live {
         let mut settled: Vec<((String, String), Ref)> = Vec::new();
         let mut gone: Vec<(String, String)> = Vec::new();
         for ((owner, property), target) in &self.pending_refs {
-            let Some(&owner_ref) = self.ids.get(owner) else {
+            // The owner was removed while the reference was waiting: nothing
+            // will ever be written for it, so it is dropped rather than held
+            // for the rest of the session.
+            if !self.ids.contains_key(owner) {
                 gone.push((owner.clone(), property.clone()));
                 continue;
-            };
+            }
             let Some(target_ref) = self.ids.get(target).copied() else {
                 continue;
             };
