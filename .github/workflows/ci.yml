@@ -44,16 +44,21 @@ jobs:
           set -o pipefail
           cargo check --workspace --all-targets --locked \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/check.log"
-      # The Linux runner has no display, which the editor self-test needs.
+      # Tests run on macOS and the two release jobs (docs/M0-UNDERSTANDING.md
+      # 10.9: "tests on macOS only"). Not Linux — no display. Not Windows
+      # either: the suite needs a display as well, and on that runner it has
+      # never finished (26 minutes in the accepted run, then a 35-minute bound
+      # with rustc dying on an "N warnings" summary). A job that cannot pass is
+      # not a gate; Windows is covered by `check` and `windows-release`, which
+      # do compile and link the tests.
       - name: Test
-        if: runner.os != 'Linux'
+        if: runner.os == 'macOS'
         shell: bash
         timeout-minutes: 40
         run: |
           set -o pipefail
-          # A test that never returns used to decide the job (26 minutes in the
-          # accepted run, 31 in the next). The suite is bounded so a hang shows
-          # up as a timeout with a log, not as a job that ran out of time.
+          # Bounded, so a test that never returns shows up as a timeout with a
+          # log rather than as a job that ran out of its allowance.
           timeout 2100 cargo test --workspace --locked \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/test.log"
       # Job logs are not readable back from here, but annotations are; see
