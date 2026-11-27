@@ -65,6 +65,12 @@ pub const INSTANCE_STATE_CHANNEL: u32 = 5;
 pub const BYTECODE_RANGE: (u8, u8) = (13, 14);
 pub const BYTECODE_RANGE_CAPABILITY: u64 = 0x10_0000;
 
+/// World packets that may wait for globals. A real join sent 793 replication
+/// packets before globals arrived; 4096 leaves room for a much larger place
+/// while keeping a server that never sends globals from growing the buffer
+/// without limit.
+const HELD_PACKETS: usize = 4096;
+
 /// How many journal rows one read takes. The journal is read in batches and
 /// drained fully, so this is a page size and not a limit.
 const DRAIN_BATCH: usize = 64;
@@ -163,6 +169,18 @@ pub struct Session {
     /// Packets on a channel this client does not dispatch: counted so the
     /// report can name a stream the session saw and did nothing with.
     pub unhandled: usize,
+    /// World packets held because globals had not arrived yet, and how many of
+    /// those were later fed. A server sends replication on more than one
+    /// stream, so arrival order is not protocol order: on a real join 793
+    /// replication packets arrived before globals, and refusing them (which is
+    /// what the decoder does without a world to apply them to) lost that part
+    /// of the place.
+    pub held: usize,
+    pub released: usize,
+    /// Held packets dropped because the bound was reached.
+    pub dropped: usize,
+    /// World packets waiting for globals, in arrival order.
+    held_packets: std::collections::VecDeque<(u8, u32, Vec<u8>)>,
     /// Reliable streams the server opened and this session accepted. A report
     /// that says "no packet arrived" has to say how many streams it was
     /// reading, or it cannot tell silence from a stream that never opened.
@@ -202,6 +220,10 @@ impl Session {
             markers: 0,
             unhandled: 0,
             streams: 0,
+            held: 0,
+            released: 0,
+            dropped: 0,
+            held_packets: std::collections::VecDeque::new(),
             datagrams: 0,
             sync_requests: 0,
             sync_replies: 0,
@@ -233,9 +255,10 @@ impl Session {
     /// A refusal is counted and returned as `false`; it never aborts the
     /// session.
     pub fn feed(&mut self, payload: &[u8]) -> bool {
-        // The channel is not known here; `feed_on` records it.
-        self.note_arrival(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload);
-        self.feed_inner(payload)
+        // A replay has no channel of its own; the world's is the one it stands
+        // for. Routed through the dispatch so a recording takes the same path
+        // a live join does, holding included.
+        self.feed_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload)
     }
 
     /// A packet that arrived on a known channel: dispatch on where it came
@@ -258,20 +281,50 @@ impl Session {
         self.note_arrival(application, channel, payload);
         let kind = payload.first().copied().unwrap_or(0);
         match (application, channel, kind) {
-            // The world: schema, globals, and replication.
-            (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 129 | 131 | 151) => {
-                self.feed_inner(payload)
+            // The schema and the globals: these are what make a world, and
+            // they are fed in whichever order they arrive.
+            (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 129 | 151) => {
+                let globals = kind == 129;
+                let fed = self.feed_inner_on(application, channel, payload);
+                // Globals are what the held packets were waiting for.
+                if globals && fed {
+                    self.release_held();
+                }
+                fed
+            }
+            // Replication needs globals. They arrive on a *different* stream
+            // (4/2) from the replication stream, so a server's packets are in
+            // protocol order on the wire and not in arrival order here: on a
+            // real join 793 replication packets arrived before globals, and the
+            // decoder refuses each of them without a world. Holding them and
+            // feeding them once globals commit is what makes the whole place
+            // arrive instead of most of it.
+            (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 131) => {
+                if self.core.scope().is_none() {
+                    self.hold(application, channel, payload);
+                    false
+                } else {
+                    self.feed_inner_on(application, channel, payload)
+                }
             }
             // Instance state (161) rides application 4 channel 5, and is the
-            // packet most of a real place's world arrives in.
-            (REPLICATION_APPLICATION, INSTANCE_STATE_CHANNEL, 161) => self.feed_instance_state(payload),
+            // packet most of a real place's world arrives in. It needs a world
+            // for the same reason replication does.
+            (REPLICATION_APPLICATION, INSTANCE_STATE_CHANNEL, 161) => {
+                if self.core.scope().is_none() {
+                    self.hold(application, channel, payload);
+                    false
+                } else {
+                    self.feed_instance_state(payload)
+                }
+            }
             // Replication on channel 3 is the world *after* globals; before
             // them the same kind is a ping (upstream's `if scope.is_none()`).
             (REPLICATION_APPLICATION, PING_CHANNEL, 131) => {
                 if self.core.scope().is_none() {
                     self.ping_requested(payload)
                 } else {
-                    self.feed_inner(payload)
+                    self.feed_inner_on(application, channel, payload)
                 }
             }
             // The server's feature-name/value table: the one packet that says
@@ -362,7 +415,47 @@ impl Session {
         *self.arrivals.entry((application, channel, kind)).or_default() += 1;
     }
 
+    /// Hold a world packet until the session has a world to apply it to.
+    ///
+    /// Bounded: a server that never sends globals must not turn a join into an
+    /// unbounded buffer, and the count is reported either way.
+    fn hold(&mut self, application: u8, channel: u32, payload: &[u8]) {
+        self.held_packets
+            .push_back((application, channel, payload.to_vec()));
+        self.held += 1;
+        while self.held_packets.len() > HELD_PACKETS {
+            // Oldest first: the world's own order matters more than any single
+            // packet, and the report says how many were dropped this way.
+            self.held_packets.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    /// Feed what was held, in arrival order, once globals have committed.
+    ///
+    /// Each held packet keeps the channel it arrived on, so it goes back
+    /// through the same choice it would have taken had globals been first:
+    /// instance state (161) to `ingest_instance_state`, everything else to the
+    /// replication decoder. Feeding a 161 as replication is a corrupt world.
+    fn release_held(&mut self) {
+        while let Some((application, channel, payload)) = self.held_packets.pop_front() {
+            self.released += 1;
+            match (application, channel, payload.first().copied().unwrap_or(0)) {
+                (REPLICATION_APPLICATION, INSTANCE_STATE_CHANNEL, 161) => {
+                    self.feed_instance_state(&payload);
+                }
+                _ => {
+                    self.feed_inner_on(application, channel, &payload);
+                }
+            }
+        }
+    }
+
     fn feed_inner(&mut self, payload: &[u8]) -> bool {
+        self.feed_inner_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload)
+    }
+
+    fn feed_inner_on(&mut self, application: u8, channel: u32, payload: &[u8]) -> bool {
         self.ingested.packets += 1;
         match self.core.ingest(payload) {
             Ok(outcome) => {

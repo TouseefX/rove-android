@@ -54,6 +54,9 @@ pub struct Report {
     started: Instant,
     /// Where the last step ended; a step's `took` is the span from here.
     mark: Duration,
+    /// When a named step began, for a step whose end is known much later
+    /// (`settle`). `log in` is the one that needs it.
+    started_at: std::collections::HashMap<String, Duration>,
     /// The furthest stage reached, which is the one line that matters.
     pub stage: &'static str,
 }
@@ -66,6 +69,7 @@ impl Report {
             steps: Vec::new(),
             started: Instant::now(),
             mark: Duration::ZERO,
+            started_at: std::collections::HashMap::new(),
             stage: "start",
         }
     }
@@ -94,6 +98,41 @@ impl Report {
             },
             name,
         )
+    }
+
+    /// Replace a step already pushed (by name) with its outcome, keeping the
+    /// moment it *started* as the beginning of its `took`.
+    ///
+    /// This is what a stage that spans the session needs: "log in" is known to
+    /// have started when the five packets are written, and known to have
+    /// succeeded only when the session ends. Pushing it once at the end
+    /// charged the whole receive to it (a two-second login reported as 33 s);
+    /// pushing it at the start and closing it here gives the two-second span
+    /// and leaves the receive as its own line.
+    pub fn settle(&mut self, name: &'static str, outcome: Step) {
+        let now = self.started.elapsed();
+        let began = self
+            .started_at
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| now.saturating_sub(outcome.took));
+        let mut step = outcome;
+        step.took = now.saturating_sub(began);
+        if let Some(existing) = self.steps.iter_mut().rev().find(|step| step.name == name) {
+            *existing = step;
+        } else {
+            // Never opened by `begins`: the span from the previous mark, which
+            // is where this step's work actually began.
+            step.took = began;
+            self.steps.push(step);
+        }
+        self.mark = now;
+        self.stage = name;
+    }
+
+    /// Mark a step as begun, so `settle` can measure it from here.
+    pub fn begins(&mut self, name: &'static str) {
+        self.started_at.insert(name.to_string(), self.started.elapsed());
     }
 
     /// A step reached but not finished: the overlay draws it as waiting.

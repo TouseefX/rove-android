@@ -73,6 +73,11 @@ pub struct JoinWindow {
     /// (`crate::start_page::home`). Not persisted yet: a device's own record of
     /// what it played is enough for the card to be one tap.
     pub recent: Vec<crate::start_page::home::RecentJoin>,
+    /// A world was installed and the session it came from should be *played*:
+    /// F5 is pressed on the tick after `set_document`, because Play reads the
+    /// document and the join window must not hold the editor mutably while it
+    /// asks for it.
+    pub play_next_tick: bool,
 }
 
 impl Default for JoinWindow {
@@ -92,6 +97,7 @@ impl JoinWindow {
             show_text: false,
             copied_at: None,
             recent: Vec::new(),
+            play_next_tick: false,
         }
     }
 
@@ -108,9 +114,24 @@ impl JoinWindow {
 impl Editor {
     /// The join window, drawn over the editor while it is open.
     pub fn join_window(&mut self, ctx: &egui::Context) {
+        // A joined world is installed on one frame and played on the next: F5
+        // reads the document, and `set_document` has to have finished with it
+        // before Play copies it as its server DataModel.
+        if std::mem::take(&mut self.join_win.play_next_tick) {
+            if self.game.play.is_some() {
+                self.info("join: a session is already running (Shift+F5 stops it)");
+            } else if self.place_loading() {
+                // A place still loading would defer the Play and lose it.
+                self.join_win.play_next_tick = true;
+            } else {
+                self.start_play(crate::runtime::RunMode::Play);
+                self.info("join: playing the joined place (Shift+F5 stops it)");
+            }
+        }
         let mut open = self.join_win.open;
         let mut start = false;
         let mut install = false;
+        let mut play = false;
         let mut close = false;
         let mut copy_report: Option<String> = None;
         let mut show_text = self.join_win.show_text;
@@ -244,6 +265,21 @@ impl Editor {
                             {
                                 install = true;
                             }
+                            // The difference is what a joined place is for:
+                            // opening installs it as an editable document,
+                            // playing runs it with a character, which is what
+                            // a person who pressed Join on someone else's
+                            // place expects to get.
+                            if ui
+                                .button("Play the place")
+                                .on_hover_text(
+                                    "Install the world and start it: server and client, with your character",
+                                )
+                                .clicked()
+                            {
+                                install = true;
+                                play = true;
+                            }
                         }
                         if ui.button("Close").clicked() {
                             close = true;
@@ -300,6 +336,11 @@ impl Editor {
         if install {
             self.install_join_world();
         }
+        if play {
+            // Deferred for the same reason the automatic path is: the install
+            // below calls `set_document`, and Play copies the document.
+            self.join_win.play_next_tick = true;
+        }
         self.join_win.show_text = show_text;
         if let Some(report) = copy_report.clone() {
             // Straight to the system clipboard, not through egui's output
@@ -330,6 +371,10 @@ impl Editor {
         // what happened, and the window stays up over the world.
         if has_world && world_worth_opening(stats.as_ref()) {
             self.install_join_world();
+            // A joined place is played, not opened as a project: the person
+            // pressed Join on someone else's place, and the thing that says the
+            // join worked is their character standing in it.
+            self.join_win.play_next_tick = true;
         }
         if let Some(place) = self.join_win.place() {
             if !self.join_win.recent.iter().any(|r| r.place_id == place) {

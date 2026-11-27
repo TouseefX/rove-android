@@ -309,3 +309,38 @@ fn the_drain_keeps_up_with_more_rows_than_one_read_returns() {
     );
     assert!(session.journal_rows() > 0);
 }
+
+#[test]
+fn replication_that_arrives_before_globals_is_held_and_then_fed() {
+    // The phone report's 793 refusals: a server sends globals and replication
+    // on different reliable streams, so the replication arrived first and the
+    // decoder refused every packet it could not apply. Held, then fed once
+    // globals commit, the same bytes build the same world.
+    let recording = stream();
+    let mut messages = messages(&recording);
+    // The recording is schema, globals, then replication. Feed the last packet
+    // first, which is what arrival order did on the device.
+    let schema = messages.remove(0);
+    let globals = messages.remove(0);
+    let late = messages.remove(0);
+
+    let mut in_order = Session::new();
+    in_order.feed_on(4, 1, &schema);
+    in_order.feed_on(4, 1, &globals);
+    in_order.feed_on(4, 1, &late);
+
+    let mut out_of_order = Session::new();
+    out_of_order.feed_on(4, 1, &schema);
+    assert!(!out_of_order.feed_on(4, 1, &late), "held, not applied yet");
+    assert_eq!(out_of_order.held, 1);
+    assert_eq!(out_of_order.ingested.refused, 0, "holding is not a refusal");
+    out_of_order.feed_on(4, 1, &globals);
+    assert_eq!(out_of_order.released, 1, "fed once globals committed");
+
+    assert_eq!(
+        out_of_order.applied.created, in_order.applied.created,
+        "the same world either way"
+    );
+    assert_eq!(out_of_order.ingested.refused, in_order.ingested.refused);
+    assert_eq!(out_of_order.ingested.replication, in_order.ingested.replication);
+}

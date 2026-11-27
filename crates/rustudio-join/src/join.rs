@@ -73,6 +73,11 @@ pub struct Stats {
     pub unhandled: usize,
     /// Reliable streams the server opened and the session accepted.
     pub streams: usize,
+    /// World packets held for globals, fed once it arrived, and dropped at the
+    /// bound. A join whose place arrived in full reports held == released.
+    pub held: usize,
+    pub released: usize,
+    pub dropped: usize,
     /// Unreliable datagrams read, and the time-sync probe's request/reply
     /// counts. A probe with requests and no replies is a server that is not
     /// answering the handshake, which is a different fault from a quiet one.
@@ -365,7 +370,7 @@ fn run(
             report.failed("log in", "connected, but the login packets were not all written")
         }),
         LOGGED_IN => {
-            settle(shared, |report| report.ok("log in", "5 packets"));
+            settle(shared, |report| close_login(report, "5 packets"));
             settle(shared, |report| {
                 report.failed("receive", format!("the server closed before any packet ({stage})"))
             });
@@ -391,15 +396,18 @@ fn run(
             } else {
                 arrivals.join(", ")
             };
-            settle(shared, |report| report.ok("log in", "5 packets"));
+            settle(shared, |report| close_login(report, "5 packets"));
             let note = format!(
                 "{} packet(s): {} schema, {} globals, {} replication, {} refused — \
+                 {} held then released, {} dropped — \
                  {} feature(s), {} marker(s), {} ping(s), {} unhandled — {arrival_note}",
                 ingested.packets,
                 ingested.schema,
                 ingested.globals,
                 ingested.replication,
                 ingested.refused,
+                world.released,
+                world.dropped,
                 world.features,
                 world.markers,
                 world.pings,
@@ -479,6 +487,9 @@ fn run(
             features: world.features,
             unhandled: world.unhandled,
             streams: world.streams,
+            held: world.held,
+            released: world.released,
+            dropped: world.dropped,
             datagrams: world.datagrams,
             sync_requests: world.sync_requests,
             sync_replies: world.sync_replies,
@@ -486,6 +497,12 @@ fn run(
         };
     }
     Ok(())
+}
+
+/// Whether the report already has a step by this name. A free function, not a
+/// closure: `publish` mutates `shared.report` right after asking.
+fn pushed(report: &Report, name: &str) -> bool {
+    report.steps().iter().any(|step| step.name == name)
 }
 
 fn elapsed_ms(shared: &Mutex<Shared>) -> u64 {
@@ -502,6 +519,28 @@ fn elapsed_ms(shared: &Mutex<Shared>) -> u64 {
 /// touches the document.
 fn publish(shared: &Mutex<Shared>, session: &session::Session) {
     if let Ok(mut shared) = shared.lock() {
+        // The stages the session owns are pushed *as they happen*, in order,
+        // because the report is read while the join runs and each step is a
+        // span of its own:
+        //
+        // - `connect` is the dial, from the end of allocate to the accepted
+        //   CONNECT;
+        // - `log in` begins when the five packets are written and ends when the
+        //   session does. Pushing it once at the end charged connect and the
+        //   whole receive to it — a two-second login reported as 33 s.
+        if matches!(
+            session.stage,
+            Stage::Connected | Stage::LoggedIn | Stage::Receiving
+        ) && !pushed(&shared.report, "connect")
+        {
+            shared.report.ok("connect", "webtransport");
+        }
+        if matches!(session.stage, Stage::LoggedIn | Stage::Receiving)
+            && !pushed(&shared.report, "log in")
+        {
+            shared.report.begins("log in");
+            shared.report.waiting("log in");
+        }
         let ingested = session.ingested;
         // Fields the session does not own (nothing is applied to the document
         // until it is handed over) are carried across, not zeroed.
@@ -528,6 +567,9 @@ fn publish(shared: &Mutex<Shared>, session: &session::Session) {
             features: session.features,
             unhandled: session.unhandled,
             streams: session.streams,
+            held: session.held,
+            released: session.released,
+            dropped: session.dropped,
             datagrams: session.datagrams,
             sync_requests: session.sync_requests,
             sync_replies: session.sync_replies,
@@ -541,6 +583,23 @@ fn publish(shared: &Mutex<Shared>, session: &session::Session) {
                 .collect(),
         };
     }
+}
+
+/// `log in` spans the session, so it is measured from where it began.
+///
+/// The five packets are written before the session reads anything, and whether
+/// the login succeeded is only known when it ends. Pushing the step at the end
+/// measured connect, the login and the whole receive as one number — a
+/// 33-second "log in" for a two-second login.
+fn close_login(report: &mut Report, note: &str) {
+    report.settle(
+        "log in",
+        crate::diagnostics::Step {
+            name: "log in",
+            outcome: crate::diagnostics::Outcome::Ok(note.to_owned()),
+            took: std::time::Duration::ZERO,
+        },
+    );
 }
 
 fn settle(shared: &Mutex<Shared>, change: impl FnOnce(&mut Report)) {

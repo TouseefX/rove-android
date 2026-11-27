@@ -290,3 +290,57 @@ seconds of receive: "log in 33157 ms" named a step that took two seconds. A
 report like that cannot say where the time went, which is the one thing it is
 for. Each step now measures from the moment the previous one was pushed, and
 `a_steps_time_is_its_own_span_not_everything_before_it` pins it.
+
+## It joined — and what the report still said wrong
+
+The 2026-11-27 run reached the place: 1353 packets, players, workspace, lighting,
+the map. Three numbers in that report were still lying, and one behaviour was
+wrong for a different reason.
+
+### 793 refusals: the packets arrived before the world they belonged to
+
+`1 schema, 1 globals, 558 replication, **793 refused**` is not a decoder that
+could not read them. It is arrival order. A server sends globals and replication
+on *different* reliable streams, and the replication reached this client first —
+`ingest_replication` returns `GlobalsRequired` without a world to apply to, and
+793 packets were counted as refusals and thrown away.
+
+Upstream's `ingest_at` dispatches on `(application, channel, id)` and its world
+owner holds one packet while capacity is unavailable, but it does not reorder
+across streams. The fix that survives a real server is to hold: a world packet
+that arrives before globals is queued (bounded at 4096) and fed, in arrival
+order, the moment globals commit. Held packets keep their channel, so an
+instance-state packet (161) goes back to `ingest_instance_state` and not to the
+replication decoder.
+
+The report now says `N held then released, M dropped`, so a join that read every
+packet it was sent is distinguishable from one that lost the first few hundred.
+
+### `log in 33273 ms` for a two-second login
+
+The previous fix (measuring each step from the previous step's push) was not
+enough, and the run proved it: `log in` is *pushed* when the session ends, so it
+measured connect, the login and the whole receive no matter where the mark was.
+A stage that spans the session has to be **opened** when it starts and **closed**
+when its outcome is known — `Report::begins` and `Report::settle`. `log in` now
+opens when the five packets are written and closes when the session ends, and
+`connect` is pushed when the connection is accepted, so the report reads:
+
+```
+  sign in                ok (...) (1678 ms)
+  allocate               ok (...) (1456 ms)
+  connect                ok (webtransport) (900 ms)
+  log in                 ok (5 packets) (2100 ms)
+  receive                ok (1353 packet(s) ...) (30000 ms)
+```
+
+### It opened as an editor, not a game
+
+A joined place was installed as an editable document and left there. `Join` is a
+person joining someone else's place; what says it worked is their character
+standing in it. The install now asks for `start_play(RunMode::Play)` on the next
+tick — after `set_document`, because Play copies the document — and the join
+window offers **Play the place** beside **Open the place** for the case where a
+person wants the editable world instead. Stop is Shift+F5 as always, and the
+local session runs the joined world's own scripts against this client's
+document.
