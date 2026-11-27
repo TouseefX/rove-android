@@ -101,6 +101,20 @@ fn replay() -> (Document, Live, Vec<(String, ApplyStats)>) {
         // taken from it rather than re-derived from the world afterwards.
         let reader = core.retain(0).expect("a reader");
         let rows = core.read_after(reader, 0, 64).expect("its rows");
+        // A schema installs the decoder and journals nothing: rove has no world
+        // to delta before the globals packet declares the roots, so
+        // `ingest_schema` returns `SchemaInstalled` and appends no record
+        // (session.rs::ingest_schema). It is the one accepted packet with no
+        // receipt, and the bridge has nothing to apply for it.
+        if let IngestOutcome::SchemaInstalled { .. } = outcome {
+            assert!(
+                rows.is_empty(),
+                "the {kind} packet is the one that journals nothing"
+            );
+            core.release(reader).expect("release");
+            applied.push((kind, ApplyStats::default()));
+            continue;
+        }
         let record = rows
             .last()
             .map(|row| row.value.clone())
@@ -157,11 +171,29 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
         .referent(&id(&recording, "datamodel"))
         .expect("DataModel is bound");
 
-    // The globals packet's containers are the world's roots; the replication
-    // packet's Part hangs off Workspace.
+    // The globals packet's containers are the world's roots: the bridge creates
+    // each with no parent, which is rove's `"parent": null`, and the Part then
+    // hangs off the Workspace the packet bound.
+    //
+    // A join's DataModel is the one thing the bridge does not yet fold into the
+    // document: `Document::empty()` already has a DataModel root, so the
+    // packet's DataModel becomes a second instance under it rather than binding
+    // to the root. It is a duplicate a real join would notice (a script's
+    // `game` would be the outer one and the replicated tree the inner one), and
+    // it belongs with the join path in M3, not with this recording. What is
+    // asserted here is what is true either way: the container is bound, its
+    // class is DataModel, and its children are where the packet put them.
     assert_eq!(doc.dom.get_by_ref(workspace).unwrap().name, "Workspace");
     assert_eq!(doc.dom.get_by_ref(players).unwrap().name, "Players");
-    assert_eq!(doc.dom.get_by_ref(datamodel).unwrap().name, "DataModel");
+    assert_eq!(
+        doc.dom.get_by_ref(datamodel).unwrap().class.as_str(),
+        "DataModel"
+    );
+    assert_eq!(
+        doc.dom.get_by_ref(workspace).unwrap().parent(),
+        datamodel,
+        "Workspace hangs off the DataModel the globals packet named"
+    );
     let part = live
         .referent(&id(&recording, "part"))
         .expect("the Part is bound");
@@ -262,7 +294,10 @@ fn the_journal_holds_what_a_live_reader_would_replay() {
     }
     let reader = core.retain(0).unwrap();
     let rows = core.read_after(reader, 0, 64).unwrap();
-    assert_eq!(rows.len(), 5, "one receipt per committed packet");
+    // Five packets are accepted and four are journaled: a schema installs the
+    // decoder and commits no world, so there is no delta to keep. The journal
+    // holds the globals and the three replication packets.
+    assert_eq!(rows.len(), 4, "one receipt per committed packet");
     // The decoder's own world, checked for what it should *not* have as well as
     // what it should: `WorldView::contains` answers from the base and the
     // overlay and does not consult the removed set, so on its own it would keep

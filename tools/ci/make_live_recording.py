@@ -146,7 +146,40 @@ def walk_schema(blob):
     version, pos = varuint_at(out, 0)
     if version != 3:
         raise SystemExit("the schema payload is version %d, not 3" % version)
-    return {"version": version, "expanded": expanded}
+    pos += 8                                     # the u64 flags
+    enums, pos = varuint_at(out, pos)
+    if enums != 0:
+        raise SystemExit("the schema declares %d enums, which this writer does not model" % enums)
+    classes, pos = varuint_at(out, pos)
+    properties, pos = varuint_at(out, pos)
+    events, pos = varuint_at(out, pos)
+    if events != 0:
+        raise SystemExit("the schema declares %d events" % events)
+    table = []
+    for _ in range(classes):
+        length, pos = varuint_at(out, pos)
+        name = out[pos:pos + length].decode()
+        pos += length
+        count, pos = varuint_at(out, pos)
+        props = []
+        for _ in range(count):
+            length, pos = varuint_at(out, pos)
+            prop_name = out[pos:pos + length].decode()
+            pos += length
+            props.append((prop_name, out[pos]))
+            pos += 1
+        pos += 2                                 # the class's unknown u16
+        class_events, pos = varuint_at(out, pos)
+        if class_events != 0:
+            raise SystemExit("class %s declares %d events" % (name, class_events))
+        table.append((name, props))
+    if pos != len(out):
+        raise SystemExit("the schema payload has %d trailing bytes" % (len(out) - pos))
+    if sum(len(props) for _, props in table) != properties:
+        raise SystemExit("the schema declares %d properties and lists %d"
+                         % (properties, sum(len(props) for _, props in table)))
+    return {"version": version, "expanded": expanded, "classes": table,
+            "property_count": properties}
 
 
 def walk_globals(blob):
@@ -186,7 +219,13 @@ def walk_globals(blob):
     return {"flags": flags, "scope": scope, "containers": containers}
 
 
-def walk_replication(blob):
+def walk_replication(blob, schema_classes):
+    """PacketParser::packet_inner (replication.rs:405): items until a 0 terminator.
+
+    `schema_classes` is the class table `walk_schema` read, because a create's
+    property list names a class-relative index and its values are typed by the
+    schema, not by the packet.
+    """
     """PacketParser::packet_inner (replication.rs:405): items until a 0 terminator."""
     if blob[0] != 131:
         raise SystemExit("the replication packet does not start with 131")
@@ -199,23 +238,26 @@ def walk_replication(blob):
             key, pos = read_key(blob, pos)
             class_id = struct.unpack("<H", blob[pos:pos + 2])[0]
             pos += 2
+            if class_id >= len(schema_classes):
+                raise SystemExit("class id %d is not in the schema" % class_id)
+            props = schema_classes[class_id][1]
             properties = []
             for _ in range(2):             # two property lists, each ended by 255
                 while blob[pos] != 255:
-                    prop_id = blob[pos]
-                    type_id = blob[pos + 1]
-                    pos += 2
-                    if type_id == 22:
-                        pos += 12
-                    elif type_id == 9:
-                        pos += 1
-                    else:
-                        raise SystemExit("property %d has type %d, which this "
-                                         "writer does not encode" % (prop_id, type_id))
-                    properties.append((prop_id, type_id))
+                    index = blob[pos]
+                    pos += 1
+                    if index >= len(props):
+                        raise SystemExit("%s has no property %d"
+                                         % (schema_classes[class_id][0], index))
+                    prop_name, type_id = props[index]
+                    if type_id not in VALUE_SIZE:
+                        raise SystemExit("property %s has type %d, which this "
+                                         "walker does not size" % (prop_name, type_id))
+                    pos += VALUE_SIZE[type_id]
+                    properties.append((prop_name, type_id))
                 pos += 1
             parent, pos = read_key(blob, pos)
-            items.append({"item": "create", "id": key, "class": class_id,
+            items.append({"item": "create", "id": key, "class": schema_classes[class_id][0],
                           "properties": properties, "parent": parent})
         elif kind == 1:                    # remove
             key, pos = read_key(blob, pos)
@@ -234,8 +276,22 @@ def walk_replication(blob):
 
 
 # ---------------------------------------------------------------- the schema
-# One class (Part) with two properties. Property names are what the bridge hands
-# the converter, so they are spelled as rustudio's api-dump.json spells them.
+# The classes, in the order rove assigns ids: 0 DataModel, 1 Workspace, 2 Part.
+# Property names are what the bridge hands the converter, so they are spelled as
+# rustudio's api-dump.json spells them; the type ids are rove's (22 Vector3,
+# 9 bool) and they matter twice — the schema carries them, and a create's
+# property list carries only a class-relative index, because the decoder takes
+# the type from the schema.
+CLASSES = (
+    ("DataModel", ()),
+    ("Workspace", ()),
+    ("Part", (("Size", 22), ("Anchored", 9))),
+)
+
+# How many bytes each type's value occupies, for the walker.
+VALUE_SIZE = {22: 12, 9: 1}
+
+
 def schema_bytes():
     """The schema packet's expanded payload.
 
@@ -250,17 +306,10 @@ def schema_bytes():
     out += struct.pack("<Q", 0)           # flags
     out += varuint(0)                     # enums
     out += varuint(3)                     # classes
-    out += varuint(2)                     # properties, counted over all classes
+    out += varuint(sum(len(props) for _, props in CLASSES))  # counted over all classes
     out += varuint(0)                     # events
 
-    for name, props in (
-        ("DataModel", ()),
-        ("Workspace", ()),
-        # The names rustudio's api-dump.json spells, so the bridge's converter
-        # is handed the real ones. 22 is Vector3 and 9 is bool, the type ids
-        # rove's value reader switches on.
-        ("Part", (("Size", 22), ("Anchored", 9))),
-    ):
+    for name, props in CLASSES:
         out += string(name)
         out += varuint(len(props))
         for prop_name, type_id in props:
@@ -289,17 +338,21 @@ def key(scope, instance):
     return varuint(scope) + struct.pack("<I", instance)
 
 
-def create(scope, instance, class_id, properties, parent):
-    """One create item: 2, key, class, [prop order, value] ..., 255, 255, parent.
+def create(scope, instance, class_index, properties, parent):
+    """One create item: 2, key, class, [index, value] ..., 255, 255, parent.
 
-    The two 255s end the instance's two property lists (rove reads both), and
-    `parent` is a key or None for "no parent yet".
+    `properties` is a list of `(class-relative index, encoded value)`. The index
+    is what the schema's class table is indexed by, not the global property id,
+    and no type byte follows it: `new_instance` looks the property up in the
+    class, takes `prop.type_id` from the schema, and hands the reader straight
+    to the value (replication.rs:740). The two 255s end the instance's two
+    property lists (rove reads both), and `parent` is a key or None.
     """
     out = bytearray([2])
     out += key(scope, instance)
-    out += struct.pack("<H", class_id)
-    for prop_id, encoded in properties:
-        out += bytes([prop_id])
+    out += struct.pack("<H", class_index)
+    for index, encoded in properties:
+        out += bytes([index])
         out += encoded
     out += bytes([255, 255])
     out += key(*parent) if parent else b"\x00"
@@ -307,11 +360,13 @@ def create(scope, instance, class_id, properties, parent):
 
 
 def vector3(x, y, z):
-    return bytes([22]) + struct.pack("<3f", x, y, z)
+    """A Vector3's value: three f32, with no type byte."""
+    return struct.pack("<3f", x, y, z)
 
 
 def boolean(value):
-    return bytes([9, 1 if value else 0])
+    """A bool's value: one byte, 0 or 1."""
+    return bytes([1 if value else 0])
 
 
 def replication_packet(*items):
@@ -427,24 +482,27 @@ def check(recording, manifest):
     schema = walk_schema(blobs[0])
     if schema["version"] != 3:
         raise SystemExit("schema version %d" % schema["version"])
+    declared = [(name, [prop for prop, _ in props]) for name, props in schema["classes"]]
+    expected_classes = list(zip(manifest["schema"]["names"],
+                                [[], [], ["Size", "Anchored"]]))
+    if declared != expected_classes:
+        raise SystemExit("the schema declares %s" % declared)
+    if schema["property_count"] != manifest["schema"]["properties"]:
+        raise SystemExit("the schema declares %d properties" % schema["property_count"])
     globals_ = walk_globals(blobs[1])
     containers = [c[0] for c in globals_["containers"]]
     if containers != manifest["globals"]["containers"]:
         raise SystemExit("globals containers are %s" % containers)
     for index, expected in enumerate(manifest["replication"]):
-        got = walk_replication(blobs[2 + index])
-        if index == 0:
-            # Property ids are global in rove's schema: 0 is Size (Vector3, type
-            # 22) and 1 is Anchored (bool, type 9). Name them for the manifest.
-            names = {0: "Size", 1: "Anchored"}
-            types = {0: 22, 1: 9}
-            for item in got:
-                if "properties" in item:
-                    for prop_id, type_id in item["properties"]:
-                        if types.get(prop_id) != type_id:
-                            raise SystemExit("property %d is encoded as type %d"
-                                             % (prop_id, type_id))
-                    item["properties"] = [names[prop_id] for prop_id, _ in item["properties"]]
+        got = walk_replication(blobs[2 + index], schema["classes"])
+        for item in got:
+            if "properties" in item:
+                names = [name for name, _ in item["properties"]]
+                if item["id"] == manifest["id"]["part"] and \
+                        item["properties"] != [("Size", 22), ("Anchored", 9)]:
+                    raise SystemExit("the Part's properties decode as %s"
+                                     % item["properties"])
+                item["properties"] = names
         got = [{k: v for k, v in item.items() if k != "class"} for item in got]
         if got != expected:
             raise SystemExit("replication packet %d reads %s, manifest says %s"
