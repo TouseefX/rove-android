@@ -183,6 +183,8 @@ enum Do {
     More(ExperienceSource),
     Account,
     Copy(String),
+    /// Join an official server of a place, as a player (M2c).
+    Play(u64),
 }
 
 const CARD_W: f32 = 176.0;
@@ -720,6 +722,8 @@ impl Editor {
                 }
                 Do::Account => self.game.account.open = true,
                 Do::Copy(s) => ctx.copy_text(s),
+                #[cfg(feature = "live")]
+                Do::Play(place) => self.join_place(place),
             }
         }
         if self.start.busy() || self.cloud.busy() || self.game.account.busy() {
@@ -896,6 +900,22 @@ impl Editor {
                 match parse_place_ref(&self.start.url) {
                     Ok(p) => todo.push(Do::Cloud(p.place_id, false)),
                     Err(e) => self.start.url_error = Some(e),
+                }
+            }
+            // Open is the editor (download the place and edit it). Play is a
+            // player join: an official server, the five login packets, the
+            // replicated world (M2c, src/join_window.rs).
+            #[cfg(feature = "live")]
+            {
+                let play = ui
+                    .add_enabled(!self.start.url.trim().is_empty(), egui::Button::new("Play"))
+                    .on_hover_text("Join an official server of this place, as a player")
+                    .clicked();
+                if play {
+                    match parse_place_ref(&self.start.url) {
+                        Ok(p) => todo.push(Do::Play(p.place_id)),
+                        Err(e) => self.start.url_error = Some(e),
+                    }
                 }
             }
         });

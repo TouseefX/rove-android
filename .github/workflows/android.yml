@@ -217,7 +217,10 @@ jobs:
             export X_PEM="$SIGNING_PEM"
             echo "Signing the release APK with the provided key"
           fi
-          args=(build -p rustudio-android --platform android --arch "${{ matrix.arch }}" --format apk)
+          # `--features live`: the player join (M2c) — rustudio-join's
+          # WebTransport, HTTPS sign in and src/join_window.rs. Off by default
+          # so a source build without it is unchanged.
+          args=(build -p rustudio-android --features live --platform android --arch "${{ matrix.arch }}" --format apk)
           if [ "${{ matrix.profile }}" = "release" ]; then
             args+=(--release)
           else

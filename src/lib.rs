@@ -35,6 +35,10 @@ pub mod ribbon_quick;
 pub mod macos;
 pub mod cloud_ui;
 pub mod join_ui;
+// Joining an official Roblox server (M2c): the window over
+// rustudio_join::join, behind the feature the Android build turns on.
+#[cfg(feature = "live")]
+pub mod join_window;
 pub mod app;
 #[cfg(not(target_os = "android"))]
 mod native_loop;

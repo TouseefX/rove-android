@@ -30,6 +30,14 @@ doctest = false
 name = "rustudio"
 path = "src/main.rs"
 
+[features]
+default = []
+# Joining an official Roblox server (M2c): the join window, the player path and
+# rustudio-join's live transport. The Android APK is built with it
+# (`--features live` in .github/workflows/android.yml); a desktop build without
+# it is unchanged.
+live = ["rustudio-join/live"]
+
 [dependencies]
 log = "0.4"
 rustudio-account = { path = "crates/rustudio-account" }
@@ -41,6 +49,9 @@ rustudio-player = { path = "crates/rustudio-player" }
 rustudio-profiler-ui = { path = "crates/rustudio-profiler-ui" }
 rustudio-net = { path = "crates/rustudio-net" }
 rustudio-live = { path = "crates/rustudio-live" }
+# A player join: the allocation, the five login packets, the session. Only its
+# `live` feature is reached from this package's own, above.
+rustudio-join = { path = "crates/rustudio-join" }
 libc = "0.2"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "links"] }
 winit = { version = "0.30", default-features = false }

@@ -346,6 +346,10 @@ pub struct Editor {
     pub pending_user_shot: Option<PathBuf>,
     /// The Start Page (src/start_page.rs): shown when nothing is open.
     pub start: crate::start_page::StartPage,
+    /// Joining an official Roblox server (src/join_window.rs, M2c). Compiled
+    /// only into the build that carries the transport.
+    #[cfg(feature = "live")]
+    pub join_win: crate::join_window::JoinWindow,
     /// Requests switching to the main viewport tab.
     pub switch_to_viewport: bool,
 }
@@ -560,6 +564,8 @@ impl RustudioApp {
             ui: crate::studio_ui::UiState::default(),
             pending_user_shot: None,
             start: Default::default(),
+            #[cfg(feature = "live")]
+            join_win: Default::default(),
             switch_to_viewport: false,
         };
         ed.info(format!(
@@ -685,6 +691,13 @@ impl RustudioApp {
             ed.show_start_page();
             let page = std::env::var("RUSTUDIO_START_PAGE").unwrap_or_default();
             ed.start.open_page(&page);
+        }
+        // RUSTUDIO_JOIN=1818: join a place as soon as there is an account (the
+        // Android build sets it; a phone has no command line, and the Start
+        // Page button is the other way in).
+        #[cfg(feature = "live")]
+        if let Some(place) = std::env::var("RUSTUDIO_JOIN").ok().and_then(|v| v.trim().parse().ok()) {
+            ed.join_place(place);
         }
         // The last session's layout and view settings (plain runs only).
         let mut dock = default_dock_for(ed.builtin_tools);
@@ -2897,6 +2910,8 @@ impl RustudioApp {
         if ed.start_page_ui(ui) {
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
+            #[cfg(feature = "live")]
+            ed.join_window(&ctx);
             ed.cloud_windows(&ctx);
             ed.mcp_windows(&ctx);
             ed.file_sync_popover_ui(&ctx);
@@ -3146,6 +3161,8 @@ impl RustudioApp {
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.game.viewport_rect);
         ed.confirm_ui(&ctx);
         ed.account_window(&ctx);
+        #[cfg(feature = "live")]
+        ed.join_window(&ctx);
         if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
             ed.character_builder_window(&ctx);
         }

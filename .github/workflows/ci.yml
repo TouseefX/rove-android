@@ -191,6 +191,23 @@ jobs:
           echo "$status" > out/join-live.status
           exit "$status"
 
+      - name: The app with the join in it (the APK's feature set)
+        shell: bash
+        run: |
+          set +e
+          # The Android APK is built with `--features live`, which is what
+          # compiles src/join_window.rs and the Start Page's Play button. It is
+          # not compiled by `check`, which uses default features, so without
+          # this step the only build that ever sees that code is the APK job.
+          cargo check -p rustudio --features live --locked \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/join-app.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          mkdir -p out
+          cp "$RUNNER_TEMP/join-app.log" out/join-app.log 2>/dev/null || true
+          echo "$status" > out/join-app.status
+          exit "$status"
+
       - name: Choose the log the annotations come from
         if: always()
         shell: bash
@@ -201,7 +218,7 @@ jobs:
           # status the choice fell to whichever log merely contained `error`,
           # which is how a green tests step's dependency *warnings* got reported
           # as the failure.
-          for name in join join-crosscheck join-live; do
+          for name in join join-crosscheck join-live join-app; do
             [ -f "out/$name.log" ] || continue
             status=$(cat "out/$name.status" 2>/dev/null || echo 0)
             echo "$name exited $status"
@@ -213,7 +230,7 @@ jobs:
           done
           # Nothing recorded a failure: annotate the quietest last resort so the
           # job still says something, rather than nothing.
-          for name in join join-crosscheck join-live; do
+          for name in join join-crosscheck join-live join-app; do
             [ -f "out/$name.log" ] && cp "out/$name.log" out/diagnostics.log && \
               echo "annotating out/$name.log (no step recorded a failure)" && exit 0
           done

@@ -16,5 +16,13 @@ name = "rustudio_android"
 crate-type = ["cdylib", "rlib"]
 doctest = false
 
+[features]
+# The player path's transport (WebTransport + HTTPS sign in), and with it
+# src/join_window.rs. The APK is built with `--features live` (the workflow);
+# a build without it carries no QUIC stack.
+live = ["rustudio/live"]
+
 [target.'cfg(target_os = "android")'.dependencies]
-rustudio = { path = "../.." }
+# `live` is passed down from this crate's own feature, so the APK's build flag
+# is what decides whether the join is compiled in.
+rustudio = { path = "../..", default-features = false }
