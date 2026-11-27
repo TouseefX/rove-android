@@ -513,7 +513,9 @@ impl Live {
                     }
                 }
                 Err(ConvertError::Value(_)) => {
-                    self.refuse(class, property, stats);
+                    // `class` is owned here (it is the value read from the
+                    // document above), so the ledger takes a borrow of it.
+                    self.refuse(&class, property, stats);
                 }
             }
         }
