@@ -6,17 +6,42 @@ use std::path::{Path, PathBuf};
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use skrifa::MetadataProvider;
 
-fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSet<String>>) {
-    for token in tokens {
+/// Tokens under a `#[cfg(test)]` item are fixture data: the colour-glyph and
+/// ligature tests use private-use codepoints as map keys, and no font is ever
+/// asked to draw them. `in_tests` says whether this token stream is inside one,
+/// so a nested group inherits it.
+fn collect(
+    tokens: TokenStream,
+    path: &Path,
+    glyphs: &mut BTreeMap<char, BTreeSet<String>>,
+    in_tests: bool,
+) {
+    let mut tokens = tokens.into_iter();
+    // A `#[cfg(test)]` attribute applies to the item that follows it.
+    let mut test_item_next = false;
+    while let Some(token) = tokens.next() {
         match token {
             TokenTree::Group(group) => {
+                let is_attribute = group.delimiter() == Delimiter::Bracket;
                 // Doc comments are desugared to #[doc = "..."].
-                if group.delimiter() == Delimiter::Bracket
+                if is_attribute
                     && matches!(group.stream().into_iter().next(), Some(TokenTree::Ident(id)) if id == "doc")
                 {
                     continue;
                 }
-                collect(group.stream(), path, glyphs);
+                // Token streams stringify with spacing that does not matter here:
+                // `#[cfg(test)]` is "cfg (test)".
+                let is_cfg_test =
+                    is_attribute && group.stream().to_string().replace(' ', "") == "cfg(test)";
+                // What this group's own tokens sit inside: the enclosing item's
+                // state, or the `#[cfg(test)]` seen just before it.
+                collect(group.stream(), path, glyphs, in_tests || test_item_next);
+                if is_cfg_test {
+                    test_item_next = true;
+                } else if !is_attribute {
+                    // The item the attribute applied to has now been visited.
+                    test_item_next = false;
+                }
             }
             TokenTree::Literal(literal) => {
                 let line = literal.span().start().line;
@@ -31,10 +56,12 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                 };
                 for ch in value.chars().filter(|c| !c.is_ascii()) {
                     let file = path.file_name().unwrap().to_str().unwrap();
-                    // A char literal in a test module is fixture data, not UI
-                    // text: the colour-glyph and ligature tests use private-use
-                    // codepoints as map keys, and no font is asked to draw them.
-                    if is_char && path.components().any(|c| c.as_os_str() == "tests") {
+                    // A char literal is never UI text: it is a key, a delimiter,
+                    // or a fixture. Strings are what reaches a font.
+                    if is_char {
+                        continue;
+                    }
+                    if in_tests {
                         continue;
                     }
                     if matches!(
@@ -55,6 +82,13 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                         .entry(ch)
                         .or_default()
                         .insert(format!("{}:{line}", path.display()));
+                }
+            }
+            // An item with no body (`#[cfg(test)] use …;`, `mod tests;`) ends at
+            // its semicolon, so the attribute must not reach past it.
+            TokenTree::Punct(punct) => {
+                if punct.as_char() == ';' {
+                    test_item_next = false;
                 }
             }
             _ => {}
@@ -93,7 +127,7 @@ fn ui_literals_use_bundled_glyphs() {
         let tokens = source
             .parse()
             .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-        collect(tokens, path.strip_prefix(root).unwrap(), &mut glyphs);
+        collect(tokens, path.strip_prefix(root).unwrap(), &mut glyphs, false);
     }
 
     let defs = rustudio_engine::ti::bundled_fonts();
