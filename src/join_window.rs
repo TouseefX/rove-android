@@ -80,6 +80,12 @@ pub struct JoinWindow {
     /// When `live` was last written to the console: one line a second, not one
     /// a frame.
     live_logged_at: Option<Instant>,
+    /// When the world was last seen to change, and whether the load report has
+    /// been written yet: the report describes a world that has stopped
+    /// arriving, so it waits for a quiet moment rather than counting half a
+    /// place.
+    live_report_at: Option<Instant>,
+    live_reported: bool,
     /// The live handover, kept here (and not on `Join`) so the editor can hold
     /// it after the join object is dropped: a stopped join still has a world.
     live_world: Option<rustudio_join::live_world::LiveWorld>,
@@ -119,6 +125,8 @@ impl JoinWindow {
             recent: Vec::new(),
             live: None,
             live_logged_at: None,
+            live_report_at: None,
+            live_reported: false,
             live_world: None,
             live_local: None,
             live_converter: Default::default(),
@@ -172,6 +180,7 @@ impl Editor {
         // Taken in one go rather than batched by hand: the queue is already in
         // journal order, and `Live` handles a create whose parent has not
         // arrived (`attach_waiting`).
+        let new_world = !self.join_win.installed;
         let batches = live.take();
         // The editor's own `Live`, made once per session: it holds the id map
         // between rove's `scope:index` names and this document's refs, and a
@@ -191,6 +200,28 @@ impl Editor {
         self.join_win.live_local = Some(live_local);
         self.join_win.live_converter = converter;
         self.join_win.live_applied += written;
+        // The report is written once the world has stopped changing, not as it
+        // arrives: a per-service count taken mid-stream is a count of half a
+        // place, and the refusal list is not sorted until there is something to
+        // sort. `live_world_report_at` is the point after which it is printed.
+        if !self.join_win.live_reported {
+            let settled = self
+                .join_win
+                .live_report_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(3));
+            if settled || new_world {
+                // A quiet three seconds with the batches drained *now*, or the
+                // first world arriving at all: either way this is the world as
+                // it stands, not half of one.
+                self.join_win.live_reported = true;
+                self.join_win.live_report_at = None;
+                self.live_datamodel_report();
+            } else if self.join_win.live_report_at.is_none() {
+                // The clock starts at the first batch and is *not* restarted by
+                // later ones: a stream that never pauses must still be reported.
+                self.join_win.live_report_at = Some(Instant::now());
+            }
+        }
         if !self.join_win.installed {
             // The first instances are in the editor: from here on this is a
             // place being played, not a join being watched.
@@ -204,6 +235,81 @@ impl Editor {
             ));
         }
         self.live_join_overlay();
+    }
+
+    /// What the world is made of, and what was refused building it (M3).
+    ///
+    /// Printed once a live session has settled, and on demand: a joined world
+    /// that is missing pieces needs to say *which* pieces, and "{} instances"
+    /// does not. The per-service counts say whether the place arrived whole
+    /// (Workspace, Players, Lighting, ReplicatedStorage); the refusal list says
+    /// which `Class.Property` the converter could not read, most frequent
+    /// first, because a DataModel with holes in it is almost always one
+    /// property in one class.
+    fn live_datamodel_report(&mut self) {
+        let Some(live) = self.join_win.live_local.as_ref() else {
+            return;
+        };
+        let doc = &self.game.doc;
+        let root = doc.dom.root_ref();
+        // The services a place is made of, as they stand now.
+        let mut services: Vec<(String, usize)> = Vec::new();
+        for child in doc.dom.get_by_ref(root).map(|i| i.children().to_vec()).unwrap_or_default() {
+            let Some(instance) = doc.dom.get_by_ref(child) else {
+                continue;
+            };
+            let count = doc.dom.descendants_of(child).count();
+            services.push((instance.class.to_string(), count));
+        }
+        services.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let made: Vec<String> = services
+            .iter()
+            .take(8)
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect();
+        self.info(format!(
+            "join world: {} instance(s) in {} service(s) — {}",
+            doc.dom.len(),
+            services.len(),
+            made.join(", ")
+        ));
+        let refused = live.refused_properties();
+        if refused.is_empty() {
+            self.info("join world: no property was refused");
+        } else {
+            let top: Vec<String> = refused
+                .iter()
+                .take(10)
+                .map(|(name, count)| format!("{name} ×{count}"))
+                .collect();
+            self.info(format!(
+                "join world: {} refused propert{} — {}",
+                refused.len(),
+                if refused.len() == 1 { "y" } else { "ies" },
+                top.join(", ")
+            ));
+        }
+        let dangling = live.dangling_refs();
+        if !dangling.is_empty() {
+            let top: Vec<String> = dangling
+                .iter()
+                .take(6)
+                .map(|(name, count)| format!("{name} ×{count}"))
+                .collect();
+            self.info(format!(
+                "join world: {} dangling ref(s) — {}",
+                dangling.iter().map(|(_, c)| c).sum::<usize>(),
+                top.join(", ")
+            ));
+        }
+        let classes = live.refused_classes();
+        if !classes.is_empty() {
+            let top: Vec<String> = classes
+                .iter()
+                .map(|(name, count)| format!("{name} ×{count}"))
+                .collect();
+            self.info(format!("join world: refused creates — {}", top.join(", ")));
+        }
     }
 
     /// The overlay's line while a session runs: packets, instances, rows.
@@ -555,6 +661,8 @@ impl Editor {
         self.join_win.live_world = Some(live.clone());
         self.join_win.live = None;
         self.join_win.live_logged_at = None;
+        self.join_win.live_report_at = None;
+        self.join_win.live_reported = false;
         // A new session's deltas describe a world built from nothing, so the
         // editor's half starts from nothing too. Carrying the id map across
         // would bind this session's `scope:index` to the previous one's refs.

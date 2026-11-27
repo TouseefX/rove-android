@@ -871,7 +871,10 @@ impl Game {
                 self.push_log(level, text);
             }
         }
+        // Play Solo is the only mode with *two* sides. A live client has one,
+        // and it is the client: the server is a machine somewhere else.
         let two = mode == RunMode::Play;
+        let network_client = mode == RunMode::Client;
         // From before any script runs until the session ends: no local files
         // as place content (assets::place_content_allowed).
         let scripts_running = rustudio_core::assets::ScriptsRunning::new();
@@ -901,17 +904,25 @@ impl Game {
         // World: a process-wide one would be reset by any other session
         // starting meanwhile (the tests run Play sessions side by side).
         let arrival = teleport.as_ref().map(|t| t.arrival.clone());
-        let mut server = match new_side(mode, Side::Server, two, signal_mode) {
-            Ok(s) => s,
-            Err(e) => {
-                self.error(format!("Could not start the Luau runtime: {e}"));
-                return;
+        // A network client starts no server at all: no server DataModel, no
+        // server `Script`s, no locally spawned character. `server` is `None`
+        // and every `with_side(Side::Server, ..)` is a no-op, which is exactly
+        // what "there is no server here" has to mean.
+        let mut server = if network_client {
+            None
+        } else {
+            match new_side(mode, Side::Server, two, signal_mode) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    self.error(format!("Could not start the Luau runtime: {e}"));
+                    return;
+                }
             }
         };
-        if let Some(w) = server.world.as_mut() {
+        if let Some(w) = server.as_mut().and_then(|v| v.world.as_mut()) {
             w.teleport_arrival = arrival.clone();
         }
-        let client = if two {
+        let client = if two || network_client {
             match new_side(mode, Side::Client, true, signal_mode) {
                 Ok(mut c) => {
                     if let Some(w) = c.world.as_mut() {
@@ -931,17 +942,33 @@ impl Game {
         // (the destination stands in for the edit document until the
         // session's copy is made; the edit document is what Stop brings back)
         let mut edit_doc = teleport.map(|t| std::mem::replace(&mut self.doc, t.doc));
-        let label = if two { "Play" } else { "Run" };
+        let label = match mode {
+            RunMode::Play => "Play",
+            RunMode::Client => "Live",
+            _ => "Run",
+        };
         let title = self.doc.title.clone();
         // A play worker's document is a copy made for this session already
         // (start_play_threaded): it becomes the server DataModel as it is.
         // Copying it again held a fourth copy of the place for the whole
         // session and took as long as the first (a million-instance place:
         // ~1 GB and ~6 s more, and the session's start ran out of memory).
-        let take = std::mem::take(&mut self.doc_is_play_copy) && edit_doc.is_none();
+        // A live client's DataModel *is* the replicated place: the document the
+        // join's deltas have been building since the first packet. It is not a
+        // copy of a local server, because there is no local server — the
+        // instance that owns this place is somewhere else, and the only thing
+        // this side knows about it is what arrived on the wire. Cloning the edit
+        // DataModel here is how a live session ended up running a local copy of
+        // a world that does not exist.
+        let take = network_client
+            || std::mem::take(&mut self.doc_is_play_copy) && edit_doc.is_none();
         let mut server_doc = if take {
             let mut d = std::mem::replace(&mut self.doc, Document::placeholder());
-            d.title = format!("{title} ({label}: Server)");
+            d.title = if network_client {
+                format!("{title} ({label})")
+            } else {
+                format!("{title} ({label}: Server)")
+            };
             d
         } else {
             self.doc.clone_for_play(format!("{title} ({label}: Server)"))
@@ -1029,6 +1056,10 @@ impl Game {
                 }
             }
         }
+        // A live client's DataModel is the one it already has (`self.doc`,
+        // moved into `server_doc` above): there is no local server to replicate
+        // *from*, so there is no second document and no `RepMap` — the server's
+        // own `Ref`s mean what the wire says they mean.
         let (mut client_doc, map) = if two {
             let (c, m) = replicate::initial_client(
                 &server_doc,
@@ -1161,14 +1192,14 @@ impl Game {
             }
         };
         self.with_side(Side::Server, bind);
-        if two {
+        if two || network_client {
             self.with_side(Side::Client, bind);
         }
         rustudio_core::load_trace::mark("play: globals bound");
         // Studio loads every plugin again in the Play server and client
         // DataModels (measured: each copy runs with IsEdit false).
         self.with_side(Side::Server, |rt, _, _| host.load_plugins(rt));
-        if two {
+        if two || network_client {
             self.with_side(Side::Client, |rt, _, _| host.load_plugins(rt));
         }
         self.with_side(Side::Server, |rt, _, _| rt.warm_queries());
@@ -1257,6 +1288,23 @@ impl Game {
             if self.play_shows_client {
                 self.show_play_side(Side::Client, host);
             }
+        }
+        if network_client {
+            // A live client's DataModel is `self.doc`, so the client half of a
+            // Play session — the Player and its PlayerScripts — is set up here
+            // rather than in the Play Solo block above, and no server half runs
+            // at all. There is no `create_player`, no head start and no local
+            // character: the character is the server's, and it arrives through
+            // the deltas like everything else.
+            self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
+            self.setup_client_player(core_scripts);
+            rustudio_core::load_trace::mark("play: live client player set up");
+            if self.play_shows_client {
+                self.show_play_side(Side::Client, host);
+            }
+            self.info(
+                "Live: the server's world and its character; no local server is running",
+            );
         }
         self.start_autoplay_sounds();
         rustudio_core::load_trace::mark("play: DataModels running");

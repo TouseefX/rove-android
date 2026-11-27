@@ -1,3 +1,9 @@
+//! **Not compiled.** The play code lives in `crates/rustudio-player/src/play.rs`
+//! and `src/lib.rs` re-exports it (`pub use rustudio_player::{… play}`), so
+//! this file is a leftover from before the split and nothing here is built.
+//! Edit the crate's copy instead: a change made here is invisible to `cargo
+//! check`, to the tests and to the APK, and it costs a CI round to find out.
+//!
 //! Play (F5), Run (F8) and Stop (Shift+F5).
 //!
 //! Play runs two DataModels like a Roblox test session: the **server** (a
@@ -160,10 +166,7 @@ pub struct PlaySession {
     saved_doc: Option<Document>,
     saved_cam: Camera,
     saved_sel: Vec<Ref>,
-    /// The server's side. `None` in a live session (`RunMode::Client`): a
-    /// networked client has no local server at all — the instance that owns the
-    /// place is elsewhere, and everything it owns arrives as a delta.
-    server: Option<SideState>,
+    server: SideState,
     client: Option<SideState>,
     /// The DataModel not shown in the editor right now.
     other_doc: Option<Document>,
@@ -242,15 +245,7 @@ impl PlaySession {
             .as_ref()
             .map(|w| (w.orphans.len(), w.freed))
             .unwrap_or_default();
-        // A live session has no server side, so there are no server Lua slots
-        // to read; the client's are counted where the client is.
-        let server_slots = self
-            .play
-            .as_ref()
-            .and_then(|s| s.server.as_ref())
-            .map(|s| s.runtime.lua_slots())
-            .unwrap_or(0);
-        (orphans, freed, server_slots)
+        (orphans, freed, self.server.runtime.lua_slots())
     }
 
     /// The id of the DataModel not shown (the server's while the client is).
@@ -443,19 +438,14 @@ impl Editor {
         let s = self.play.as_mut()?;
         let (result, output) = match side {
             Side::Server => {
-                // `?` in a `match` arm would return from the function, which is
-                // what `with_side` wants: a side that does not exist runs
-                // nothing and returns `None`. A live session has no server, so
-                // every server-side call here is a no-op by construction.
-                let srv = s.server.as_mut()?;
-                let mut w = srv.world.take()?;
+                let mut w = s.server.world.take()?;
                 w.doc = Some(std::mem::replace(&mut self.doc, Document::placeholder()));
-                srv.runtime.enter(w);
-                let r = f(&srv.runtime, s.other_doc.as_ref(), &mut s.map);
-                let mut w = srv.runtime.leave();
+                s.server.runtime.enter(w);
+                let r = f(&s.server.runtime, s.other_doc.as_ref(), &mut s.map);
+                let mut w = s.server.runtime.leave();
                 self.doc = w.doc.take().expect("server document returned");
                 let out = std::mem::take(&mut w.output);
-                srv.world = Some(w);
+                s.server.world = Some(w);
                 (r, out)
             }
             Side::Client => {
@@ -486,7 +476,7 @@ impl Editor {
     }
 
     fn server_world(&mut self) -> Option<&mut World> {
-        self.play.as_mut()?.server.as_mut()?.world.as_mut()
+        self.play.as_mut()?.server.world.as_mut()
     }
 
     fn client_world(&mut self) -> Option<&mut World> {
@@ -528,10 +518,7 @@ impl Editor {
                 self.push_log(level, text);
             }
         }
-        // Play Solo is the only mode with *two* sides. A live client has one,
-        // and it is the client: the server is a machine somewhere else.
         let two = mode == RunMode::Play;
-        let network_client = mode == RunMode::Client;
         // From before any script runs until the session ends: no local files
         // as place content (assets::place_content_allowed).
         let scripts_running = crate::assets::ScriptsRunning::new();
@@ -557,22 +544,14 @@ impl Editor {
         if crate::rustudio_settings::live_data() {
             self.info("DataStores: live");
         }
-        // A network client starts no server: no server DataModel, no server
-        // scripts, no locally spawned character. `server` is `None` and every
-        // `with_side(Side::Server, ..)` below is a no-op, which is exactly what
-        // "there is no server here" has to mean.
-        let server = if network_client {
-            None
-        } else {
-            match new_side(mode, Side::Server, two) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    self.error(format!("Could not start the Luau runtime: {e}"));
-                    return;
-                }
+        let server = match new_side(mode, Side::Server, two) {
+            Ok(s) => s,
+            Err(e) => {
+                self.error(format!("Could not start the Luau runtime: {e}"));
+                return;
             }
         };
-        let client = if two || network_client {
+        let client = if two {
             match new_side(mode, Side::Client, true) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -584,24 +563,10 @@ impl Editor {
             None
         };
         crate::load_trace::mark("play: runtimes made");
-        let label = match mode {
-            RunMode::Play => "Play",
-            RunMode::Client => "Live",
-            _ => "Run",
-        };
-        // A live client takes the document it already has — the place the join
-        // has been replicating into — rather than cloning the edit DataModel.
-        // The edit DataModel is not this place: it is whatever was open before
-        // the join, and cloning it here is how a live session ended up running
-        // a local copy of a world that does not exist.
-        let mut server_doc = if network_client {
-            let mut d = std::mem::replace(&mut self.doc, Document::empty());
-            d.title = format!("{} ({label})", d.title);
-            d
-        } else {
-            self.doc
-                .clone_for_play(format!("{} ({label}: Server)", self.doc.title))
-        };
+        let label = if two { "Play" } else { "Run" };
+        let mut server_doc = self
+            .doc
+            .clone_for_play(format!("{} ({label}: Server)", self.doc.title));
         // Roblox's default PlayerModule, PlayerScriptsLoader and
         // RbxCharacterSounds join StarterPlayerScripts, as Studio does.
         // Every Roblox DataModel has these services, even when the file
@@ -663,18 +628,6 @@ impl Editor {
         } else {
             Vec::new()
         };
-        // A live client's DataModel *is* the replicated place: the editor's
-        // document, which the join's deltas have been building since the first
-        // packet (src/join_window.rs). It is not a copy of a local server,
-        // because there is no local server — the instance that owns this place
-        // is somewhere else, and the only thing this side knows about it is what
-        // arrived on the wire.
-        //
-        // `server_doc` is still built above because `PlaySession` needs a
-        // DataModel for `self.doc`, and for a live client that DataModel is this
-        // one: the place as it stands at the moment Play is pressed. The session
-        // keeps growing it — the deltas go on arriving into `self.doc`, which is
-        // the same document the scene draws.
         let (client_doc, map) = if two {
             let (c, m) = replicate::initial_client(
                 &server_doc,
@@ -685,22 +638,8 @@ impl Editor {
             (None, RepMap::default())
         };
         crate::load_trace::mark("play: client DataModel replicated");
-        // Stop must bring back what was there before the session. A live
-        // client's `self.doc` *is* `server_doc` (the replicated place,
-        // moved out of it above), so putting it back is what makes it the
-        // DataModel the editor draws. There is no edit place to restore, so
-        // `saved_doc` is `None` and Stop ends the session instead of returning
-        // to one.
-        let (saved_sel, saved_doc) = if network_client {
-            let selection = std::mem::take(&mut server_doc.selection);
-            self.doc = server_doc;
-            self.doc.selection = selection;
-            (Vec::new(), None)
-        } else {
-            let sel = std::mem::take(&mut self.doc.selection);
-            let saved = std::mem::replace(&mut self.doc, server_doc);
-            (sel, Some(saved))
-        };
+        let saved_sel = std::mem::take(&mut self.doc.selection);
+        let saved_doc = std::mem::replace(&mut self.doc, server_doc);
         let mut physics = Physics::new(&mut self.doc);
         crate::load_trace::mark("play: physics built");
         self.info(format!("Physics solver: {}", solver.name()));
@@ -709,12 +648,9 @@ impl Editor {
         let mut server = server;
         let mut client = client;
         let groups = crate::collision_groups::shared();
-        for w in [
-            server.as_mut().and_then(|v| v.world.as_mut()),
-            client.as_mut().and_then(|c| c.world.as_mut()),
-        ]
-        .into_iter()
-        .flatten()
+        for w in [server.world.as_mut(), client.as_mut().and_then(|c| c.world.as_mut())]
+            .into_iter()
+            .flatten()
         {
             w.groups = groups.clone();
             w.avatar = self.account.avatar().cloned();
@@ -724,7 +660,7 @@ impl Editor {
             npcs: Default::default(),
             mode,
             _scripts_running: scripts_running,
-            saved_doc,
+            saved_doc: Some(saved_doc),
             saved_cam: self.cam.clone(),
             saved_sel,
             server,
@@ -787,7 +723,6 @@ impl Editor {
         self.info(match mode {
             RunMode::Play => "▶ Play: a server and a client are running; WASD + Space to move, Shift+F5 to stop",
             RunMode::Run => "▶ Run: server scripts and physics running (no client, no character), Shift+F5 to stop",
-            RunMode::Client => "▶ Live: the server's world, its character; WASD + Space to move, Shift+F5 to leave",
             RunMode::Edit => "",
         });
 
@@ -800,7 +735,7 @@ impl Editor {
             }
         };
         self.with_side(Side::Server, bind);
-        if two || network_client {
+        if two {
             self.with_side(Side::Client, bind);
         }
         crate::load_trace::mark("play: globals bound");
@@ -808,15 +743,12 @@ impl Editor {
         // DataModels (measured: each copy runs with IsEdit false).
         let host = std::mem::take(&mut self.plugins);
         self.with_side(Side::Server, |rt, _, _| host.load_into_play(rt));
-        if two || network_client {
+        if two {
             self.with_side(Side::Client, |rt, _, _| host.load_into_play(rt));
         }
         self.plugins = host;
         self.with_side(Side::Server, |rt, _, _| rt.warm_queries());
         crate::load_trace::mark("play: server queries warmed");
-        // A live client has no server to warm, to start scripts on, or to make
-        // a Player: the server that has those is the one the join is attached
-        // to, and everything it owns arrives through the deltas.
         // Server scripts start first, as on a real server; the player joins
         // after (so Players:GetPlayers() is empty when they start).
         let server_scripts = self.server_scripts(None);
@@ -2388,13 +2320,7 @@ impl Editor {
         // An avatar that arrived after Play started (it wasn't waited for:
         // CharacterAutoLoads off) is the next LoadCharacter's.
         if let (Some(look), Some(s)) = (self.account.avatar(), self.play.as_mut()) {
-            for w in [
-                s.server.as_mut().and_then(|v| v.world.as_mut()),
-                s.client.as_mut().and_then(|c| c.world.as_mut()),
-            ]
-            .into_iter()
-            .flatten()
-            {
+            for w in [s.server.world.as_mut(), s.client.as_mut().and_then(|c| c.world.as_mut())].into_iter().flatten() {
                 if w.avatar.is_none() {
                     w.avatar = Some(look.clone());
                 }
@@ -2554,11 +2480,7 @@ impl Editor {
         let sc = crate::bench::scope("p1_physics_sync");
         {
             let s = self.play.as_mut().expect("playing");
-            let w = s
-                .server
-                .as_mut()
-                .and_then(|v| v.world.as_mut())
-                .expect("server world");
+            let w = s.server.world.as_mut().expect("server world");
             let vel = std::mem::take(&mut w.velocity_requests);
             s.physics.sync(&mut self.doc);
             if let Some(c) = s.other_doc.as_mut() {
@@ -2617,12 +2539,7 @@ impl Editor {
             // What the scripts did on Stepped / PreSimulation reaches this
             // frame's world steps.
             if let Some(s) = self.play.as_mut() {
-                let vel = s
-                    .server
-                    .as_mut()
-                    .and_then(|v| v.world.as_mut())
-                    .map(|w| std::mem::take(&mut w.velocity_requests))
-                    .unwrap_or_default();
+                let vel = s.server.world.as_mut().map(|w| std::mem::take(&mut w.velocity_requests)).unwrap_or_default();
                 s.physics.sync(&mut self.doc);
                 if let Some(c) = s.other_doc.as_mut() {
                     s.physics.follow_client(&self.doc, c, &s.map.c2s);
@@ -3587,7 +3504,7 @@ impl Editor {
     pub(crate) fn play_side_lua(&self, side: Side) -> Option<&mlua::Lua> {
         let s = self.play.as_ref()?;
         match side {
-            Side::Server => s.server.as_ref().map(|v| &v.runtime.lua),
+            Side::Server => Some(&s.server.runtime.lua),
             Side::Client => s.client.as_ref().map(|c| &c.runtime.lua),
         }
     }
@@ -3745,21 +3662,13 @@ impl Editor {
     /// the physics when a side's set grew.
     fn sync_touch_interest(&mut self) {
         let Some(s) = self.play.as_mut() else { return };
-        let srev = s
-            .server
-            .as_ref()
-            .and_then(|v| v.with_world(|w| w.touch_rev))
-            .unwrap_or(0);
+        let srev = s.server.with_world(|w| w.touch_rev).unwrap_or(0);
         let crev = s.client.as_ref().and_then(|c| c.with_world(|w| w.touch_rev)).unwrap_or(0);
         if s.touch_seen == Some((srev, crev)) {
             return;
         }
         s.touch_seen = Some((srev, crev));
-        let mut refs: Vec<Ref> = s
-            .server
-            .as_ref()
-            .and_then(|v| v.with_world(|w| w.touch_refs.iter().copied().collect()))
-            .unwrap_or_default();
+        let mut refs: Vec<Ref> = s.server.with_world(|w| w.touch_refs.iter().copied().collect()).unwrap_or_default();
         let client: Vec<Ref> = s.client.as_ref().and_then(|c| c.with_world(|w| w.touch_refs.iter().copied().collect())).unwrap_or_default();
         for r in client {
             refs.push(r);

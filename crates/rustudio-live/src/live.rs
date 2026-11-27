@@ -138,6 +138,17 @@ pub struct Live {
     waiting_for_parent: HashMap<String, String>,
     /// Events too old to dispatch (their instances are gone).
     dropped_events: usize,
+    /// Every `Class.Property` the converter refused, counted. A join whose
+    /// DataModel is missing pieces says so here by name rather than as a
+    /// number: "{} refused" is a fault, `Part.Shape` refused 412 times is a
+    /// thing to go and fix.
+    refused_properties: std::collections::BTreeMap<String, usize>,
+    /// Classes whose create was refused outright.
+    refused_classes: std::collections::BTreeMap<String, usize>,
+    /// `$ref` targets that were not in the world when the property arrived and
+    /// were dropped: a dangling reference, which is how a Model loses its
+    /// PrimaryPart.
+    dangling_refs: std::collections::BTreeMap<String, usize>,
 }
 
 impl Live {
@@ -147,6 +158,9 @@ impl Live {
             refs: HashMap::new(),
             waiting_for_parent: HashMap::new(),
             dropped_events: 0,
+            refused_properties: std::collections::BTreeMap::new(),
+            refused_classes: std::collections::BTreeMap::new(),
+            dangling_refs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -158,6 +172,9 @@ impl Live {
             refs: world.refs.clone(),
             waiting_for_parent: HashMap::new(),
             dropped_events: 0,
+            refused_properties: std::collections::BTreeMap::new(),
+            refused_classes: std::collections::BTreeMap::new(),
+            dangling_refs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -186,6 +203,39 @@ impl Live {
 
     pub fn dropped_events(&self) -> usize {
         self.dropped_events
+    }
+
+    /// `Class.Property` values the converter refused, most-frequent first.
+    ///
+    /// A live world that is missing pieces is diagnosable from this list: the
+    /// top entry is almost always one property in one class, and knowing which
+    /// is the difference between "the join is broken" and "`Part.Shape` is not
+    /// converted yet".
+    pub fn refused_properties(&self) -> Vec<(&str, usize)> {
+        let mut out: Vec<(&str, usize)> = self
+            .refused_properties
+            .iter()
+            .map(|(name, count)| (name.as_str(), *count))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        out
+    }
+
+    /// Creates refused because the node named no class.
+    pub fn refused_classes(&self) -> Vec<(&str, usize)> {
+        self.refused_classes
+            .iter()
+            .map(|(name, count)| (name.as_str(), *count))
+            .collect()
+    }
+
+    /// Properties dropped because the `$ref` target was not in the world yet,
+    /// by `Class.Property`.
+    pub fn dangling_refs(&self) -> Vec<(&str, usize)> {
+        self.dangling_refs
+            .iter()
+            .map(|(name, count)| (name.as_str(), *count))
+            .collect()
     }
 
     /// One batch of journal records' world actions, applied to `doc`.
@@ -232,6 +282,7 @@ impl Live {
         };
         let Some(class) = node.get("class_name").and_then(J::as_str) else {
             stats.unknown_ids += 1;
+            *self.refused_classes.entry("<no class_name>".to_owned()).or_default() += 1;
             return;
         };
         // The parent, if this delta brought one and the world has it; else the
@@ -280,7 +331,13 @@ impl Live {
                 }
                 match self.convert(property, class, value, conv) {
                     Ok(v) => values.push((property.clone(), v)),
-                    Err(_) => stats.refused_values += 1,
+                    Err(_) => {
+                        stats.refused_values += 1;
+                        *self
+                            .refused_properties
+                            .entry(format!("{class}.{property}"))
+                            .or_default() += 1;
+                    }
                 }
             }
             if let Some(instance) = doc.dom.get_by_ref_mut(r) {
@@ -343,9 +400,24 @@ impl Live {
                         }
                         doc.mark_prop(r, key);
                     }
-                    None => stats.unknown_ids += 1,
-                },
-                Err(ConvertError::Value(_)) => stats.refused_values += 1,
+                    None => {
+                        stats.unknown_ids += 1;
+                        // The target had not arrived when the property naming it
+                        // did. Counted by name: this is the fault that leaves a
+                        // Model with no PrimaryPart and a weld with no Part1.
+                        *self
+                            .dangling_refs
+                            .entry(format!("{class}.{property}"))
+                            .or_default() += 1;
+                    }
+                }
+                Err(ConvertError::Value(_)) => {
+                    stats.refused_values += 1;
+                    *self
+                        .refused_properties
+                        .entry(format!("{class}.{property}"))
+                        .or_default() += 1;
+                }
             }
         }
     }

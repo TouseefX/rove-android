@@ -440,6 +440,8 @@ fn every_applied_delta_is_marked_for_the_scene() {
     // only way to say which packet produced them.
     let mut saw_create = false;
     let mut saw_prop = false;
+    // (both are asserted below: a create and a property write each have to be
+    // marked, and either alone would pass a test that only counted marks)
     for (index, (kind, bytes)) in packets(&recording).into_iter().enumerate() {
         let before = doc.revision;
         core.ingest(&bytes)
