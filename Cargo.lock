@@ -4758,6 +4758,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustudio-join"
+version = "0.5.2"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "rbx_dom_weak",
+ "rove-client-core",
+ "rustudio-core",
+ "rustudio-live",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "rustudio-live"
 version = "0.5.2"
 dependencies = [
