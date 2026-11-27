@@ -278,6 +278,10 @@ impl Editor {
                 .map(|i| i.children().to_vec())
                 .unwrap_or_default();
             for child in children {
+                // `children()` was taken before this loop and the loop does not
+                // write, so every ref is still present — but `descendants_of`
+                // panics rather than returning empty if that ever stops being
+                // true, and a report must not be able to kill the editor.
                 let Some(instance) = doc.dom.get_by_ref(child) else {
                     continue;
                 };

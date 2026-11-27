@@ -717,9 +717,16 @@ impl Game {
     /// True while a Play session drives a character.
     pub fn play_has_character(&self) -> bool {
         self.play.as_ref().is_some_and(|p| {
-            p.mode == RunMode::Play && p.presentation.as_ref().map_or_else(
-                || p.character.as_ref().is_some_and(|c| !c.dead), |p| p.has_character,
-            )
+            // `RunMode::Client` too: a live client's character is the server's,
+            // replicated into this document, and the camera and controls bind to
+            // it exactly as a Play Solo client's do. Without this the joined
+            // world had a `Player.Character` in it and nothing following it —
+            // every avatar stood still because nothing was looking at one.
+            matches!(p.mode, RunMode::Play | RunMode::Client)
+                && p.presentation.as_ref().map_or_else(
+                    || p.character.as_ref().is_some_and(|c| !c.dead),
+                    |p| p.has_character,
+                )
         })
     }
 
@@ -1315,7 +1322,7 @@ impl Game {
             // character: the character is the server's, and it arrives through
             // the deltas like everything else.
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
-            self.setup_client_player(core_scripts.take());
+            self.setup_live_client_player(core_scripts.take());
             rustudio_core::load_trace::mark("play: live client player set up");
             if self.play_shows_client {
                 self.show_play_side(Side::Client, host);
@@ -1594,8 +1601,15 @@ impl Game {
         let Some(mut s) = self.play.take() else {
             return;
         };
+        // A live client has no edit place to go back to: its document *is* the
+        // joined world, and the placeholder the worker path kept is an empty
+        // DataModel that would wipe the editor. Leaving it is the honest
+        // outcome — the session ends, the world stays on screen, nothing is
+        // restored that was never saved.
         if let Some(d) = s.saved_doc.take() {
-            self.doc = d;
+            if !(s.mode == RunMode::Client && d.dom.len() <= 1) {
+                self.doc = d;
+            }
         }
         self.edit_audio.stop_playback();
         self.doc.discard_marks_for(doc::Reader::EditAudio);
@@ -1629,6 +1643,14 @@ impl Game {
         };
         let mut out = Vec::new();
         for s in &roots {
+            // A live document is written by another thread every frame: an
+            // instance this walk started from can be gone by the time it is
+            // walked, and `descendants_of` panics on a ref that is not in the
+            // DOM rather than returning nothing. (A phone log, 21:10:21, from a
+            // streaming place whose region was rebuilt under the walk.)
+            if d.dom.get_by_ref(*s).is_none() {
+                continue;
+            }
             for i in d.dom.descendants_of(*s) {
                 let client = rustudio_render::scene::enum_u32(d.prop(i.referent(), "RunContext")) == Some(2);
                 if i.class == "Script" && !client && script_enabled(d, i.referent()) {
@@ -1642,6 +1664,9 @@ impl Game {
         if under.is_none() {
             for name in ["ReplicatedStorage", "ReplicatedFirst", "StarterPlayer", "Lighting", "SoundService", "Teams", "Chat", "TextChatService", "Players"] {
                 let Some(svc) = d.find_child(root, name) else { continue };
+                if d.dom.get_by_ref(svc).is_none() {
+                    continue;
+                }
                 for i in d.dom.descendants_of(svc) {
                     let r = i.referent();
                     if i.class != "Script" || rustudio_render::scene::enum_u32(d.prop(r, "RunContext")) != Some(1) || !script_enabled(d, r) {
@@ -1773,6 +1798,287 @@ impl Game {
 
     /// Client side of joining: LocalPlayer, PlayerScripts (client-only,
     /// filled from StarterPlayerScripts), then LocalScripts start.
+    /// Pick up the server's character once it has been replicated, and rebind
+    /// when it is replaced on respawn.
+    ///
+    /// A live client makes no character: the server does, and it arrives as a
+    /// `Player.Character` ref through the delta stream. This is the other half of
+    /// `setup_live_client_player` — that names `LocalPlayer`, this finds the
+    /// model that belongs to it.
+    ///
+    /// The **rig type is read, never assumed**: an R6 model has no `UpperTorso`
+    /// and a rig forced to R15 against an R6 body has no parts to write a pose
+    /// to. `RigType` is decided from the parts actually present.
+    ///
+    /// Cheap when there is nothing to do (one property read), so it runs every
+    /// frame; it acts once per character.
+    fn bind_live_character(&mut self) {
+        let Some(s) = self.play.as_ref() else { return };
+        if s.mode != RunMode::Client || s.server.is_some() {
+            return;
+        }
+        // Already bound and the model is still there: nothing to do.
+        let bound = s.character.as_ref().map(|c| c.model);
+        let root = self.doc.dom.root_ref();
+        let Some(players) = self.doc.find_child(root, "Players") else {
+            return;
+        };
+        let Some(local) = (match self.doc.prop(players, "LocalPlayer") {
+            Some(Variant::Ref(p)) if self.doc.exists(p) => Some(p),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(character) = (match self.doc.prop(local, "Character") {
+            Some(Variant::Ref(c)) if self.doc.exists(c) => Some(c),
+            _ => None,
+        }) else {
+            return;
+        };
+        if bound == Some(character) {
+            return;
+        }
+        // A model this process already drives, or a new one?
+        let Some(humanoid) = self
+            .doc
+            .dom
+            .descendants_of(character)
+            .find(|i| i.class == "Humanoid")
+            .map(|i| i.referent())
+        else {
+            // The ref is here but the subtree is still streaming in. Try again
+            // next frame; nothing is broken.
+            return;
+        };
+        // **The rig the server made**, not the one the setting asks for.
+        let rig_type = if self.doc.find_named(character, "UpperTorso").is_some()
+            || self.doc.find_named(character, "LowerTorso").is_some()
+        {
+            RigType::R15
+        } else {
+            RigType::R6
+        };
+        // Where it stands: the root's replicated position, so the camera does
+        // not swing across the map on the frame of the bind.
+        let (start, yaw) = match self
+            .doc
+            .find_named(character, "HumanoidRootPart")
+            .or_else(|| self.doc.find_named(character, "Torso"))
+            .and_then(|r| self.doc.prop(r, "CFrame"))
+        {
+            // `Xform::from_cframe` is how every other part's CFrame is read
+            // here: rbx_types stores the matrix as rows, and taking it apart by
+            // hand is how a character ends up facing 90° off.
+            Some(Variant::CFrame(cf)) => {
+                let x = Xform::from_cframe(&cf);
+                // Yaw in radians from the CFrame's own orientation, the same
+                // value `character_pose` writes back — so the bind does not
+                // rotate the model on its first frame.
+                (x.pos, x.orientation_deg().y.to_radians())
+            }
+            _ => self.character_spawn_point(),
+        };
+        let ch = self.character_at(character, rig_type, humanoid, start, yaw);
+        let rig_label = match rig_type {
+            RigType::R15 => "R15",
+            RigType::R6 => "R6",
+        };
+        if let Some(p) = self.play.as_mut() {
+            // The model is the server's: its motion arrives as replication, so
+            // this side reads the pose rather than integrating it. `s.character`
+            // is still what the camera and the controls bind to.
+            p.character = Some(ch);
+            p.initial_spawn_frames = None;
+        }
+        self.info(format!(
+            "Live: bound to the server's character ({rig_label}); the camera follows it",
+        ));
+    }
+
+    /// The client half of a **live** session, on the replicated document.
+    ///
+    /// `setup_client_player` cannot do this job: it is written for Play Solo,
+    /// where this process made the server and therefore holds the `s2c` map from
+    /// the server's Player to the client's. A live client made no server, so
+    /// `s.map.s2c.get(&s.player)` is `None`, that function returns on its second
+    /// line, and none of the following ever happened on a joined place:
+    /// `Players.LocalPlayer` was never set, no `PlayerScripts` existed, and no
+    /// LocalScript ran. That is why every character stood still and the view
+    /// never became a game.
+    ///
+    /// What a live client needs is narrower and is all here: find *its* Player
+    /// among the replicated ones, name it `LocalPlayer`, give it `PlayerScripts`
+    /// copied from `StarterPlayerScripts`, make sure Workspace has a
+    /// `CurrentCamera` set to Custom, and collect the LocalScripts to start.
+    /// The character is not made here — the server replicates it, and
+    /// `bind_live_character` picks it up when it arrives.
+    fn setup_live_client_player(
+        &mut self,
+        core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
+    ) {
+        let Some(s) = self.play.as_ref() else { return };
+        if s.server.is_some() {
+            // Not a live client after all: the Play Solo path owns this.
+            return;
+        }
+        let doc = &mut self.doc;
+        let root = doc.dom.root_ref();
+        let players = doc.find_child(root, "Players");
+        // Whose Player is this? `Player.UserId` is what the server replicated
+        // for us, and it is what `account` says we are. A server that has not
+        // sent `Players` yet is not an error: the caller runs this once the
+        // world has arrived.
+        let me = players.and_then(|players| {
+            let uid = self.account.user_id()?;
+            let children = doc.dom.get_by_ref(players).map(|i| i.children().to_vec())?;
+            children.into_iter().find(|c| {
+                doc.dom.get_by_ref(*c).is_some_and(|i| {
+                    // `UserId` arrives as whatever the reflection database says;
+                    // rove's converter decides between the integer widths, so
+                    // both are read rather than guessed at.
+                    let id = match i.properties.get(&ustr("UserId")) {
+                        Some(Variant::Int64(v)) => Some(*v as u64),
+                        Some(Variant::Int32(v)) => Some(*v as u64),
+                        _ => None,
+                    };
+                    i.class == "Player" && id == Some(uid)
+                })
+            })
+        });
+        let Some(player) = me else {
+            self.info(
+                "Live: Players.UserId is not in the world yet; the character binds when it arrives",
+            );
+            return;
+        };
+        // The replicated Player is renamed here, as Roblox does: a client's own
+        // Player is `Players.LocalPlayer` and its Name is its own.
+        if let Some(players) = players {
+            if let Some(i) = doc.dom.get_by_ref_mut(players) {
+                i.properties.insert(ustr("LocalPlayer"), Variant::Ref(player));
+            }
+            doc.mark_prop(players, ustr("LocalPlayer"));
+        }
+        // PlayerScripts, from the replicated StarterPlayerScripts. A client
+        // whose scripts arrive with the world must not copy them twice.
+        let has_scripts = doc
+            .find_child(player, "PlayerScripts")
+            .is_some();
+        if !has_scripts {
+            let scripts = doc.dom.insert(
+                player,
+                InstanceBuilder::new("PlayerScripts").with_name("PlayerScripts"),
+            );
+            if let Some(sps) = doc
+                .find_child(root, "StarterPlayer")
+                .and_then(|sp| doc.find_child(sp, "StarterPlayerScripts"))
+            {
+                for k in doc
+                    .dom
+                    .get_by_ref(sps)
+                    .map(|i| i.children().to_vec())
+                    .unwrap_or_default()
+                {
+                    let c = doc.dom.clone_within(k);
+                    doc.dom.transfer_within(c, scripts);
+                }
+            }
+            doc.mark_tree(scripts);
+        }
+        // Workspace.CurrentCamera, Custom — the PlayerModule's cameras drive it.
+        if let Some(ws) = doc.workspace() {
+            let has = matches!(doc.prop(ws, "CurrentCamera"), Some(Variant::Ref(c)) if doc.exists(c));
+            let cam = if has {
+                match doc.prop(ws, "CurrentCamera") {
+                    Some(Variant::Ref(c)) => Some(c),
+                    _ => None,
+                }
+            } else {
+                Some(doc.dom.insert(
+                    ws,
+                    InstanceBuilder::new("Camera")
+                        .with_name("Camera")
+                        .with_property("FieldOfView", mech::FOV_DEG),
+                ))
+            };
+            if let Some(cam) = cam {
+                if !has {
+                    if let Some(i) = doc.dom.get_by_ref_mut(ws) {
+                        i.properties
+                            .insert(ustr("CurrentCamera"), Variant::Ref(cam));
+                    }
+                }
+                if let Some(i) = doc.dom.get_by_ref_mut(cam) {
+                    i.properties.insert(
+                        ustr("CameraType"),
+                        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(
+                            mech::CAMERA_TYPE_CUSTOM,
+                        )),
+                    );
+                }
+                doc.mark_prop(cam, ustr("CameraType"));
+            }
+        }
+        // The scripts to start: LocalScripts and Client RunContext Scripts,
+        // excluding the CoreScripts the patch installed.
+        let mut local = client_scripts(doc, &[doc.find_child(root, "ReplicatedFirst"), Some(player)]);
+        let services: Vec<Ref> = doc
+            .dom
+            .get_by_ref(root)
+            .map(|r| {
+                r.children()
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        doc.dom
+                            .get_by_ref(c)
+                            .is_some_and(|i| i.class != "CoreGui" && i.class != "CorePackages")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for svc in services {
+            if doc.dom.get_by_ref(svc).is_none() {
+                continue;
+            }
+            for i in doc.dom.descendants_of(svc) {
+                if i.class == "Script"
+                    && rustudio_render::scene::enum_u32(doc.prop(i.referent(), "RunContext")) == Some(2)
+                    && script_enabled(doc, i.referent())
+                    && !local.contains(&i.referent())
+                {
+                    local.push(i.referent());
+                }
+            }
+        }
+        self.sync_view_size();
+        // Start them on the client side. CoreScripts first, as a Play client
+        // does, then the place's own — `start_collected` is idempotent per ref.
+        let started = local.len();
+        self.with_side(Side::Client, |rt, _, _| {
+            for r in local {
+                rt.start_collected(r);
+            }
+            rt.dispatch();
+        });
+        self.info(format!(
+            "Live: Players.LocalPlayer = {} (UserId {}), {} client script(s) started",
+            doc.dom.get_by_ref(player).map(|i| i.name.as_str()).unwrap_or("?"),
+            self.account.user_id().unwrap_or(0),
+            started
+        ));
+        // CoreScripts, if the patch gave any: a joined place needs the player
+        // module, which is what binds the camera to the character.
+        if let Some(Ok((installed, _line))) = core.take() {
+            let started = self
+                .with_side(Side::Client, |rt, _, _| rt.start_core_scripts(installed))
+                .is_some_and(|result| result.is_ok());
+            if let Some(s) = self.play.as_mut() {
+                s.game.core_scripts_active = started;
+            }
+        }
+    }
+
     fn setup_client_player(
         &mut self,
         core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
@@ -2291,7 +2597,13 @@ impl Game {
                     i.name = name.clone();
                 }
                 // Animate finds the Animator with FindFirstChildOfClass.
-                if let Some(h) = self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid").map(|i| i.referent()) {
+                if let Some(h) = self
+                    .doc
+                    .dom
+                    .get_by_ref(m)
+                    .and_then(|_| self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid"))
+                    .map(|i| i.referent())
+                {
                     let has = self.doc.dom.get_by_ref(h).is_some_and(|i| {
                         i.children().iter().any(|c| self.doc.dom.get_by_ref(*c).is_some_and(|c| c.class == "Animator"))
                     });
@@ -2341,7 +2653,13 @@ impl Game {
                 // The avatar's equipped emotes (Humanoid:PlayEmote, /e, the
                 // emote wheel read them from here).
                 if let Some(look) = self.account.avatar().filter(|l| !l.emotes.is_empty()).cloned() {
-                    if let Some(h) = self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid").map(|i| i.referent()) {
+                    if let Some(h) = self
+                        .doc
+                        .dom
+                        .get_by_ref(m)
+                        .and_then(|_| self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid"))
+                        .map(|i| i.referent())
+                    {
                         self.doc.dom.insert(h, rustudio_engine::avatar::emote_description(&look));
                     }
                 }
@@ -2451,10 +2769,16 @@ impl Game {
         let parts: Vec<Ref> = self
             .doc
             .dom
-            .descendants_of(m)
-            .filter(|i| doc::is_a(&i.class, "BasePart"))
-            .map(|i| i.referent())
-            .collect();
+            .get_by_ref(m)
+            .map(|_| {
+                self.doc
+                    .dom
+                    .descendants_of(m)
+                    .filter(|i| doc::is_a(&i.class, "BasePart"))
+                    .map(|i| i.referent())
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(p) = self.play.as_mut() {
             p.physics.skip.extend(parts.iter().copied());
             p.physics.refresh(parts);
@@ -3069,10 +3393,16 @@ impl Game {
             let parts: Vec<Ref> = self
                 .doc
                 .dom
-                .descendants_of(ch.model)
-                .filter(|i| doc::is_a(&i.class, "BasePart"))
-                .map(|i| i.referent())
-                .collect();
+                .get_by_ref(ch.model)
+                .map(|_| {
+                    self.doc
+                        .dom
+                        .descendants_of(ch.model)
+                        .filter(|i| doc::is_a(&i.class, "BasePart"))
+                        .map(|i| i.referent())
+                        .collect()
+                })
+                .unwrap_or_default();
             (ch.model, parts)
         };
         let motors: Vec<Ref> = self
@@ -3903,8 +4233,15 @@ impl Game {
         let sc = rustudio_core::bench::scope("p1_physics_sync");
         {
             let s = self.play.as_mut().expect("playing");
-            let w = s.server.as_mut().and_then(|server| server.world.as_mut()).expect("server world");
-            let vel = std::mem::take(&mut w.velocity_requests);
+            // A live client (`RunMode::Client`) has no server world at all, and
+            // this `expect` is what crashed the phone at 21:09:49 and again on
+            // the next launch from the crash marker. Script velocity requests
+            // only exist on a side whose scripts ran here; on a live client the
+            // server owns them and they arrive as replicated motion.
+            let vel = match s.server.as_mut().and_then(|server| server.world.as_mut()) {
+                Some(w) => std::mem::take(&mut w.velocity_requests),
+                None => Vec::new(),
+            };
             s.physics.sync(&mut self.doc);
             s.physics.set_streaming_visibility(
                 s.map.streaming_collider_revision(),
@@ -3944,6 +4281,12 @@ impl Game {
         }
         // 2. Character (owned by the client: written to both DataModels).
         let sc = rustudio_core::bench::scope("p2_character");
+        // A live client has no character until the server replicates one: this
+        // is where it becomes available, and it is re-bound on every respawn.
+        // One property read on the frames where there is nothing to do.
+        if mode == RunMode::Client {
+            self.bind_live_character();
+        }
         let mut hum_out: Option<hum_glue::HumFrameOut> = None;
         if mode == RunMode::Play && self.play_has_character()
             && !self.play.as_ref().is_some_and(|s| s.map.gameplay_paused())
@@ -5270,6 +5613,11 @@ fn load_core_scripts(cdoc: &mut Document) -> Result<(rustudio_core::core_scripts
 fn client_scripts(cd: &Document, under: &[Option<Ref>]) -> Vec<Ref> {
     let mut out = Vec::new();
     for u in under.iter().flatten() {
+        // The ref may have gone: a live document is written every frame, and
+        // `descendants_of` panics rather than returning nothing.
+        if cd.dom.get_by_ref(*u).is_none() {
+            continue;
+        }
         for i in cd.dom.descendants_of(*u) {
             let client_script = i.class == "Script"
                 && rustudio_render::scene::enum_u32(cd.prop(i.referent(), "RunContext")) == Some(2);

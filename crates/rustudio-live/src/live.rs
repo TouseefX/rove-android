@@ -438,7 +438,24 @@ impl Live {
         // instances that no longer exist, or a later `$ref` binds a dead ref.
         // `descendants` yields `&Instance` (the ref is `referent()`), and a
         // whole map is dropped per batch rather than per instance.
-        let doomed: Vec<Ref> = doc.dom.descendants_of(r).map(|i| i.referent()).collect();
+        // `descendants_of` *panics* when the ref is not in the DOM, and this is
+        // the one place a live stream can hand it a ref that is not: the server
+        // may send a remove for an instance a previous remove in the same batch
+        // already destroyed, and a writer that panicked on that took the
+        // editor's thread down with it (a phone log, 21:10:21).
+        let doomed: Vec<Ref> = match doc.dom.get_by_ref(r) {
+            Some(_) => doc.dom.descendants_of(r).map(|i| i.referent()).collect(),
+            None => {
+                // Gone already: forget the id so a later `$ref` cannot bind it,
+                // and count it as the duplicate it is.
+                if let Some(id) = self.refs.remove(&r) {
+                    self.ids.remove(&id);
+                    self.waiting_for_parent.remove(&id);
+                }
+                stats.unknown_ids += 1;
+                return;
+            }
+        };
         for d in &doomed {
             if let Some(id) = self.refs.remove(d) {
                 self.ids.remove(&id);
@@ -725,6 +742,47 @@ mod tests {
         assert!(live.referent("3:1").is_none());
         assert!(live.referent("3:2").is_none(), "no dead refs stay in the map");
         assert_eq!(live.len(), 0);
+    }
+
+    /// A remove for an instance a previous remove already destroyed must be
+    /// counted, not fatal.
+    ///
+    /// `descendants_of` **panics** when the ref is not in the DOM, and a live
+    /// stream can hand one a dead ref: the server may remove a subtree and then
+    /// name a child of it, or send the same remove twice around a region
+    /// rebuild. On a phone this took the editor's thread down at 21:10:21,
+    /// seconds after the world had been arriving perfectly.
+    #[test]
+    fn a_remove_for_something_already_gone_does_not_panic() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        live.apply(
+            &mut doc,
+            &[
+                action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                    "node": {"id": "3:1", "class_name": "Model", "properties": {}}})),
+                action(serde_json::json!({"sequence": 2, "kind": "create", "id": "3:2",
+                    "node": {"id": "3:2", "class_name": "Part", "parent": "3:1",
+                             "properties": {}}})),
+            ],
+            &mut conv,
+        );
+        let first = live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 3, "kind": "remove", "id": "3:1"}))],
+            &mut conv,
+        );
+        assert_eq!(first.removed, 1);
+        assert_eq!(first.unknown_ids, 0);
+        // The child is gone with its parent, and the server names it anyway.
+        let stats = live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 4, "kind": "remove", "id": "3:2"}))],
+            &mut conv,
+        );
+        assert_eq!(stats.removed, 0, "there was nothing left to remove");
+        assert_eq!(stats.unknown_ids, 1, "and it is counted, not ignored");
+        assert_eq!(live.len(), 0, "the id map holds no dead refs");
     }
 
     #[test]

@@ -973,8 +973,20 @@ impl Game {
         // The worker's document: Play's server copy, made here once (as
         // `start_play` would: fresh refs, root "Game"). A teleport plays its
         // own destination, and the worker copies that as before.
+        //
+        // A **live client** copies nothing. `RunMode::Client` has no local
+        // server to seed from and no edit place to keep: the document it draws
+        // is the one the join has been replicating into, and it moves to the
+        // worker rather than being cloned into a second, 661-instance world
+        // that nothing ever updates. (That clone is what the phone showed:
+        // "Server DataModel 661 instances" while the join's own world was 9193,
+        // and characters that never moved because the clone holds one frame of
+        // a stream that keeps going without it.)
+        let network_client = mode == RunMode::Client;
         let teleporting = self.teleport_to.is_some();
-        let mut doc = if teleporting {
+        let mut doc = if network_client {
+            std::mem::replace(&mut self.doc, Document::placeholder())
+        } else if teleporting {
             Document::from_play_dom(self.doc.dom.clone(), self.doc.title.clone())
         } else {
             self.doc.clone_for_play(self.doc.title.clone())
@@ -999,7 +1011,12 @@ impl Game {
 
         let worker = match PlayWorker::spawn(host.play_worker_host(), move |game, worker_host| {
             game.doc = doc;
-            game.doc_is_play_copy = !teleporting;
+            // A live client's document is not a play copy: Stop must not put it
+            // back as an "edit place", and the session's own `take` is skipped
+            // because the document is already here.
+            if !network_client {
+                game.doc_is_play_copy = !teleporting;
+            }
             game.teleport_to = teleport;
             game.cam = cam;
             game.viewport_rect = viewport;
