@@ -26,8 +26,7 @@
 //! counts as `default-only`.
 
 use rbx_dom_weak::types::{
-    Color3, Color3uint8, CFrame, Enum, Faces, Matrix3, Rect, UDim, UDim2, Variant,
-    Vector2, Vector3,
+    Color3, Color3uint8, Enum, Faces, Rect, UDim, UDim2, Variant, Vector2, Vector3,
 };
 use serde_json::{json, Value as J};
 
@@ -185,6 +184,16 @@ impl ValueConverter {
     /// One property value. `class`/`property` are for the error text and for
     /// asking `api-dump.json` what type the property has.
     pub fn value(&mut self, property: &str, class: &str, v: &J) -> Result<Variant, String> {
+        // `Tags` is CollectionService's list, and rove sends it as the same
+        // comma-separated string Roblox stores (`instance_state.rs` writes the
+        // raw field). `api-dump.json` has no `Tags` member at all, so
+        // `project_values` cannot type it and every part with a tag was
+        // refused — `Tool.Tags ×56` in the phone's report. It is a
+        // `BinaryString` in the DOM (which is what Studio saves), so a string
+        // and a hex blob both convert here.
+        if property.eq_ignore_ascii_case("tags") {
+            return Ok(Variant::BinaryString(tags(v)));
+        }
         if let Some((tag, inner)) = tagged(v) {
             self.converted += 1;
             match self.tagged(tag, inner, property, class) {
@@ -196,6 +205,25 @@ impl ValueConverter {
             }
         }
         self.scalar += 1;
+        // A place-file value first: it is the reader that knows the property's
+        // type from `api-dump.json`.
+        if let Ok(variant) = via_place_value(class, property, v) {
+            return Ok(variant);
+        }
+        // An **untagged** frame object — `{"position": …, "rotation_id": …}`
+        // with no `$cframe` around it. rove writes that shape in an
+        // instance-state record and in a create's node properties
+        // (`instance_state.rs:266`, `runtime_delta.rs:962`), and
+        // `project_values` reads only the place-file forms (`[12 floats]`, or
+        // `position` plus a 3×3 `orientation`), so it was refused:
+        // `Part.CFrame ×57` in the phone's report. Only reached once the
+        // typed reader has said no, so a property whose own type is not a frame
+        // is never forced into one.
+        if v.get("position").is_some() {
+            if let Some(frame) = crate::cframe::frame(v) {
+                return Ok(Variant::CFrame(frame));
+            }
+        }
         via_place_value(class, property, v)
     }
 
@@ -222,35 +250,17 @@ impl ValueConverter {
                 let a = f32s(2)?;
                 Variant::Vector2(Vector2::new(a[0], a[1]))
             }
-            // rove's rotation is row-major: `rotation[row * 3 + column]`
-            // (`rove/client-core/src/physics.rs` indexes it that way, and
-            // validates it as a right-handed orthonormal matrix). rbx_types
-            // stores `Matrix3` as its three *columns*, so the read below is the
-            // transpose — for the identity, which is what a place's parts
-            // mostly carry, it is indistinguishable; the crate's tests pin a
-            // 90° rotation so the convention cannot drift.
-            "$cframe" => {
-                let position = inner
-                    .get("position")
-                    .and_then(J::as_array)
-                    .filter(|a| a.len() == 3)
-                    .ok_or_else(|| format!("$cframe wants position [x,y,z] {}", ctx()))?;
-                let rotation = inner
-                    .get("rotation")
-                    .and_then(J::as_array)
-                    .filter(|a| a.len() == 9)
-                    .ok_or_else(|| format!("$cframe wants rotation [r00..r22], 9 numbers {}", ctx()))?;
-                let p = |a: &Vec<J>, i: usize| a[i].as_f64().unwrap_or(0.0) as f32;
-                let m = Matrix3::new(
-                    Vector3::new(p(rotation, 0), p(rotation, 3), p(rotation, 6)),
-                    Vector3::new(p(rotation, 1), p(rotation, 4), p(rotation, 7)),
-                    Vector3::new(p(rotation, 2), p(rotation, 5), p(rotation, 8)),
-                );
-                Variant::CFrame(CFrame::new(
-                    Vector3::new(p(position, 0), p(position, 1), p(position, 2)),
-                    m,
-                ))
-            }
+            // Every spelling rove emits, not only the decoded one: a selector
+            // (`rotation_id` 1..=36), a packed quaternion (`rotation_id` 0 with
+            // `packed_rotation`), and the type-51 form where the small
+            // `rotation` number *is* the selector. `crate::cframe` is the one
+            // reader; see its module docs for the four shapes and where each
+            // comes from in rove.
+            "$cframe" => Variant::CFrame(
+                crate::cframe::frame(inner)
+                    .ok_or_else(|| format!("$cframe: no position, or an unusable rotation {}", ctx()))?,
+            ),
+
             "$udim" => Variant::UDim(UDim::new(
                 inner.get("scale").and_then(J::as_f64).unwrap_or(0.0) as f32,
                 inner.get("offset").and_then(J::as_i64).unwrap_or(0) as i32,
@@ -401,6 +411,45 @@ impl ValueConverter {
     }
 }
 
+/// CollectionService's `Tags` as the DOM holds it.
+///
+/// Roblox stores the tag list as a `BinaryString` (a NUL-separated blob in a
+/// place file; the property is not in `api-dump.json` at all). rove replicates
+/// the field as whatever the server serialised, so both shapes are accepted:
+/// a plain string (the comma-separated form Studio's Properties panel shows)
+/// and a hex blob (`$bytes_hex`, or a string that is one). Anything else — an
+/// array of names — is joined, because a tag list is a list of strings
+/// whichever way it was written.
+fn tags(v: &J) -> rbx_dom_weak::types::BinaryString {
+    let text = match v {
+        J::String(s) => s.clone(),
+        J::Array(items) => items
+            .iter()
+            .map(|i| match i {
+                J::String(s) => s.clone(),
+                J::Object(o) => o
+                    .get("$string")
+                    .or_else(|| o.get("$shared_string"))
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                _ => String::new(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(","),
+        J::Object(o) => o
+            .get("$bytes_hex")
+            .or_else(|| o.get("$string"))
+            .or_else(|| o.get("$shared_string"))
+            .and_then(J::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    };
+    rbx_dom_weak::types::BinaryString::from(text.into_bytes())
+}
+
 /// The one `$` key of a tagged value, and its payload.
 fn tagged(v: &J) -> Option<(&str, &J)> {
     let object = v.as_object()?;
@@ -451,4 +500,25 @@ pub fn convert_property(
 /// a number and a class/property.
 pub fn enum_json(n: u32) -> J {
     json!({ "Enum": n })
+}
+
+/// Properties rove replicates that a client cannot read at all, so a value the
+/// converter has no type for is expected rather than a fault: `Player.User` (a
+/// `User`, `RobloxSecurity`) and `Player.GameplayPaused` (`Hidden`,
+/// `NotAccessibleSecurity`). They arrive on the wire because the server
+/// serialises its own Player; they are not a conversion the client got wrong,
+/// and counting them as refused properties made a healthy join look broken.
+///
+/// Matched by name rather than looked up in `api-dump.json` because the type is
+/// the reason: the reflection database lists both, and a reader for a `User`
+/// value is not something a client can have. `crate::live` asks this *after* a
+/// refusal, so the property keeps its default and the ledger says nothing.
+pub fn not_client_readable(class: &str, property: &str) -> bool {
+    matches!(
+        (class, property),
+        ("Player", "User")
+            | ("Player", "GameplayPaused")
+            | ("Player", "CharacterRegionId")
+            | ("Player", "CharacterAppearanceId")
+    ) || property == "UniqueId"
 }

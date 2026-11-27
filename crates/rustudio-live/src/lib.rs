@@ -32,6 +32,7 @@
 //!   follow it);
 //! - classes come from `api-dump.json`, not from a list in this crate.
 
+pub mod cframe;
 pub mod live;
 pub mod snapshot;
 pub mod world;

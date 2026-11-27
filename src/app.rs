@@ -3293,6 +3293,20 @@ impl RustudioApp {
     /// Roblox a 886 × 411 unit canvas: the phone layout, 70-unit jump
     /// button, every button on the screen).
     fn play_fills_screen(&self) -> bool {
+        // A **joined** game always fills the screen, whatever the setting says:
+        // Studio around it is not a Roblox client, and a join is a client.
+        // `start_join` turns the setting on; this makes it hold even if
+        // something turns it off mid-session, and it is what keeps the joining
+        // cover and the game's own touch controls on the frame that draws them.
+        if self
+            .ed
+            .game
+            .play
+            .as_ref()
+            .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client)
+        {
+            return true;
+        }
         self.ed.ui.play_full && !self.ed.play_full_exit && self.ed.game.play.is_some()
     }
 
@@ -3316,13 +3330,26 @@ impl RustudioApp {
         let ed = &mut self.ed;
         let mut stop = false;
         let mut dock = false;
+        // **A joined game is not a Studio playtest.** Studio's Stop square and
+        // its "Studio around the game" button are the editor's way out of a
+        // session the editor started; over a live Roblox place they are two
+        // buttons no Roblox client has, sitting where its own top bar is. The
+        // way out of a join is Roblox's (the Esc menu's Leave, which CoreGui
+        // draws), or the joining cover's Cancel before the game is in.
+        let live_client = ed
+            .game
+            .play
+            .as_ref()
+            .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
                 let _p = rustudio_core::bench::scope("viewport");
                 ed.viewport_ui(ui);
-                stop = ed.play_stop_button(ui);
-                dock = ed.play_full_button(ui, true);
+                if !live_client {
+                    stop = ed.play_stop_button(ui);
+                    dock = ed.play_full_button(ui, true);
+                }
             });
         if stop {
             ed.stop_play();
@@ -3337,6 +3364,15 @@ impl RustudioApp {
         ed.confirm_ui(ctx);
         ed.account_window(ctx);
         ed.cloud_windows(ctx);
+        // The join's own two surfaces belong here too, and this is the frame a
+        // join spends most of its time in: `play_fills_screen` returns before
+        // the editor frame, so a cover drawn only from there never appeared over
+        // a game that fills the screen — the one case it exists for. The window
+        // goes with it, because the cover's Report button opens it.
+        #[cfg(feature = "live")]
+        ed.join_window(ctx);
+        #[cfg(feature = "live")]
+        ed.join_cover(ctx);
         self.watchdog.stage("3D view", "harness and screenshot readback");
         self.finish_frame(ctx, frame_start, dt);
         // The soft keyboard over a game's TextBox (the chat), as in `frame`.

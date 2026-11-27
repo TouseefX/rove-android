@@ -161,8 +161,19 @@ pub struct Live {
     written_properties: std::collections::BTreeMap<String, usize>,
     /// `$ref` targets that were not in the world when the property arrived and
     /// were dropped: a dangling reference, which is how a Model loses its
-    /// PrimaryPart.
+    /// PrimaryPart. Only a reference that *cannot* be kept is counted here —
+    /// one whose target is simply late is held in `pending_refs` instead.
     dangling_refs: std::collections::BTreeMap<String, usize>,
+    /// A `$ref` that arrived before its target, kept until the target does:
+    /// `(owner id, property) → target id`. Roblox's own stream does this all
+    /// the time — a `Model.PrimaryPart` is set in the same delta that creates
+    /// the part, and `Player.Character` names a model the server has not sent
+    /// yet — and dropping the property is what leaves a Model with no
+    /// PrimaryPart and a player with no character, on a world where every
+    /// value arrived.
+    pending_refs: std::collections::BTreeMap<(String, String), String>,
+    /// `$ref`s resolved by the batch that made their target, for the report.
+    refs_bound: usize,
 }
 
 impl Live {
@@ -176,6 +187,8 @@ impl Live {
             refused_properties: std::collections::BTreeMap::new(),
             refused_classes: std::collections::BTreeMap::new(),
             dangling_refs: std::collections::BTreeMap::new(),
+            pending_refs: std::collections::BTreeMap::new(),
+            refs_bound: 0,
         }
     }
 
@@ -191,6 +204,8 @@ impl Live {
             refused_properties: std::collections::BTreeMap::new(),
             refused_classes: std::collections::BTreeMap::new(),
             dangling_refs: std::collections::BTreeMap::new(),
+            pending_refs: std::collections::BTreeMap::new(),
+            refs_bound: 0,
         }
     }
 
@@ -263,6 +278,17 @@ impl Live {
             .collect()
     }
 
+    /// References that were held for a target that arrived later, and are now
+    /// written: the positive counterpart to `dangling_refs`.
+    pub fn refs_bound(&self) -> usize {
+        self.refs_bound
+    }
+
+    /// References still held, waiting for their target: `(owner, property)`.
+    pub fn refs_pending(&self) -> usize {
+        self.pending_refs.len()
+    }
+
     /// Properties dropped because the `$ref` target was not in the world yet,
     /// by `Class.Property`.
     pub fn dangling_refs(&self) -> Vec<(String, usize)> {
@@ -293,7 +319,9 @@ impl Live {
                 _ => stats.unknown_ids += 1,
             }
         }
-        // A create that named a parent which has now arrived.
+        // A `$ref` whose target arrived in this batch, then a create that named
+        // a parent which has now arrived.
+        self.bind_pending_refs(doc, &mut stats);
         self.attach_waiting(doc, &mut stats);
         stats.duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         stats
@@ -322,11 +350,18 @@ impl Live {
         // The parent, if this delta brought one and the world has it; else the
         // root, with a note for `attach_waiting`.
         let wanted_parent = node.get("parent").and_then(parent_id);
+        let root_ref = doc.dom.root_ref();
+        // The parent has to be *in the DOM*, not merely in the id map. A remove
+        // in an earlier batch drops the id, but a re-sent create for a child of
+        // a parent the journal has re-created in a new generation can name an id
+        // whose ref this side still holds, and `WeakDom::insert` **panics** with
+        // "cannot insert into parent that does not exist" (dom.rs:313) rather
+        // than refusing — the phone's crash report, 22:30:22, was this line.
         let parent_ref = wanted_parent
             .as_deref()
             .and_then(|p| self.ids.get(p).copied())
-            .unwrap_or_else(|| doc.dom.root_ref());
-
+            .filter(|r| doc.dom.get_by_ref(*r).is_some())
+            .unwrap_or(root_ref);
         let name = node
             .get("properties")
             .and_then(|p| p.get("Name"))
@@ -375,12 +410,15 @@ impl Live {
                 }
                 match self.convert(property, class, value, conv) {
                     Ok(v) => values.push((property.clone(), v)),
-                    Err(_) => {
-                        stats.refused_values += 1;
-                        *self
-                            .refused_properties
-                            .entry(format!("{class}.{property}"))
-                            .or_default() += 1;
+                    // A reference into the same delta: the target is made by a
+                    // create later in this batch, so it is held, not refused.
+                    // `Model.PrimaryPart` and a weld's `Part1` arrive this way.
+                    Err(ConvertError::Ref(target)) => {
+                        values.push((property.clone(), Variant::Ref(Ref::none())));
+                        self.hold_ref(id, property, &target);
+                    }
+                    Err(ConvertError::Value(_)) => {
+                        self.refuse(class, property, stats);
                     }
                 }
             }
@@ -445,26 +483,35 @@ impl Live {
                         if let Some(instance) = doc.dom.get_by_ref_mut(r) {
                             instance.properties.insert(key, Variant::Ref(target_ref));
                             stats.properties += 1;
+                            // A late resolution of something held earlier is a
+                            // property written now, and the report's positive
+                            // count should say so.
+                            *self
+                                .written_properties
+                                .entry(format!("{class}.{property}"))
+                                .or_default() += 1;
                         }
                         doc.mark_prop(r, key);
                     }
+                    // The target had not arrived when the property naming it
+                    // did: `Player.Character` is set in the delta that creates
+                    // the model, a `Model.PrimaryPart` in the one that creates
+                    // the part. Held, not dropped — dropping it is what leaves a
+                    // Model with no PrimaryPart and a player with no character
+                    // on a world where every value arrived.
                     None => {
-                        stats.unknown_ids += 1;
-                        // The target had not arrived when the property naming it
-                        // did. Counted by name: this is the fault that leaves a
-                        // Model with no PrimaryPart and a weld with no Part1.
-                        *self
-                            .dangling_refs
-                            .entry(format!("{class}.{property}"))
-                            .or_default() += 1;
+                        self.hold_ref(id, property, &target);
+                        // `Ref::none()` while it waits: not a ref into
+                        // nowhere (the scene walk and the physics reader would
+                        // follow one) and not nil-as-a-real-target either — it
+                        // is what an unset reference is in this DOM.
+                        if let Some(instance) = doc.dom.get_by_ref_mut(r) {
+                            instance.properties.insert(ustr(property), Variant::Ref(Ref::none()));
+                        }
                     }
                 }
                 Err(ConvertError::Value(_)) => {
-                    stats.refused_values += 1;
-                    *self
-                        .refused_properties
-                        .entry(format!("{class}.{property}"))
-                        .or_default() += 1;
+                    self.refuse(class, property, stats);
                 }
             }
         }
@@ -526,7 +573,15 @@ impl Live {
             return;
         };
         match self.ids.get(parent).copied() {
-            Some(parent_ref) => {
+            // `transfer_within` panics on a parent that is not in the DOM, and
+            // on a *destroyed* child — both reachable here, because a re-sent
+            // create and a remove can name the same id in one session
+            // (dom.rs:313 again). Anything already gone becomes a waiting edge,
+            // which is where a parent that has not arrived yet goes too.
+            Some(parent_ref)
+                if doc.dom.get_by_ref(parent_ref).is_some()
+                    && doc.dom.get_by_ref(r).is_some() =>
+            {
                 if r != parent_ref && r != doc.dom.root_ref() {
                     doc.dom.transfer_within(r, parent_ref);
                     // A move changes the tree, not a property: the old parent
@@ -536,7 +591,7 @@ impl Live {
                     self.waiting_for_parent.remove(id);
                 }
             }
-            None => {
+            _ => {
                 self.waiting_for_parent.insert(id.to_string(), parent.to_string());
             }
         }
@@ -558,6 +613,88 @@ impl Live {
         for (id, parent) in settled {
             self.reparent(doc, &id, &parent, stats);
             self.waiting_for_parent.remove(&id);
+        }
+    }
+
+    /// Count a value the converter would not take — unless the property is one
+    /// no client can read in the first place.
+    ///
+    /// `Player.User` (a `User`, `RobloxSecurity`), `Player.GameplayPaused` and
+    /// `Player.CharacterRegionId` arrive because the server serialises its own
+    /// Player. Their types have no reader on this side and there is nothing to
+    /// read: they are not a conversion the client got wrong, and the phone's
+    /// report listed two of them among 75 "refused properties" on a world that
+    /// was arriving fine. A ledger full of expected refusals is a ledger nobody
+    /// reads, which is the one fault worse than a missing entry.
+    fn refuse(&mut self, class: &str, property: &str, stats: &mut ApplyStats) {
+        if crate::snapshot::not_client_readable(class, property) {
+            return;
+        }
+        stats.refused_values += 1;
+        *self
+            .refused_properties
+            .entry(format!("{class}.{property}"))
+            .or_default() += 1;
+    }
+
+    /// Remember a `$ref` whose target has not arrived, keyed by the owner and
+    /// the property so a later batch can write it (`bind_pending_refs`).
+    fn hold_ref(&mut self, owner: &str, property: &str, target: &str) {
+        self.pending_refs
+            .insert((owner.to_string(), property.to_string()), target.to_string());
+    }
+
+    /// Write every held `$ref` whose target is now in the world.
+    ///
+    /// Runs after each batch's creates, before `attach_waiting` — a reference is
+    /// cheaper to settle than a parent edge and a parent may be what makes the
+    /// target real. Bounded by the number of held references, and each one is
+    /// removed as it settles, so this cannot grow into a per-frame walk of the
+    /// world.
+    fn bind_pending_refs(&mut self, doc: &mut Document, stats: &mut ApplyStats) {
+        if self.pending_refs.is_empty() {
+            return;
+        }
+        let mut settled: Vec<((String, String), Ref)> = Vec::new();
+        let mut gone: Vec<(String, String)> = Vec::new();
+        for ((owner, property), target) in &self.pending_refs {
+            let Some(&owner_ref) = self.ids.get(owner) else {
+                gone.push((owner.clone(), property.clone()));
+                continue;
+            };
+            let Some(target_ref) = self.ids.get(target).copied() else {
+                continue;
+            };
+            if doc.dom.get_by_ref(target_ref).is_some() {
+                settled.push(((owner.clone(), property.clone()), target_ref));
+            }
+        }
+        for (key, target_ref) in settled {
+            let (owner, property) = key.clone();
+            let Some(&owner_ref) = self.ids.get(&owner) else {
+                continue;
+            };
+            if doc.dom.get_by_ref(owner_ref).is_some() {
+                if let Some(instance) = doc.dom.get_by_ref_mut(owner_ref) {
+                    instance.properties.insert(ustr(&property), Variant::Ref(target_ref));
+                }
+                doc.mark_prop(owner_ref, ustr(&property));
+                let class = doc
+                    .dom
+                    .get_by_ref(owner_ref)
+                    .map(|i| i.class.to_string())
+                    .unwrap_or_else(|| "Instance".to_string());
+                *self
+                    .written_properties
+                    .entry(format!("{class}.{property}"))
+                    .or_default() += 1;
+                stats.properties += 1;
+                self.refs_bound += 1;
+            }
+            self.pending_refs.remove(&key);
+        }
+        for key in gone {
+            self.pending_refs.remove(&key);
         }
     }
 
@@ -878,6 +1015,121 @@ mod tests {
             written.iter().any(|(name, count)| name == "Part.CFrame" && *count == 1),
             "the write is attributed to Part.CFrame: {written:?}"
         );
+    }
+
+    /// A create whose `CFrame` is the *compact* wire form — a basis selector,
+    /// not nine floats — converts instead of being refused.
+    ///
+    /// This is the phone's `Part.CFrame ×57`: rove's type-27 payload is
+    /// `{"position": …, "rotation_id": n}`, and only the nine-float shape was
+    /// read. A world of parts at a default CFrame is a world that draws as void.
+    #[test]
+    fn a_selector_cframe_in_a_create_is_written_not_refused() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let cframe = serde_json::json!({
+            "$cframe": {"position": [12.0, 3.0, -4.0], "rotation_id": 2}
+        });
+        let create = action(serde_json::json!({
+            "sequence": 1,
+            "kind": "create",
+            "id": "3:1",
+            "node": {"id": "3:1", "class_name": "Part",
+                     "properties": {"Name": "Floor", "CFrame": cframe}},
+        }));
+        let stats = live.apply(&mut doc, &[create], &mut conv);
+        assert_eq!(stats.refused_values, 0, "no refusal: {stats:?}");
+        assert!(live.refused_properties().is_empty(), "{:?}", live.refused_properties());
+        let r = live.referent("3:1").expect("the part is in the world");
+        match doc.prop(r, "CFrame") {
+            Some(Variant::CFrame(cf)) => {
+                assert!((cf.position.x - 12.0).abs() < 1e-6, "{:?}", cf.position);
+                assert!((cf.position.y - 3.0).abs() < 1e-6);
+                assert!((cf.position.z + 4.0).abs() < 1e-6);
+            }
+            other => panic!("the part has the CFrame: {other:?}"),
+        }
+    }
+
+    /// A `Model.PrimaryPart` naming a part created later in the same batch is
+    /// held and then written — the shape that left every model in the phone's
+    /// join without a PrimaryPart.
+    #[test]
+    fn a_ref_to_a_later_create_is_bound_when_the_target_arrives() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let model = serde_json::json!({
+            "sequence": 1, "kind": "create", "id": "3:1",
+            "node": {"id": "3:1", "class_name": "Model",
+                     "properties": {"Name": "Kit", "PrimaryPart": {"$ref": "3:2"}}},
+        });
+        let part = serde_json::json!({
+            "sequence": 2, "kind": "create", "id": "3:2",
+            "node": {"id": "3:2", "class_name": "Part", "parent": "3:1",
+                     "properties": {"Name": "Base"}},
+        });
+        let stats = live.apply(
+            &mut doc,
+            &[action(model), action(part)],
+            &mut conv,
+        );
+        assert_eq!(stats.refused_values, 0, "{stats:?}");
+        assert!(live.refused_properties().is_empty(), "{:?}", live.refused_properties());
+        let model = live.referent("3:1").expect("the model");
+        let part = live.referent("3:2").expect("the part");
+        match doc.prop(model, "PrimaryPart") {
+            Some(Variant::Ref(target)) => assert_eq!(target, part, "PrimaryPart bound"),
+            other => panic!("PrimaryPart is a ref to the part: {other:?}"),
+        }
+        assert_eq!(live.refs_pending(), 0, "nothing is left waiting");
+    }
+
+    /// A `$ref` whose target never arrives stays held (and is reported as
+    /// pending), not flung into the refusal list.
+    #[test]
+    fn a_ref_with_no_target_yet_is_held_not_refused() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let set = serde_json::json!({
+            "sequence": 1, "kind": "create", "id": "3:9",
+            "node": {"id": "3:9", "class_name": "Player",
+                     "properties": {"Name": "me", "Character": {"$ref": "3:10"}}},
+        });
+        let stats = live.apply(&mut doc, &[action(set)], &mut conv);
+        assert_eq!(stats.refused_values, 0, "{stats:?}");
+        assert!(live.refused_properties().is_empty(), "{:?}", live.refused_properties());
+        assert_eq!(live.refs_pending(), 1, "held until the character arrives");
+    }
+
+    /// A create naming a parent that is in the id map but *not* in the DOM must
+    /// not panic (dom.rs:313, the phone's crash report): it goes to the root and
+    /// waits, as a parent that has not arrived does.
+    #[test]
+    fn a_create_under_a_removed_parent_does_not_panic() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Model", "properties": {}}}))],
+            &mut conv,
+        );
+        live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 2, "kind": "remove", "id": "3:1"}))],
+            &mut conv,
+        );
+        // Re-created and removed again: the id map and the DOM disagree for a
+        // moment, which is what a re-sent pair of packets does.
+        live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 3, "kind": "create", "id": "3:5",
+                "node": {"id": "3:5", "class_name": "Part", "parent": "3:1",
+                         "properties": {}}}))],
+            &mut conv,
+        );
+        assert!(live.referent("3:5").is_some(), "the part is still made");
+        assert_eq!(live.waiting(), 1, "and it waits for the parent to come back");
     }
 
     #[test]

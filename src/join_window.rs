@@ -378,6 +378,18 @@ impl Editor {
                     top.join(", ")
                 ));
             }
+            // References: bound late (the target arrived after the property),
+            // and still waiting. Both are normal in a live stream — a
+            // `Model.PrimaryPart` is set in the delta that creates the part —
+            // so a join with a hundred of them is a healthy one, and the
+            // number to worry about is `dangling`, the ones nothing can bind.
+            if live.refs_bound() > 0 || live.refs_pending() > 0 {
+                lines.push(format!(
+                    "join world: {} ref(s) bound late, {} still waiting for their target",
+                    live.refs_bound(),
+                    live.refs_pending()
+                ));
+            }
             let dangling = live.dangling_refs();
             if !dangling.is_empty() {
                 let top: Vec<String> = dangling
@@ -490,21 +502,43 @@ impl Editor {
         let Some(phase) = self.join_cover_phase() else {
             return;
         };
+        // The report window is drawn from the editor's frame (`join_window`),
+        // which runs *before* this and is an `egui::Window` at
+        // `Order::Middle`. A cover at `Order::Foreground` painted over it, so a
+        // person tapping Report got the numbers and then a cover on top of them
+        // — the button worked and looked broken. While the report is open the
+        // cover steps out of its way entirely: it is the same join underneath,
+        // and the window's own Close puts it back.
+        if self.join_win.open {
+            return;
+        }
+        // Not `screen.min`-sized with the painter: the buttons below are real
+        // widgets (`ui.allocate_rect(…, Sense::click())`), which is what makes a
+        // *touch* tap a tap. The old version read
+        // `ctx.input(|i| i.pointer.any_click())` and compared it with the press
+        // position, and a finger on Android produces a click egui only
+        // synthesises at the end of a gesture — so Report and Cancel did
+        // nothing at all on the phone.
         let screen = ctx.content_rect();
         let mut open_report = false;
+        let mut cancel = false;
         egui::Area::new(egui::Id::new("join_cover"))
             .fixed_pos(screen.min)
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .interactable(true)
             .show(ctx, |ui| {
-                let painter = ui.painter();
-                painter.rect_filled(screen, 0.0, egui::Color32::from_rgb(18, 20, 26));
+                // The whole screen is the cover: everything under it stays
+                // drawn (the world is arriving behind this), but no tap in it
+                // reaches the editor.
+                let (rect, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                let painter = ui.painter_at(rect).with_clip_rect(rect);
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 20, 26));
+                let _ = response;
                 // The three steps, as a list with the current one lit. Drawn
-                // rather than laid out with widgets so it cannot scroll or take
-                // a tap by accident on a phone.
-                let centre = screen.center();
+                // rather than laid out with widgets so it cannot scroll.
+                let centre = rect.center();
                 let mut y = centre.y - 46.0;
-                for (index, (label, state)) in phase.steps.iter().enumerate() {
+                for (label, state) in phase.steps.iter() {
                     let colour = match state {
                         CoverStep::Done => egui::Color32::from_rgb(120, 190, 140),
                         CoverStep::Now => egui::Color32::WHITE,
@@ -523,7 +557,6 @@ impl Editor {
                         colour,
                     );
                     y += 30.0;
-                    let _ = index;
                 }
                 if let Some(note) = &phase.note {
                     painter.text(
@@ -534,39 +567,47 @@ impl Editor {
                         egui::Color32::from_rgb(140, 146, 160),
                     );
                 }
-                // The way out of a stall: the numbers, and a cancel.
-                let button_y = screen.max.y - 54.0;
+                // The way out of a stall: the numbers, and a cancel. Sized for
+                // a finger (Roblox's own controls are 44 points) and laid out
+                // with `allocate_ui_at_rect` so egui's own click detection runs
+                // for them, which is the difference between a button and a
+                // picture of one on a touchscreen.
+                let button_y = rect.max.y - 64.0;
                 let report = egui::Rect::from_center_size(
-                    egui::Pos2::new(centre.x - 74.0, button_y),
-                    egui::vec2(132.0, 36.0),
+                    egui::Pos2::new(centre.x - 76.0, button_y),
+                    egui::vec2(140.0, 44.0),
                 );
-                let cancel = egui::Rect::from_center_size(
-                    egui::Pos2::new(centre.x + 74.0, button_y),
-                    egui::vec2(132.0, 36.0),
+                let leave = egui::Rect::from_center_size(
+                    egui::Pos2::new(centre.x + 76.0, button_y),
+                    egui::vec2(140.0, 44.0),
                 );
-                for (rect, text) in [(report, "Report"), (cancel, "Cancel")] {
-                    painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(36, 40, 50));
-                    painter.text(
-                        rect.center(),
+                for (button, text) in [(report, "Report"), (leave, "Cancel")] {
+                    let response = ui.allocate_rect(button, egui::Sense::click());
+                    ui.painter().rect_filled(
+                        button,
+                        8.0,
+                        if response.is_pointer_button_down_on() {
+                            egui::Color32::from_rgb(64, 70, 84)
+                        } else if response.hovered() {
+                            egui::Color32::from_rgb(48, 53, 66)
+                        } else {
+                            egui::Color32::from_rgb(36, 40, 50)
+                        },
+                    );
+                    ui.painter().text(
+                        button.center(),
                         egui::Align2::CENTER_CENTER,
                         text,
-                        egui::FontId::proportional(15.0),
+                        egui::FontId::proportional(16.0),
                         egui::Color32::from_rgb(220, 224, 232),
                     );
-                }
-                let pointer = ctx.input(|i| i.pointer.interact_pos());
-                if ctx.input(|i| i.pointer.any_click()) {
-                    if let Some(p) = pointer {
-                        if report.contains(p) {
+                    if response.clicked() {
+                        if text == "Report" {
                             open_report = true;
-                        } else if cancel.contains(p) {
-                            // Same path as the window's own Stop: a join the
-                            // person gave up on must leave nothing half-made.
-                            self.join_win.cancel_requested = true;
+                        } else {
+                            cancel = true;
                         }
                     }
-                    // (a tap elsewhere is swallowed by the cover, and does not
-                    // reach the editor underneath it)
                 }
                 // Whatever is under the cover must keep being drawn: the world
                 // is arriving while this is up.
@@ -575,6 +616,15 @@ impl Editor {
         if open_report {
             self.join_win.open = true;
             self.join_win.show_text = true;
+            // The window is opened after the editor's frame has already drawn
+            // it this frame, so ask for another: otherwise the tap opens
+            // nothing until the world sends another packet.
+            ctx.request_repaint();
+        }
+        if cancel {
+            // Same path as the window's own Stop: a join the person gave up on
+            // must leave nothing half-made.
+            self.join_win.cancel_requested = true;
         }
         if std::mem::take(&mut self.join_win.cancel_requested) {
             self.abandon_join();
@@ -597,11 +647,30 @@ impl Editor {
         let doc = &self.game.doc;
         let root = doc.dom.root_ref();
         let workspace = doc.workspace().is_some();
-        let local_player = doc
+        let me = doc
             .find_child(root, "Players")
-            .is_some_and(|players| matches!(doc.prop(players, "LocalPlayer"), Some(Variant::Ref(p)) if doc.exists(p)));
+            .and_then(|players| match doc.prop(players, "LocalPlayer") {
+                Some(Variant::Ref(p)) if doc.exists(p) => Some(p),
+                _ => None,
+            });
         let character = play.character.is_some();
-        workspace && local_player && character
+        // `Player.CharacterAutoLoads == false` means the server will not make
+        // one until a script asks: a cover that waits for a character that is
+        // never coming is a cover that never comes down. (Roblox's own loading
+        // screen ends the same way — at the game, not at the character.)
+        let auto = match me.and_then(|p| doc.prop(p, "CharacterAutoLoads")) {
+            Some(Variant::Bool(auto)) => auto,
+            _ => true,
+        };
+        // A join whose streaming handshake was refused, or that has been
+        // waiting a long time, is not one to keep hidden: the game is in and
+        // whoever is holding the phone can see what it looks like.
+        let stalled = self
+            .join_win
+            .live
+            .as_ref()
+            .is_some_and(|c| c.seconds >= 45);
+        workspace && me.is_some() && (character || !auto || stalled)
     }
 
     /// Give up on a join: drop the session and put the editor back.
@@ -668,10 +737,16 @@ impl Editor {
                 _ => CoverStep::Waiting,
             },
         ));
+        // The note says whether the handshake went, because it is the one
+        // number that explains a join that has instances and no character:
+        // `stream` is what tells a streaming server the spawn region arrived.
         let note = self.join_win.live.as_ref().map(|c| {
             format!(
-                "{} instances · {} packets · {} s",
-                c.instances, c.packets, c.seconds
+                "{} instances · {} packets · stream {} · {} s",
+                c.instances,
+                c.packets,
+                if c.streaming_ready { "acked" } else { "no-ack" },
+                c.seconds
             )
         });
         Some(CoverPhase { steps, note })
@@ -994,6 +1069,12 @@ impl Editor {
         self.join_win.live_logged_at = None;
         self.join_win.live_report_at = None;
         self.join_win.live_reported = false;
+        // A joined place fills the screen, as it does on Roblox: the game is
+        // the whole window, not the dock's 3D view with Studio around it. That
+        // is also what makes the joining cover a cover — and it is what
+        // `play_full_frame` (no Stop or Studio buttons for a live client) draws.
+        self.game.ui.play_full = true;
+        self.play_full_exit = false;
         // The cover goes up now, on the tap, not when the first packet lands:
         // what it is hiding is the *editor*, and the editor is what is on
         // screen between those two moments.

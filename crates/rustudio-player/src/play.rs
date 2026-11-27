@@ -1061,7 +1061,11 @@ impl Game {
         rustudio_engine::tool_grip::grip_at_load(&mut server_doc);
         // Ensure RobloxReplicatedStorage + version RemoteFunctions exist before
         // initial_client so SettingsHub's GetServerVersionBlocking() maps 1:1.
-        if two && rustudio_core::rustudio_settings::core_scripts() {
+        // A **live client** needs them too, and it has no `client_doc` to put
+        // them in: SettingsHub asks this DataModel for the server's version
+        // when CoreGui starts, and with no `RobloxReplicatedStorage` the
+        // Settings module fails to load and the Esc menu never appears.
+        if (two || (network_client && !two)) && rustudio_core::rustudio_settings::core_scripts() {
             let root = server_doc.dom.root_ref();
             let rrs = server_doc
                 .find_child(root, "RobloxReplicatedStorage")
@@ -1098,50 +1102,41 @@ impl Game {
         // DataModelPatch.rbxm does not stall wall-clock time between server
         // startup and client join. CoreScripts still start in
         // `setup_client_player` once LocalPlayer exists.
-        let mut core_scripts = if let Some(cdoc) = client_doc.as_mut() {
+        //
+        // **A live client has no `client_doc`.** In `RunMode::Client` the
+        // replicated place *is* `self.doc` and `client_doc` is `None` — the
+        // local server that would have needed a second copy does not exist — so
+        // this whole block used to be skipped, and a joined game had no
+        // `CoreGui.RobloxGui`, no `CorePackages`, no `Stats.PerformanceStats`
+        // and no CoreScripts. Roblox's TopBar, its Esc menu, chat and the player
+        // list are all CoreGui, which is why a join was a bare 3D view. The
+        // document to install into is therefore `self.doc` in that mode, taken
+        // by a re-borrow here and given back below.
+        let live_client = network_client && !two;
+        let mut core_scripts = if live_client {
             if rustudio_core::rustudio_settings::core_scripts()
                 && (rustudio_core::core_scripts::patch_path().is_some()
                     || rustudio_core::rustudio_settings::core_scripts_forced())
             {
-                // Populate Stats.PerformanceStats with native StatsItem children
-                // (not creatable via Instance.new) for DevConsole & PerformanceStats.
-                let root = cdoc.dom.root_ref();
-                let stats = cdoc.find_child(root, "Stats").unwrap_or_else(|| {
-                    cdoc.dom
-                        .insert(root, InstanceBuilder::new("Stats").with_name("Stats"))
-                });
-                let perf = cdoc
-                    .dom
-                    .get_by_ref(stats)
-                    .and_then(|s| {
-                        s.children()
-                            .iter()
-                            .copied()
-                            .find(|c| cdoc.dom.get_by_ref(*c).is_some_and(|i| i.name == "PerformanceStats"))
-                    })
-                    .unwrap_or_else(|| {
-                        cdoc.dom
-                            .insert(stats, InstanceBuilder::new("Folder").with_name("PerformanceStats"))
-                    });
-                for n in [
-                    "Memory", "CPU", "GPU", "NetworkSent", "NetworkReceived", "Ping",
-                    "MaxMemory", "MaxCPU", "MaxGPU", "MaxNetworkSent", "MaxNetworkReceived", "MaxPing",
-                ] {
-                    let exists = cdoc.dom.get_by_ref(perf).is_some_and(|p| {
-                        p.children()
-                            .iter()
-                            .any(|c| cdoc.dom.get_by_ref(*c).is_some_and(|i| i.name == n))
-                    });
-                    if !exists {
-                        cdoc.dom.insert(
-                            perf,
-                            InstanceBuilder::new("StatsItem")
-                                .with_name(n)
-                                .with_property("DisplayName", rbx_dom_weak::types::Variant::String(n.into())),
-                        );
-                    }
-                }
-                Some(load_core_scripts(cdoc))
+                let cdoc = &mut self.doc;
+                Some(install_client_core(cdoc))
+            } else {
+                // Said out loud, because the alternative reading of "a join has
+                // no menus and no chat" is that CoreGui is broken.
+                self.info(
+                    "Live: no CoreScripts (this device has no Studio content: \
+                     CoreGui's TopBar, menu and chat need \
+                     ExtraContent/models/DataModelPatch)",
+                );
+                None
+            }
+        } else if client_doc.is_some() {
+            let cdoc = client_doc.as_mut().expect("just asked");
+            if rustudio_core::rustudio_settings::core_scripts()
+                && (rustudio_core::core_scripts::patch_path().is_some()
+                    || rustudio_core::rustudio_settings::core_scripts_forced())
+            {
+                Some(install_client_core(cdoc))
             } else {
                 None
             }
@@ -1157,10 +1152,11 @@ impl Game {
             std::mem::take(&mut edit_doc.as_mut().unwrap_or(&mut self.doc).selection)
         };
         let saved_doc = if network_client {
-            // Put the replicated place back where the editor draws it. It is
+            // The replicated place is already where the editor draws it. It is
             // not an "edit document" and must not be saved as one, so the
-            // session has nothing to hand back on Stop.
-            self.doc = server_doc;
+            // session has nothing to hand back on Stop. (A live client's
+            // `self.doc` is the document CoreGui was installed into a few lines
+            // up; moving `server_doc` back over it would throw that away.)
             Document::empty()
         } else {
             let previous = std::mem::replace(&mut self.doc, server_doc);
@@ -5667,6 +5663,57 @@ fn kept_on_spawn(d: &Document, r: Ref) -> bool {
 
 /// Puts Studio's data model patch in the client's DataModel
 /// (core_scripts::install). Returns what to start and a line for Output.
+///
+/// What a client's DataModel needs before its CoreScripts can run, put into
+/// `cdoc`: `Stats.PerformanceStats` with its native `StatsItem` children (they
+/// cannot be made with `Instance.new`, and DevConsole and the PerformanceStats
+/// panel read them), then the patch itself — `CoreGui.RobloxGui` and its
+/// modules, `CorePackages`, and the CoreScripts by name.
+///
+/// One function for both clients: Play installs into its replicated client
+/// copy and a live join installs into `self.doc`, which *is* its client copy.
+/// Two copies of this used to exist and the live half had none at all, which is
+/// why a joined place had no TopBar, no Esc menu and no chat.
+fn install_client_core(cdoc: &mut Document) -> Result<(rustudio_core::core_scripts::Installed, String), String> {
+    let root = cdoc.dom.root_ref();
+    let stats = cdoc.find_child(root, "Stats").unwrap_or_else(|| {
+        cdoc.dom
+            .insert(root, InstanceBuilder::new("Stats").with_name("Stats"))
+    });
+    let perf = cdoc
+        .dom
+        .get_by_ref(stats)
+        .and_then(|s| {
+            s.children()
+                .iter()
+                .copied()
+                .find(|c| cdoc.dom.get_by_ref(*c).is_some_and(|i| i.name == "PerformanceStats"))
+        })
+        .unwrap_or_else(|| {
+            cdoc.dom
+                .insert(stats, InstanceBuilder::new("Folder").with_name("PerformanceStats"))
+        });
+    for n in [
+        "Memory", "CPU", "GPU", "NetworkSent", "NetworkReceived", "Ping",
+        "MaxMemory", "MaxCPU", "MaxGPU", "MaxNetworkSent", "MaxNetworkReceived", "MaxPing",
+    ] {
+        let exists = cdoc.dom.get_by_ref(perf).is_some_and(|p| {
+            p.children()
+                .iter()
+                .any(|c| cdoc.dom.get_by_ref(*c).is_some_and(|i| i.name == n))
+        });
+        if !exists {
+            cdoc.dom.insert(
+                perf,
+                InstanceBuilder::new("StatsItem")
+                    .with_name(n)
+                    .with_property("DisplayName", rbx_dom_weak::types::Variant::String(n.into())),
+            );
+        }
+    }
+    load_core_scripts(cdoc)
+}
+
 fn load_core_scripts(cdoc: &mut Document) -> Result<(rustudio_core::core_scripts::Installed, String), String> {
     let path = rustudio_core::core_scripts::patch_path().ok_or_else(|| {
         format!("CoreScripts: no {} in the Studio install", rustudio_core::core_scripts::PATCH)

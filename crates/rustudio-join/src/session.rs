@@ -869,10 +869,15 @@ impl Session {
             // the parts, and holds the character until this client says the
             // spawn region arrived — so these are answered from here, where the
             // records are, rather than guessed at from the packet count.
-            self.note_regions(&row.value.world_delta["regions"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default());
+            //
+            // `regions` is a field of the **record** (`SessionRecord.regions`,
+            // rove's `session.rs:160`), not of `world_delta`: that object is
+            // `{"version","delta","sequence","actions"}` and never carries a
+            // region. Reading it out of the delta is why the overlay said
+            // `stream 0/0` for a whole session — no region was ever seen, so no
+            // focus was ever sent, so the character never came and the cover
+            // never came down.
+            self.note_regions(&row.value.regions.clone());
             // Our own Player — the one the account's id names — and whether a
             // character has been replicated for it. Both are read from the
             // ids this batch made, which is the only place the wire's names
