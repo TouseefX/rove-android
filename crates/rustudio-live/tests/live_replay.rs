@@ -70,6 +70,17 @@ fn packets(recording: &Value) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+/// A note on the two framings, because they differ and the difference cost a CI
+/// run: a schema packet (151) on the wire is the kind byte, a `u32 LE`
+/// compressed length, a `u32 LE` expanded length and a zstd frame, and rove's
+/// `parse_schema` inflates exactly that. A globals packet (129) is **not**
+/// framed — `ReplicationDecoder::globals` reads the seven boolean flags from
+/// bytes 1..8 immediately. Replication (131) carries no envelope either. The
+/// fixture ships each packet in the form its own reader expects, so it goes to
+/// `ingest` untouched; framing the globals packet instead makes its compressed
+/// length parse as the flags (`40, 0, 0, 0, 36, 0, 0`) and the decoder refuses
+/// it with `InvalidPacket("Invalid globals boolean")`.
+
 /// Replay the whole recording the way a live connection would: ingest, read the
 /// receipt the journal just committed, apply its actions.
 fn replay() -> (Document, Live, Vec<(String, ApplyStats)>) {
@@ -170,43 +181,61 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
         "Anchored is the packet's boolean"
     );
 
-    // Nothing is left waiting: Players' parent edge arrived in the packet after
-    // the one that created it.
+    // Nothing is left waiting, and each deferred edge was settled the way the
+    // packet expressed it: Players by an item-19 edge in the same packet that
+    // created it, the Character by one in the packet after.
     assert_eq!(
         live.waiting(),
         0,
         "no create is still waiting for its parent"
     );
     assert_eq!(doc.dom.get_by_ref(players).unwrap().parent(), workspace);
+    let character = live
+        .referent(&id(&recording, "character"))
+        .expect("the Character is bound");
+    assert_eq!(doc.dom.get_by_ref(character).unwrap().parent(), players);
 }
 
 #[test]
-fn the_character_is_bound_to_players_even_though_it_arrived_first() {
-    let (doc, live, _) = replay();
+fn a_late_parent_edge_is_settled_by_the_packet_after_the_create() {
+    let (doc, live, applied) = replay();
     let recording = recording();
     let players = live.referent(&id(&recording, "players")).unwrap();
     let character = live.referent(&id(&recording, "character")).unwrap();
+    let (kind, stats) = &applied[3];
+    assert_eq!(kind, "replication");
+    assert_eq!(
+        stats.parents, 1,
+        "the packet after the create is the one that moved it: {stats:?}"
+    );
     assert_eq!(
         doc.dom.get_by_ref(character).unwrap().parent(),
         players,
-        "the child arrived with no parent and was given its edge later"
+        "the Character arrived with a null parent and the later edge holds"
     );
+    // The create that made it named no parent, so before that packet it hung
+    // off the root and was waiting; the apply that brought the edge settled it.
+    assert_eq!(live.waiting(), 0);
 }
 
 #[test]
-fn the_removal_takes_the_subtree_and_forgets_the_id() {
+fn the_removal_forgets_the_id_and_leaves_the_rest_alone() {
     let (doc, live, applied) = replay();
     let recording = recording();
     let (kind, stats) = applied.last().expect("an applied packet");
     assert_eq!(kind, "replication");
     assert_eq!(stats.removed, 1, "one node destroyed: {stats:?}");
+    assert_eq!(
+        stats.instances_removed, 0,
+        "the Part had no children, so nothing went with it: {stats:?}"
+    );
     assert!(
         live.referent(&id(&recording, "part")).is_none(),
         "the id is forgotten with the node"
     );
     assert!(
         live.referent(&id(&recording, "character")).is_some(),
-        "the other Part is untouched"
+        "the other Part is untouched — it is not in the removed Part's subtree"
     );
     // Only the Character is still a Part in the document.
     let parts: Vec<String> = {
@@ -234,10 +263,19 @@ fn the_journal_holds_what_a_live_reader_would_replay() {
     let reader = core.retain(0).unwrap();
     let rows = core.read_after(reader, 0, 64).unwrap();
     assert_eq!(rows.len(), 5, "one receipt per committed packet");
+    // The decoder's own world, checked for what it should *not* have as well as
+    // what it should: `WorldView::contains` answers from the base and the
+    // overlay and does not consult the removed set, so on its own it would keep
+    // saying "yes" to a part the recording destroyed. `read_only_node` does
+    // consult it, and that is the one that has to say no.
     let view = core.world_view().expect("a world");
     assert!(
-        view.contains(&id(&recording, "part")),
-        "the decoder's own world has the Part the packets created"
+        view.contains(&id(&recording, "workspace")),
+        "the decoder's own world has the Workspace the globals packet made"
+    );
+    assert!(
+        view.read_only_node(&id(&recording, "part")).is_none(),
+        "the Part the recording destroyed is gone from the decoder's own world"
     );
     assert!(
         core.journal_stats().records > 0,

@@ -1,5 +1,5 @@
 {
- "note": "A join as a recording: rove's own decoder reads the schema (DataModel, Workspace, Part), the globals (the place's top containers), then the place itself \u2014 a Part under Workspace, a Player and a second Part whose parent edges arrive in a later packet, and the first Part destroyed.",
+ "note": "A join as a recording: rove's own decoder reads the schema (DataModel, Workspace, Part) and the globals (the place's top containers), then the place itself. The Part is created under Workspace and destroyed in the last packet; Players gets its parent edge in the packet that creates the Part; the Character arrives with a null parent and is parented by the packet after.",
  "scope": 1,
  "ids": {
   "datamodel": "1:0",
@@ -7,6 +7,70 @@
   "players": "1:2",
   "part": "1:3",
   "character": "1:4"
+ },
+ "manifest": {
+  "id": {
+   "datamodel": "1:0",
+   "workspace": "1:1",
+   "players": "1:2",
+   "part": "1:3",
+   "character": "1:4"
+  },
+  "schema": {
+   "classes": 3,
+   "properties": 2,
+   "names": [
+    "DataModel",
+    "Workspace",
+    "Part"
+   ]
+  },
+  "globals": {
+   "containers": [
+    "1:0",
+    "1:1",
+    "1:2"
+   ]
+  },
+  "replication": [
+   [
+    {
+     "item": "create",
+     "id": "1:3",
+     "parent": "1:1",
+     "properties": [
+      "Size",
+      "Anchored"
+     ]
+    },
+    {
+     "item": "create",
+     "id": "1:4",
+     "parent": null,
+     "properties": [
+      "Size"
+     ]
+    },
+    {
+     "item": "parent",
+     "id": "1:2",
+     "to": "1:1"
+    }
+   ],
+   [
+    {
+     "item": "parent",
+     "id": "1:4",
+     "to": "1:2"
+    }
+   ],
+   [
+    {
+     "item": "remove",
+     "id": "1:3"
+    }
+   ]
+  ]
  },
  "packets": [
   {
@@ -17,17 +81,17 @@
   {
    "at_ms": 0,
    "kind": "globals",
-   "base64": "gSgAAAAkAAAAKLUv/SAk/QAAqAEBAAEDAQABAAEBAAECAAAAAQABAAMAKkPAEQsMAQ=="
+   "base64": "gQEBAAAAAAABAwEAAAAAAAABAAEBAAAAAQABAAECAAAAAQABAA=="
   },
   {
    "at_ms": 40,
    "kind": "replication",
-   "base64": "gwIBAwAAAAIAABYAAIBAAACAPwAAAEABCQH//wEBAAAAAgEEAAAAAgAAFgAAgD8AAIA/AACAP///AAA="
+   "base64": "gwIBAwAAAAIAABYAAIBAAACAPwAAAEABCQH//wEBAAAAAgEEAAAAAgAAFgAAgD8AAIA/AACAP///ABMBAgAAAAEBAAAAAA=="
   },
   {
    "at_ms": 60,
    "kind": "replication",
-   "base64": "gwIBAgAAAAAA//8BAQAAAAA="
+   "base64": "gxMBBAAAAAECAAAAAA=="
   },
   {
    "at_ms": 80,

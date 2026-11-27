@@ -77,8 +77,16 @@ jobs:
           cargo test -p rustudio-live --locked --message-format=short -- --nocapture 2>&1 | tee /tmp/live-tests.log
           status=${PIPESTATUS[0]}
           set -e
-          echo "--- summary:"
-          grep -E "^(test result|running|test )" /tmp/live-tests.log | head -40
+          # The acceptance numbers, printed before the verdict so a red run says
+          # what it saw: the per-test names, then whatever a failure explained.
+          echo "--- tests:"
+          grep -E "^(running|test result|test .* (ok|FAILED))" /tmp/live-tests.log | head -40
+          if [ "$status" -ne 0 ]; then
+            echo "--- what failed:"
+            sed -n '/panicked at/,$p' /tmp/live-tests.log | head -30
+            echo "--- every assertion message:"
+            grep -E "^(thread|assertion|left|right|note:|called .* on an)" /tmp/live-tests.log | head -30
+          fi
           # Copy the log where the annotation step can always reach it, then
           # fail: the step that emits annotations must not be the step that ran
           # out of output first.
