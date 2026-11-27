@@ -4643,6 +4643,7 @@ dependencies = [
  "rustudio-account",
  "rustudio-core",
  "rustudio-engine",
+ "rustudio-join",
  "rustudio-live",
  "rustudio-net",
  "rustudio-physics",
