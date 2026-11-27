@@ -710,7 +710,14 @@ impl Game {
     /// keys go to the game's scripts.
     pub fn play_game_input(&self) -> bool {
         self.play.as_ref().is_some_and(|p| {
-            p.mode == RunMode::Play && p.showing == Side::Client
+            // A live client is *always* the client side: `showing` is
+            // meaningless there (there is no other document), so requiring
+            // `Side::Client` made this false for every joined game and the
+            // thumbstick, jump and taps went to the editor instead.
+            match p.mode {
+                RunMode::Client => true,
+                _ => p.mode == RunMode::Play && p.showing == Side::Client,
+            }
         })
     }
 
@@ -4311,7 +4318,10 @@ impl Game {
             let _s = rustudio_core::bench::scope("p2a_lua_pre");
             // (CameraRelative's turn: on the studio path after the client's
             // RenderStepped, at the end of the last frame, `hum_face_camera`.)
-            if mode == RunMode::Play && !studio_path() {
+            // A live client turns its character to the camera too: the server
+            // replicates motion, but CameraRelative is the client's own turn,
+            // and without it a walked character slides sideways.
+            if matches!(mode, RunMode::Play | RunMode::Client) && !studio_path() {
                 self.hum_face_camera();
             }
             self.lua_pre_physics(mode, dt, 0);
@@ -4325,7 +4335,11 @@ impl Game {
             self.bind_live_character();
         }
         let mut hum_out: Option<hum_glue::HumFrameOut> = None;
-        if mode == RunMode::Play && self.play_has_character()
+        // `RunMode::Client` too. This is what runs the Humanoid: its state
+        // machine, jump, the animation driver and the camera's subject. Leaving
+        // it Play-only is why a joined game had a character in it that nothing
+        // stepped — and why the thumbstick had nothing to move.
+        if matches!(mode, RunMode::Play | RunMode::Client) && self.play_has_character()
             && !self.play.as_ref().is_some_and(|s| s.map.gameplay_paused())
         {
             let _s = rustudio_core::bench::scope("p2_player_humanoid");
@@ -5407,13 +5421,21 @@ impl Game {
         // 7. The view is the client's Workspace.CurrentCamera, whatever its
         // CameraType: Roblox's CameraModule (or the place's own camera
         // script) moves it. Looking at the server side frees the editor camera.
-        let client_cam = (mode == RunMode::Play
-            && self
-                .play
-                .as_ref()
-                .is_some_and(|s| s.showing == Side::Client))
-        .then(|| self.play.as_ref().and_then(|s| s.other_doc.as_ref()))
-        .flatten()
+        // A live client draws the world itself, so its camera is in `self.doc`;
+        // Play Solo puts the client's DataModel in `other_doc` while the server
+        // is in front. Reading `other_doc` for `Client` gave `None` and left the
+        // editor camera in place over a joined game.
+        let client_cam = if mode == RunMode::Client {
+            Some(&self.doc)
+        } else {
+            (mode == RunMode::Play
+                && self
+                    .play
+                    .as_ref()
+                    .is_some_and(|s| s.showing == Side::Client))
+            .then(|| self.play.as_ref().and_then(|s| s.other_doc.as_ref()))
+            .flatten()
+        }
         .and_then(|cd| {
             let ws = cd.workspace()?;
             let cam = match cd.prop(ws, "CurrentCamera") {

@@ -3178,6 +3178,11 @@ impl RustudioApp {
         ed.cloud_windows(&ctx);
         ed.mcp_windows(&ctx);
         ed.file_sync_popover_ui(&ctx);
+        // The joining cover goes last, over everything, and only while a join
+        // is in flight: it hides the bare editor between the tap and the first
+        // replicated frame, which is what a joined place looked like before.
+        #[cfg(feature = "live")]
+        ed.join_cover(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
         self.finish_frame(&ctx, frame_start, dt);
         // The soft keyboard follows what there is to type into; egui-winit

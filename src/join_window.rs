@@ -22,6 +22,8 @@
 
 use std::time::{Duration, Instant};
 
+use rbx_dom_weak::types::Variant;
+
 use crate::app::Editor;
 
 /// Place 1818 (*Baseplate*): a public place, so a join needs no special access,
@@ -56,6 +58,20 @@ fn cookie_source() -> impl FnOnce() -> Option<String> + Send + 'static {
 }
 
 /// A join the person started, and how it is going.
+/// One line of the joining cover, and whether it is done, happening, or waiting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoverStep {
+    Done,
+    Now,
+    Waiting,
+}
+
+/// What the cover draws this frame.
+struct CoverPhase {
+    steps: Vec<(String, CoverStep)>,
+    note: Option<String>,
+}
+
 pub struct JoinWindow {
     pub open: bool,
     pub place_text: String,
@@ -67,6 +83,11 @@ pub struct JoinWindow {
     pub installed: bool,
     /// The report shown as selectable text (the copy's fallback).
     pub show_text: bool,
+    /// The cover is up from the tap until the live client is in.
+    pub cover_until_played: bool,
+    /// A Cancel/Stop asked for on the cover, taken on the next frame so the
+    /// click handler does not stop a join from inside its own draw.
+    pub cancel_requested: bool,
     /// When the report was last copied, for the "copied" note.
     pub copied_at: Option<Instant>,
     /// The places this device has joined, newest first — the home page's cards
@@ -121,6 +142,8 @@ impl JoinWindow {
             started: None,
             installed: false,
             show_text: false,
+            cover_until_played: false,
+            cancel_requested: false,
             copied_at: None,
             recent: Vec::new(),
             live: None,
@@ -402,6 +425,234 @@ impl Editor {
                 String::new()
             }
         ));
+    }
+
+    /// A full-screen "Joining…" cover, drawn *over* the editor from the moment
+    /// Play is tapped until the live client is in.
+    ///
+    /// What it hides is not cosmetic. Between the tap and the first replicated
+    /// frame, the editor is still showing whatever was last open: a bare
+    /// empty-skybox viewport with the explorer, the ribbon and a toolbar. On a
+    /// phone that reads as "the app opened an .rbxl file and froze", which is
+    /// exactly the report it kept getting.
+    ///
+    /// It is a *cover*, not a gate: it draws while `join_cover()` says a join is
+    /// in flight, and it never blocks on the whole map. The three lines it shows
+    /// are the three things a person waits for, and the last one clears as soon
+    /// as the character is bound — streaming continues behind a game that is
+    /// already playable, which is what Roblox does.
+    ///
+    /// The session's own numbers stay reachable: the small `report` line at the
+    /// bottom opens the existing window, so a stall is diagnosable from the
+    /// phone rather than by reading logcat.
+    pub fn join_cover(&mut self, ctx: &egui::Context) {
+        // Gone the moment the game is playable: a cover over a running game
+        // would be the same problem in a different colour.
+        if self.join_win.cover_until_played && self.live_client_ready() {
+            self.join_win.cover_until_played = false;
+        }
+        // And gone if the join died under it. A cover with nothing behind it is
+        // worse than the editor: the takeover that made it is over, and what is
+        // on screen now is a place that will never arrive. It comes down and
+        // says so, and the session's own "closed" reason is left in Output.
+        let session_over = self
+            .join_win
+            .join
+            .as_ref()
+            .is_some_and(|join| !join.running())
+            && self.game.play.is_none();
+        if self.join_win.cover_until_played && session_over {
+            self.join_win.cover_until_played = false;
+            self.info("join: the session ended before the world arrived");
+        }
+        let Some(phase) = self.join_cover_phase() else {
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let mut open_report = false;
+        egui::Area::new(egui::Id::new("join_cover"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let painter = ui.painter();
+                painter.rect_filled(screen, 0.0, egui::Color32::from_rgb(18, 20, 26));
+                // The three steps, as a list with the current one lit. Drawn
+                // rather than laid out with widgets so it cannot scroll or take
+                // a tap by accident on a phone.
+                let centre = screen.center();
+                let mut y = centre.y - 46.0;
+                for (index, (label, state)) in phase.steps.iter().enumerate() {
+                    let colour = match state {
+                        CoverStep::Done => egui::Color32::from_rgb(120, 190, 140),
+                        CoverStep::Now => egui::Color32::WHITE,
+                        CoverStep::Waiting => egui::Color32::from_rgb(110, 116, 130),
+                    };
+                    let mark = match state {
+                        CoverStep::Done => "✓",
+                        CoverStep::Now => "•",
+                        CoverStep::Waiting => "·",
+                    };
+                    painter.text(
+                        egui::Pos2::new(centre.x, y),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{mark}  {label}"),
+                        egui::FontId::proportional(if state == CoverStep::Now { 21.0 } else { 18.0 }),
+                        colour,
+                    );
+                    y += 30.0;
+                    let _ = index;
+                }
+                if let Some(note) = &phase.note {
+                    painter.text(
+                        egui::Pos2::new(centre.x, y + 12.0),
+                        egui::Align2::CENTER_CENTER,
+                        note,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_rgb(140, 146, 160),
+                    );
+                }
+                // The way out of a stall: the numbers, and a cancel.
+                let button_y = screen.max.y - 54.0;
+                let report = egui::Rect::from_center_size(
+                    egui::Pos2::new(centre.x - 74.0, button_y),
+                    egui::vec2(132.0, 36.0),
+                );
+                let cancel = egui::Rect::from_center_size(
+                    egui::Pos2::new(centre.x + 74.0, button_y),
+                    egui::vec2(132.0, 36.0),
+                );
+                for (rect, text) in [(report, "Report"), (cancel, "Cancel")] {
+                    painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(36, 40, 50));
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        text,
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::from_rgb(220, 224, 232),
+                    );
+                }
+                let pointer = ctx.input(|i| i.pointer.interact_pos());
+                if ctx.input(|i| i.pointer.any_click()) {
+                    if let Some(p) = pointer {
+                        if report.contains(p) {
+                            open_report = true;
+                        } else if cancel.contains(p) {
+                            // Same path as the window's own Stop: a join the
+                            // person gave up on must leave nothing half-made.
+                            self.join_win.cancel_requested = true;
+                        }
+                    }
+                    // (a tap elsewhere is swallowed by the cover, and does not
+                    // reach the editor underneath it)
+                }
+                // Whatever is under the cover must keep being drawn: the world
+                // is arriving while this is up.
+                ctx.request_repaint();
+            });
+        if open_report {
+            self.join_win.open = true;
+            self.join_win.show_text = true;
+        }
+        if std::mem::take(&mut self.join_win.cancel_requested) {
+            self.cancel_join();
+        }
+    }
+
+    /// Whether the live client is far enough in to take the cover down:
+    /// a session playing, `Workspace`, `LocalPlayer`, and a character bound.
+    ///
+    /// Deliberately *not* "the map has finished streaming". That is a much
+    /// longer wait, and a game someone can already walk around in does not need
+    /// to be hidden while the rest of the place arrives behind them.
+    fn live_client_ready(&self) -> bool {
+        let Some(play) = self.game.play.as_ref() else {
+            return false;
+        };
+        if play.mode != rustudio_engine::runtime::RunMode::Client {
+            return false;
+        }
+        let doc = &self.game.doc;
+        let root = doc.dom.root_ref();
+        let workspace = doc.workspace().is_some();
+        let local_player = doc
+            .find_child(root, "Players")
+            .is_some_and(|players| matches!(doc.prop(players, "LocalPlayer"), Some(Variant::Ref(p)) if doc.exists(p)));
+        let character = play.character.is_some();
+        workspace && local_player && character
+    }
+
+    /// Give up on a join: drop the session and put the editor back.
+    ///
+    /// A join the person cancelled must leave nothing half-made — no cover, no
+    /// session, and Stop taken so the world it had started building is gone.
+    pub fn cancel_join(&mut self) {
+        self.join_win.join = None;
+        self.join_win.live_world = None;
+        self.join_win.live = None;
+        self.join_win.cover_until_played = false;
+        self.join_win.installed = false;
+        self.join_win.live_reported = false;
+        self.join_win.live_report_at = None;
+        if self.game.play.is_some() {
+            self.request_stop();
+        }
+        self.info("join: cancelled");
+    }
+
+    /// What the cover should say, or `None` when no join is in flight.
+    ///
+    /// The three steps are the three waits, in order, and each is *observed*
+    /// rather than timed: a cover that guesses its phase is a cover that lies
+    /// about a stall.
+    fn join_cover_phase(&self) -> Option<CoverPhase> {
+        // A join the person started and the editor has not finished installing.
+        let joining = self.join_win.join.as_ref().is_some_and(|j| j.running());
+        let playing = self.game.play.is_some();
+        if !joining && !playing && !self.join_win.cover_until_played {
+            return None;
+        }
+        let has_world = self.join_win.installed || self.game.doc.dom.len() > 8;
+        let stats = self.join_win.join.as_ref().map(|j| j.stats());
+        let stage = stats
+            .as_ref()
+            .map(|s| s.stage_name())
+            .unwrap_or("starting");
+        let bound = self
+            .game
+            .play
+            .as_ref()
+            .and_then(|s| s.character.as_ref())
+            .is_some();
+        let signed_in = !matches!(stage, "idle" | "allocated");
+        let mut steps = Vec::with_capacity(3);
+        steps.push((
+            "Joining".to_string(),
+            if signed_in { CoverStep::Done } else { CoverStep::Now },
+        ));
+        steps.push((
+            "Loading world".to_string(),
+            match (signed_in, has_world) {
+                (true, true) => CoverStep::Done,
+                (true, false) => CoverStep::Now,
+                _ => CoverStep::Waiting,
+            },
+        ));
+        steps.push((
+            "Waiting for your character".to_string(),
+            match (has_world, bound) {
+                (true, true) => CoverStep::Done,
+                (true, false) => CoverStep::Now,
+                _ => CoverStep::Waiting,
+            },
+        ));
+        let note = self.join_win.live.as_ref().map(|c| {
+            format!(
+                "{} instances · {} packets · {} s",
+                c.instances, c.packets, c.seconds
+            )
+        });
+        Some(CoverPhase { steps, note })
     }
 
     /// The join window, drawn over the editor while it is open.
@@ -721,6 +972,10 @@ impl Editor {
         self.join_win.live_logged_at = None;
         self.join_win.live_report_at = None;
         self.join_win.live_reported = false;
+        // The cover goes up now, on the tap, not when the first packet lands:
+        // what it is hiding is the *editor*, and the editor is what is on
+        // screen between those two moments.
+        self.join_win.cover_until_played = true;
         // A new session's deltas describe a world built from nothing, so the
         // editor's half starts from nothing too. Carrying the id map across
         // would bind this session's `scope:index` to the previous one's refs.

@@ -142,7 +142,21 @@ impl Editor {
             }
         }
         // Deterministic editor self-tests inspect intermediate VM state.
-        let threaded = self.game.use_gameplay_worker() && self.harness.selftest.is_none();
+        //
+        // A **live client is never threaded**, and not for a performance reason.
+        // The worker owns `game.doc`, which for `RunMode::Client` is the
+        // document a join has been replicating into; `live_join_frame` applies
+        // each arriving batch to the document the editor is holding. With the
+        // worker those are two different documents: the batches went to a
+        // placeholder the worker never looks at, and the worker drew the world
+        // as it stood on the frame Play began. That is one world split in two —
+        // frozen avatars, streamed parts missing — and the fix is to have one
+        // document, on the thread the join writes to. A live session's own
+        // `Live` is bounded per frame, so this is not the frame-time trade a
+        // Play Solo session makes.
+        let threaded = mode != RunMode::Client
+            && self.game.use_gameplay_worker()
+            && self.harness.selftest.is_none();
         self.plugins.stop_edit_audio_vm_state();
         self.with_game_host(|game, host| {
             if threaded {
