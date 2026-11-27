@@ -189,10 +189,18 @@ fn rove_decodes_the_recording_and_the_bridge_applies_it() {
         doc.dom.get_by_ref(datamodel).unwrap().class.as_str(),
         "DataModel"
     );
+    // Both are children of the document's own root, which is what "no parent"
+    // becomes in a `WeakDom`: the packet's DataModel is a sibling of Workspace,
+    // not its parent. That is the duplicate named above, stated as a fact.
     assert_eq!(
         doc.dom.get_by_ref(workspace).unwrap().parent(),
-        datamodel,
-        "Workspace hangs off the DataModel the globals packet named"
+        doc.dom.root_ref(),
+        "a container with no parent is a child of the document's root"
+    );
+    assert_eq!(
+        doc.dom.get_by_ref(datamodel).unwrap().parent(),
+        doc.dom.root_ref(),
+        "and the packet's DataModel sits beside it, not above it"
     );
     let part = live
         .referent(&id(&recording, "part"))
