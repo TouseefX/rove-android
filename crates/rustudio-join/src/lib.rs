@@ -47,8 +47,9 @@ pub mod session;
 
 #[cfg(feature = "live")]
 pub mod http;
-// The version in the `User-Agent` the launcher checks for (behind `live`: it is
-// fetched over HTTPS).
+// The version in the `User-Agent` the launcher checks for. Behind `live` with
+// `http`: it fetches over HTTPS, with the same `ureq` that feature links.
+#[cfg(feature = "live")]
 pub mod client_version;
 
 pub use allocation::{
