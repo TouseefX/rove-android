@@ -94,10 +94,17 @@ jobs:
             plain=$(mktemp)
             sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" \
               | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain" || true
+            # A failed assert!'s own message is the diagnostic: print what comes
+            # after the "panicked at" line first, since that is where the test
+            # prints the list of what it found.
+            if grep -q "panicked at" "$plain"; then
+              echo "--- the failure"
+              sed -n '/panicked at/,$p' "$plain" | head -6 | sed 's/^/::error::log: /'
+            fi
             echo "--- first lines"
-            head -5 "$plain" | sed 's/^/::error::log: /' || true
+            head -4 "$plain" | sed 's/^/::error::log: /' || true
             echo "--- last lines"
-            tail -5 "$plain" | sed 's/^/::error::log: /' || true
+            tail -4 "$plain" | sed 's/^/::error::log: /' || true
             rm -f "$plain"
             true
           done
@@ -154,10 +161,17 @@ jobs:
             plain=$(mktemp)
             sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" \
               | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain" || true
+            # A failed assert!'s own message is the diagnostic: print what comes
+            # after the "panicked at" line first, since that is where the test
+            # prints the list of what it found.
+            if grep -q "panicked at" "$plain"; then
+              echo "--- the failure"
+              sed -n '/panicked at/,$p' "$plain" | head -6 | sed 's/^/::error::log: /'
+            fi
             echo "--- first lines"
-            head -5 "$plain" | sed 's/^/::error::log: /' || true
+            head -4 "$plain" | sed 's/^/::error::log: /' || true
             echo "--- last lines"
-            tail -5 "$plain" | sed 's/^/::error::log: /' || true
+            tail -4 "$plain" | sed 's/^/::error::log: /' || true
             rm -f "$plain"
             true
           done
