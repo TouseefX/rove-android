@@ -113,7 +113,7 @@ fn packet_138_matches_the_python_layout_and_hash_vectors() {
     let vectors = vectors();
     let ticket = &vectors["ticket"];
     assert_eq!(
-        ticket_hash(b"", 0).as_u64().unwrap(),
+        u64::from(ticket_hash(b"", 0)),
         vectors["ticket"]["hash_empty_seed0"].as_u64().unwrap()
     );
     for pair in ticket["checksum_vectors"].as_array().unwrap() {
@@ -147,7 +147,7 @@ fn the_checksum_and_hash_match_the_independent_vectors() {
         unhex(vectors["ticket"]["packet_hex"].as_str().unwrap())
     );
     assert_eq!(
-        ticket_hash(b"", 0) as u64,
+        u64::from(ticket_hash(b"", 0)),
         vectors["ticket"]["hash_empty_seed0"].as_u64().unwrap()
     );
 }

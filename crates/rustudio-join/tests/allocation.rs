@@ -332,10 +332,18 @@ impl HttpClient for Recorded {
     ) -> Result<Reply, AllocationError> {
         self.asked
             .push((host.to_owned(), path.to_owned(), method.to_owned(), payload.cloned()));
-        if self.replies.is_empty() {
-            return Err(AllocationError::new("no recorded reply left"));
+        match self.replies.is_empty() {
+            true => Ok(Reply {
+                // A client that was asked more than it recorded: hand back the
+                // least interesting reply rather than failing, so the test's
+                // own assertions (about how many requests were made) decide.
+                http_status: 500,
+                challenge_present: false,
+                content_type: "application/json".into(),
+                data: None,
+            }),
+            false => Ok(self.replies.remove(0)),
         }
-        Ok(self.replies.remove(0))
     }
 }
 
