@@ -84,6 +84,12 @@ pub struct Counters {
     /// session whose retained count climbs while `acked` stands still is one
     /// whose journal is about to refuse packets.
     pub acked: u64,
+    /// Streaming: regions received, focus updates sent, and whether the spawn
+    /// acknowledgment went. A streaming place sends half a world until that
+    /// handshake happens, so these three say whether it did.
+    pub regions: usize,
+    pub focus_sent: usize,
+    pub streaming_ready: bool,
     pub journal: usize,
     pub replies_sent: usize,
     pub replies_failed: usize,
@@ -96,7 +102,7 @@ impl Counters {
     pub fn line(&self) -> String {
         format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
-             acked {}/{} held · markers {}/{} · {} s",
+             acked {}/{} held · markers {}/{} · stream {}/{} {} · {} s",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -109,6 +115,9 @@ impl Counters {
             self.journal,
             self.markers,
             self.replies_sent,
+            self.regions,
+            self.focus_sent,
+            if self.streaming_ready { "acked" } else { "no-ack" },
             self.seconds
         )
     }

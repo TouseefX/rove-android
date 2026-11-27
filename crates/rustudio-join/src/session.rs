@@ -181,6 +181,21 @@ pub struct Session {
     /// retained count, which prunes to zero as the session keeps up.
     pub rows_applied: u64,
     pub acknowledged_errors: usize,
+    /// Streaming: the regions the server has sent, where we last asked it to
+    /// focus, whether the spawn acknowledgment went, and whether our own Player
+    /// has appeared yet. A streaming place sends half a world until the client
+    /// acknowledges the spawn region, so these four numbers say whether that
+    /// handshake happened at all.
+    pub regions: usize,
+    pub focus_id: u32,
+    pub focus_sent: usize,
+    pub streaming_ready_sent: bool,
+    pub streaming_resume_refused: usize,
+    /// Our account's user id, and whether a character of ours has resolved.
+    pub account_user_id: Option<u64>,
+    pub character_seen: bool,
+    /// The ids of every `Player` in the world, for finding ours.
+    pub player_ids: std::collections::BTreeSet<String>,
     /// Ping packets that carried no request (a pure reply packet) and those
     /// whose request this client cannot answer truthfully. Both counted so a
     /// session with pings and no replies names the reason.
@@ -269,6 +284,14 @@ impl Session {
             rows_applied: 0,
             acknowledged_through: 0,
             acknowledged_errors: 0,
+            regions: 0,
+            focus_id: 0,
+            focus_sent: 0,
+            streaming_ready_sent: false,
+            streaming_resume_refused: 0,
+            account_user_id: None,
+            character_seen: false,
+            player_ids: std::collections::BTreeSet::new(),
             ping_unanswered: 0,
             ping_refused: 0,
             integrity_status: 0,
@@ -448,6 +471,132 @@ impl Session {
     /// this reason). Until that measurement is ported, a fabricated reply would
     /// be a lie told to the server in its own protocol, so the count is what
     /// the report carries and the answer is left out.
+    /// Tell a streaming server we have the spawn region, so it will send the
+    /// character and the parts around it.
+    ///
+    /// This is rove's `prepare_streaming_resume`, and it exists because of a
+    /// chicken-and-egg a streaming place creates: the server holds the
+    /// character until the client acknowledges the spawn region, and a client
+    /// waiting for the character before acknowledging waits forever. Half a
+    /// DataModel — Models with no parts in them, no character — is what that
+    /// deadlock looks like from the outside.
+    ///
+    /// What "we have it" means is evidence, not a timer: a region received, or
+    /// a `Player` of ours in the world, or a resolved character. rove's own
+    /// comment records that some servers never publish regions before the ack,
+    /// so the character resolves first there — and at least one of the three
+    /// must hold before anything is sent.
+    ///
+    /// Sent once per session on `(4, 1)`, the reliable world stream.
+    fn prepare_streaming_resume(&mut self) -> bool {
+        if self.streaming_ready_sent {
+            return false;
+        }
+        let Some(view) = self.core.world_view() else {
+            return false;
+        };
+        // Our own Player: the one whose `UserId` is the account's.
+        let me = self.account_user_id.and_then(|uid| {
+            self.player_ids.iter().find(|id| {
+                view.class_name(id) == Some("Player")
+                    && view
+                        .get_property(id, "UserId")
+                        .and_then(|v| v.as_f64())
+                        .is_some_and(|v| v as u64 == uid)
+            })
+        });
+        // The evidence: a Player of ours exists, or a character has resolved.
+        let character = self.character_seen;
+        let Some(player) = me else {
+            // No Player of ours yet. Not a failure — this is asked again after
+            // the next packet — but a character with no Player is not evidence
+            // enough to spend the one acknowledgment on.
+            return false;
+        };
+        if !character && self.regions == 0 {
+            // Nothing proves the region arrived, and a `131, 3` sent on a guess
+            // tells the server we have a world we do not have.
+            return false;
+        }
+        let Some(property) = self.gameplay_paused_property_id() else {
+            return false;
+        };
+        let Ok(guid) = parse_instance_guid(player) else {
+            return false;
+        };
+        let evidence = rove_client_core::replication_out::StreamingEvidence {
+            player_spawned: character,
+            spawn_region_received: true,
+        };
+        match rove_client_core::replication_out::streaming_ready(guid, property, 9, evidence) {
+            Ok(payload) => {
+                self.outbound
+                    .push((REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload));
+                self.streaming_ready_sent = true;
+                true
+            }
+            Err(error) => {
+                // Counted, not fatal: the next packet asks again.
+                log::debug!("session: streaming resume not encoded: {error}");
+                false
+            }
+        }
+    }
+
+    /// Whether one of our Players has a `Character` that is in the world.
+    fn character_present(&self) -> bool {
+        self.player_ids.iter().any(|id| {
+            self.live
+                .referent(id)
+                .is_some_and(|r| match self.document.prop(r, "Character") {
+                    Some(rbx_dom_weak::types::Variant::Ref(c)) => self.document.exists(c),
+                    _ => false,
+                })
+        })
+    }
+
+    /// `Player.GameplayPaused`'s schema id, which the resume packet names.
+    fn gameplay_paused_property_id(&self) -> Option<u16> {
+        let schema = self.core.schema()?;
+        let class = schema.classes.iter().find(|c| c.name == "Player")?;
+        let property = schema
+            .properties
+            .iter()
+            .find(|p| p.name == "GameplayPaused" && class.properties.contains(&p.id))?;
+        u16::try_from(property.id).ok()
+    }
+
+    /// Where to ask the streamer to focus: the last region the server sent.
+    ///
+    /// Region coordinates arrive as 64-stud cell indices; a focus point is world
+    /// studs, so the cell centre is what to ask for — rove's own conversion.
+    /// Sent on `(4, 1)`, cycling the id the server echoes back.
+    fn note_regions(&mut self, regions: &[serde_json::Value]) {
+        self.regions += regions.len();
+        let Some(center) = regions
+            .last()
+            .and_then(|region| region.get("coordinate"))
+            .and_then(|c| c.as_array())
+            .filter(|values| values.len() == 3)
+        else {
+            return;
+        };
+        let to_stud = |index: usize| {
+            (center[index].as_f64().unwrap_or(0.0) * 64.0 + 32.0) as f32
+        };
+        self.focus_id = self.focus_id.wrapping_add(1);
+        if let Ok(packet) = rove_client_core::replication_out::replication_focus(
+            self.focus_id,
+            [to_stud(0), to_stud(1), to_stud(2)],
+            512.0,
+            4000,
+        ) {
+            self.outbound
+                .push((REPLICATION_APPLICATION, REPLICATION_CHANNEL, packet));
+            self.focus_sent += 1;
+        }
+    }
+
     /// A ping on `(4, 3)`, answered rather than counted.
     ///
     /// The reply echoes the request's own timestamp and word and adds the
@@ -661,6 +810,9 @@ impl Session {
             rows: self.rows_applied as usize,
             markers: self.markers,
             acked: self.acknowledged_through,
+            regions: self.regions,
+            focus_sent: self.focus_sent,
+            streaming_ready: self.streaming_ready_sent,
             journal: self.journal_rows(),
             replies_sent: self.replies_sent,
             replies_failed: self.replies_failed,
@@ -705,6 +857,45 @@ impl Session {
             self.cursor = row.sequence;
             through = row.sequence;
             self.rows_applied += 1;
+            // Streaming, and the spawn handshake: both read from the record
+            // that carried them. A streaming place sends the region set before
+            // the parts, and holds the character until this client says the
+            // spawn region arrived — so these are answered from here, where the
+            // records are, rather than guessed at from the packet count.
+            self.note_regions(&row.value.world_delta["regions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default());
+            // Our own Player — the one the account's id names — and whether a
+            // character has been replicated for it. Both are read from the
+            // ids this batch made, which is the only place the wire's names
+            // become refs.
+            for action in &actions {
+                if action.get("kind").and_then(|k| k.as_str()) != Some("create") {
+                    continue;
+                }
+                let (Some(id), Some(class)) = (
+                    action.get("id").and_then(|v| v.as_str()),
+                    action
+                        .get("node")
+                        .and_then(|n| n.get("class_name"))
+                        .and_then(|c| c.as_str()),
+                ) else {
+                    continue;
+                };
+                if class == "Player" {
+                    self.player_ids.insert(id.to_string());
+                }
+            }
+            // A character is a Model with a Humanoid, parented to our Player:
+            // the cheapest sound evidence is a `Character` property that
+            // resolves, which the `Live` already holds.
+            if !self.character_seen && self.character_present() {
+                self.character_seen = true;
+            }
+            if self.prepare_streaming_resume() {
+                log::info!("session: spawn region acknowledged; the server will stream the character");
+            }
             if actions.is_empty() {
                 self.ingested.without_actions += 1;
                 continue;
@@ -742,7 +933,22 @@ impl Session {
         read
     }
 
-    /// Rows the journal holds. A counter, not a scan: this is polled by a
+    /// `"scope:index"` as the wire's two-number instance key.
+///
+/// The stream names instances this way and `replication_out` wants the pair;
+/// scope 0 is not a real scope and the encoder refuses it, so it is refused
+/// here too rather than at the encoder, where the reason is less clear.
+fn parse_instance_guid(id: &str) -> Result<(u32, u32), ()> {
+    let (scope, index) = id.split_once(':').ok_or(())?;
+    let scope: u32 = scope.parse().map_err(|_| ())?;
+    let index: u32 = index.parse().map_err(|_| ())?;
+    if scope == 0 {
+        return Err(());
+    }
+    Ok((scope, index))
+}
+
+/// Rows the journal holds. A counter, not a scan: this is polled by a
     /// progress callback while the session runs, and `read_after(.., 4096)`
     /// walks the whole journal every time it is asked.
     pub fn journal_rows(&self) -> usize {

@@ -389,6 +389,10 @@ fn run(
         .build()
         .map_err(|_| "the transport runtime could not be started".to_owned())?;
     let mut world = session::Session::new();
+    // Who we are, so the session can find *its* Player in a world full of
+    // other people's: a streaming server will not send a character until the
+    // client acknowledges the spawn region for that Player.
+    world.account_user_id = Some(user_id);
     // The world goes to the caller as it is built, when there is somewhere to
     // put it (M3). Without one the session collects the place and this hands it
     // over at the end, exactly as M2 did.
