@@ -140,8 +140,13 @@ jobs:
           cargo test -p rustudio-join --locked --message-format=short 2>&1 \
             | tee "$RUNNER_TEMP/join.log"
           grep -E "^(running|test result)" "$RUNNER_TEMP/join.log" || true
-      - name: The ported codec against rove's own encoder (both included)
+      - name: The ported codec against rove's own encoder (both in one build)
         shell: bash
+        # If this step goes red, the line to read is the `error` one above the
+        # "Process completed" line: this example is the only place two login
+        # modules are compiled together, so a mistake here is a mistake in the
+        # comparison, not in the crate.
+        if: always()
         run: |
           set -o pipefail
           cargo run -p rustudio-join --example crosscheck --locked \

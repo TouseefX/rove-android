@@ -4,31 +4,33 @@
 //! `login.rs`, and making that crate a dev-dependency of this one pulls a whole
 //! client target into the test graph — which changes cargo's feature resolution
 //! for the workspace (its `ureq` chain reaches `tungstenite`'s native-tls, and
-//! that is not in the lock). So the reference is `include!`d here instead: same
-//! crate, same module graph, no dependency arc. Two `login` modules appear side
-//! by side, which is exactly what a cross-check should look like.
+//! that is not in the lock). So the reference is loaded by path here instead:
+//! same crate, its own module, no dependency arc.
+//!
+//! A module loaded with `#[path]` keeps its file's own `//!` docs, which an
+//! `include!` in item position cannot (E0753) — that is why it is not a macro.
+//! The one outside name `login.rs` uses is `crate::allocation::new_join_attempt_id`
+//! (for the verification nonce), and an example's crate root is this file, so
+//! `allocation` below is that shim. It calls the port's own function, which
+//! makes that single path shared rather than compared — the verification
+//! packet is therefore checked against rove's recorded vectors instead, below.
 //!
 //! Run it with `cargo run -p rustudio-join --example crosscheck`. It prints one
 //! line per check and exits non-zero on the first disagreement, so CI can gate
 //! on it.
 
-// The reference, compiled as it ships. `login.rs` is a plain module with one
-// outside reference of its own (`crate::allocation::new_join_attempt_id`, for
-// the verification nonce), so `allocation` here is a shim onto the port's own —
-// which makes that one path a shared implementation rather than a comparison.
-// The verification packet is therefore checked against the *vector* below, not
-// against the reference; everything else is compared byte for byte.
-mod reference {
-    pub mod allocation {
-        pub fn new_join_attempt_id() -> Result<String, &'static str> {
-            crate::port::allocation::new_join_attempt_id().map_err(|_| "no entropy")
-        }
-    }
-    #[allow(dead_code, unused_imports)]
-    pub mod login {
-        include!("../../../rove/rust-client/src/login.rs");
+mod allocation {
+    pub fn new_join_attempt_id() -> Result<String, &'static str> {
+        rustudio_join::allocation::new_join_attempt_id().map_err(|_| "no entropy")
     }
 }
+
+// The reference's own `#[cfg(test)] mod tests` (a copy of the vector checks,
+// with an `include_str!` path relative to rove's crate) is not compiled here:
+// `cfg(test)` is never set for an example's dependency graph.
+#[path = "../../../rove/rust-client/src/login.rs"]
+#[allow(dead_code, unused_imports)]
+mod reference_login;
 
 use rustudio_join::login as port;
 
@@ -59,25 +61,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compare(
             &format!("protocol_sync{range:?}"),
             port::protocol_sync(join, Some(ticket), range)?,
-            reference::login::protocol_sync(join, Some(ticket), range)?,
+            reference_login::protocol_sync(join, Some(ticket), range)?,
         );
     }
     let ticket_join = &vectors["ticket"]["join"];
     compare(
         "ticket_packet",
         port::ticket_packet(ticket_join)?,
-        reference::login::ticket_packet(ticket_join)?,
+        reference_login::ticket_packet(ticket_join)?,
     );
     let early = vectors["early_auth"]["ticket"].as_str().unwrap();
     compare(
         "issued_early_auth",
         port::issued_early_auth(early)?,
-        reference::login::issued_early_auth(early)?,
+        reference_login::issued_early_auth(early)?,
     );
     compare(
         "server_id_packet",
         port::server_id_packet(),
-        reference::login::server_id_packet(),
+        reference_login::server_id_packet(),
     );
 
     // The codec beneath them, over a spread of magnitudes.
@@ -97,30 +99,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compare(
             &format!("encode_signed({value})"),
             port::encode_signed(value),
-            reference::login::encode_signed(value),
+            reference_login::encode_signed(value),
         );
     }
     for value in [0u64, 1, 127, 128, 624_485, u64::MAX / 3, u64::MAX] {
         compare(
             &format!("encode_unsigned({value})"),
             port::encode_unsigned(value)?,
-            reference::login::encode_unsigned(value)?,
+            reference_login::encode_unsigned(value)?,
         );
     }
     for text in ["", "a", "é", "a longer string with spaces", "🤖"] {
         compare(
             &format!("encode_string({text:?})"),
             port::encode_string(text)?,
-            reference::login::encode_string(text)?,
+            reference_login::encode_string(text)?,
         );
     }
     for input in [0u32, 1, 0x1234_5678, u32::MAX] {
         checks += 1;
-        if port::ticket_checksum(input) != reference::login::ticket_checksum(input) {
+        if port::ticket_checksum(input) != reference_login::ticket_checksum(input) {
             eprintln!("DISAGREE ticket_checksum({input:#x})");
             std::process::exit(1);
         }
-        if port::ticket_hash(&input.to_le_bytes(), 1) != reference::login::ticket_hash(&input.to_le_bytes(), 1) {
+        if port::ticket_hash(&input.to_le_bytes(), 1) != reference_login::ticket_hash(&input.to_le_bytes(), 1) {
             eprintln!("DISAGREE ticket_hash({input:#x})");
             std::process::exit(1);
         }

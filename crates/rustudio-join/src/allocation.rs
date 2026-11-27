@@ -79,7 +79,11 @@ impl fmt::Display for AllocationError {
 
 impl std::error::Error for AllocationError {}
 
+/// Response and token bounds shared with the live client. Unused when the crate
+/// is built without `live`, which is the build the offline tests run in.
+#[cfg_attr(not(feature = "live"), allow(dead_code))]
 pub(crate) const MAX_RESPONSE: usize = 2 * 1024 * 1024;
+#[cfg_attr(not(feature = "live"), allow(dead_code))]
 const MAX_CSRF_TOKEN: usize = 8 * 1024;
 const MAX_CERT_PINS: usize = 16;
 
@@ -850,7 +854,9 @@ fn canonical_non_nil_uuid(value: &str) -> bool {
     nonzero
 }
 
-/// rove's anti-CSRF token sanity check: printable, non-empty, bounded.
+/// rove's anti-CSRF token sanity check: printable, non-empty, bounded. Used by
+/// the live client; the offline build only needs the parser.
+#[cfg_attr(not(feature = "live"), allow(dead_code))]
 pub(crate) fn valid_csrf_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= MAX_CSRF_TOKEN
