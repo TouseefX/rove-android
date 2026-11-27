@@ -185,7 +185,7 @@ mod tests {
     fn a_finished_join_reads_as_its_stages_in_order() {
         let mut report = Report::begin(1818);
         report.ok("sign in", "user 424242");
-        report.ok("allocate", "203.0.113.9:443, 2 pins, token yes");
+        report.ok("allocate", "5.5.5.5:443, 2 pins, token yes");
         report.ok("connect", "webtransport");
         report.ok("log in", "5 packets");
         report.waiting("receive");
@@ -217,7 +217,7 @@ mod tests {
         // The steps are written by callers, so this is a check on the shape:
         // nothing in a report is a cookie, a token or a ticket.
         let mut report = Report::begin(1818);
-        report.ok("allocate", "203.0.113.9:443, 2 pins, token yes");
+        report.ok("allocate", "5.5.5.5:443, 2 pins, token yes");
         let text = report.lines().join("\n");
         assert!(!text.contains("ROBLOSECURITY"));
         assert!(text.contains("token yes"), "the presence is reported, not the value");

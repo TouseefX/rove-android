@@ -66,7 +66,7 @@ fn the_dial_address_is_the_udmux_front_and_the_backend_is_the_machine() {
     // Dial the udmux front from the port the NetStackConfig agrees with.
     assert_eq!(
         issued.endpoint,
-        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 443)),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5)), 443)),
         "UdmuxEndpoints[0].Address, on NetStackConfig's port"
     );
     // The routing header carries the machine, which is a *different* address
@@ -74,7 +74,7 @@ fn the_dial_address_is_the_udmux_front_and_the_backend_is_the_machine() {
     // this test exists to catch.
     assert_eq!(
         issued.backend,
-        Some(Ipv4Addr::new(198, 51, 100, 7)),
+        Some(Ipv4Addr::new(7, 7, 7, 7)),
         "MachineAddress is the backend the header names"
     );
     assert!(issued.is_transport_ready());
@@ -105,10 +105,10 @@ fn a_server_without_udmux_is_dialled_at_its_machine_address() {
     let issued = issued("machine_only");
     assert_eq!(
         issued.endpoint,
-        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 443)),
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7)), 443)),
         "with no udmux front, MachineAddress is the address to dial"
     );
-    assert_eq!(issued.backend, Some(Ipv4Addr::new(198, 51, 100, 7)));
+    assert_eq!(issued.backend, Some(Ipv4Addr::new(7, 7, 7, 7)));
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn a_secret_is_not_in_the_debug_output() {
     assert!(debug.contains("[REDACTED]"));
     // And the display summary names the endpoint without a secret.
     let summary = issued.summary();
-    assert!(summary.contains("203.0.113.9:443"), "{summary}");
+    assert!(summary.contains("5.5.5.5:443"), "{summary}");
     assert!(!summary.contains("synthetic-session-id"));
 }
 
@@ -170,6 +170,31 @@ fn a_loopback_endpoint_is_refused_rather_than_dialled() {
         }
         other => panic!("a loopback endpoint should parse to a non-dialable allocation: {other:?}"),
     }
+}
+
+#[test]
+fn the_documentation_ranges_are_refused_like_loopback() {
+    // 203.0.113.0/24, 198.51.100.0/24 and 192.0.2.0/24 are reserved for
+    // documentation and never route. The first fixture written for this test
+    // used them, which is how the refusal came up: a join script naming one is
+    // not something to dial, and the parser says so by leaving the endpoint
+    // empty rather than by connecting and hanging.
+    let fixture = fixture();
+    let issued = match parse_allocation(
+        200,
+        fixture["rejected"]["documentation_range"].as_object(),
+        &target(),
+        None,
+        USER,
+        "application/json",
+    )
+    .expect("the body parses; the address is what is refused")
+    {
+        AllocationResult::Ready(issued) => issued,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(issued.endpoint, None);
+    assert!(!issued.is_transport_ready());
 }
 
 #[test]
