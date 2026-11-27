@@ -1951,7 +1951,13 @@ impl Game {
         // across them is four borrow errors (which is how CI found this).
         let uid = self.account.user_id();
         let mut no_player_yet = false;
-        let (_player, name, local, has_scripts_now) = {
+        //
+        // `'bind` is a *labelled block*, not the function: a bare `return` in
+        // here returns from `setup_live_client_player`, which is E0308 (the
+        // function returns `()`, the block's value is a tuple) — and even had it
+        // compiled, it would have skipped the report at the bottom. `break 'bind`
+        // leaves the block with that value and lets the function carry on.
+        let (_player, name, local, has_scripts_now) = 'bind: {
         let doc = &mut self.doc;
         let root = doc.dom.root_ref();
         let players = doc.find_child(root, "Players");
@@ -1982,7 +1988,7 @@ impl Game {
             // (A `drop(doc)` here would be a no-op on a reborrow, which is what
             // the warning at this line said.)
             no_player_yet = true;
-            return (None, String::new(), Vec::new(), false);
+            break 'bind (None, String::new(), Vec::new(), false);
         };
         // (the Player ref itself is only used inside the block: outside it, the
         // `LocalPlayer` property is what names it)
