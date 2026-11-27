@@ -25,6 +25,16 @@ use crate::allocation::{
     valid_csrf_token, AllocationError, HttpClient, Reply, ALLOWED_HOSTS, MAX_RESPONSE,
 };
 
+/// What a native Roblox client says it is, in the header the launcher reads to
+/// decide whether a join request may have a server at all.
+///
+/// Not a lie about being Roblox's own binary on the wire — every join after
+/// this one is this client's own WebTransport session with this client's own
+/// pins — but the launcher's admission test is about *the kind of client*, and
+/// a browser identity is refused (status 12) while a native one is admitted.
+const NATIVE_IDENTITY: &str = "Roblox/Darwin";
+const NATIVE_USER_AGENT: &str = "RobloxPlatform/0.744.0.7441080";
+
 const MAX_COOKIE: usize = 32 * 1024;
 const MAX_REQUEST: usize = 1024 * 1024;
 const TIMEOUT_SECS: u64 = 20;
@@ -111,7 +121,7 @@ impl AccountSession {
             // No redirects: the Cookie header must never follow a 3xx to a host
             // that is not on the allowlist above.
             .max_redirects(0)
-            .user_agent(concat!("RustudioJoin/", env!("CARGO_PKG_VERSION")))
+            .user_agent(NATIVE_USER_AGENT)
             .build();
         let agent: ureq::Agent = config.into();
         Ok(Self {
@@ -159,6 +169,15 @@ impl AccountSession {
                     format!(".ROBLOSECURITY={}", self.cookie.expose()),
                 ),
                 ("Accept".into(), "application/json".into()),
+                // **The launcher admits native clients and refuses web ones.**
+                // `gamejoin` answers HTTP 200 with status 12, "You are not
+                // allowed to play this game", to a request that identifies as
+                // a browser — and status 2 for the same place and cookie once
+                // it identifies as a native client (the research in
+                // H644b/Roblox-Public-Web-Play-Join measured exactly this,
+                // including that the HTTP `User-Agent` alone changes nothing:
+                // it is this header).
+                ("rbx-user-agent".into(), NATIVE_IDENTITY.into()),
                 ("Origin".into(), "https://www.roblox.com".into()),
                 ("Referer".into(), "https://www.roblox.com/".into()),
             ];

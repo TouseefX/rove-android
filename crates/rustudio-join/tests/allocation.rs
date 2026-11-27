@@ -333,9 +333,11 @@ fn a_rejection_keeps_the_status_it_was_given() {
         AllocationResult::Rejected {
             http_status,
             status,
+            message,
         } => {
             assert_eq!(http_status, 403);
             assert_eq!(status, Some(8));
+            assert_eq!(message, None, "this body carried no message");
         }
         other => panic!("{other:?}"),
     }
@@ -519,4 +521,34 @@ fn an_attempt_id_is_a_canonical_v4_uuid() {
         "variant bits: {id}"
     );
     assert_ne!(id, new_join_attempt_id().unwrap(), "a fresh one each time");
+}
+
+#[test]
+fn a_refusal_keeps_the_sentence_that_says_which_refusal_it_is() {
+    // The case a phone hit: HTTP 200, status 12, and only the body says why.
+    // A status number on its own cannot tell "this identity is refused" from
+    // "this place does not exist" from "playtesters only".
+    let rejected = classify(
+        Reply {
+            http_status: 200,
+            challenge_present: false,
+            content_type: "application/json".into(),
+            data: Some(serde_json::json!({
+                "status": 12,
+                "message": "You are not allowed to play this game",
+                "joinScript": null,
+            })),
+        },
+        &target(),
+        None,
+        USER,
+    )
+    .expect("a refusal is a decision, not an error");
+    match rejected {
+        AllocationResult::Rejected { status, message, .. } => {
+            assert_eq!(status, Some(12));
+            assert_eq!(message.as_deref(), Some("You are not allowed to play this game"));
+        }
+        other => panic!("{other:?}"),
+    }
 }

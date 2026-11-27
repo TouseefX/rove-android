@@ -379,6 +379,12 @@ pub enum AllocationResult {
     Rejected {
         http_status: u16,
         status: Option<i64>,
+        /// The launcher's own sentence, when it sent one. Roblox says *why*
+        /// in the body — `"You are not allowed to play this game"`,
+        /// `"Unable to join Game 211"`, `"Playtesters Only"` — and a status
+        /// number alone cannot distinguish an admission refusal from a place
+        /// that does not exist.
+        message: Option<String>,
     },
     Ready(IssuedJoinAllocation),
 }
@@ -478,6 +484,10 @@ pub fn classify(
         return Ok(AllocationResult::Rejected {
             http_status: reply.http_status,
             status,
+            message: data
+                .and_then(|d| d.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
     }
     parse_allocation(reply.http_status, data, target, invite, expected_user_id, &reply.content_type)
@@ -501,6 +511,10 @@ pub fn parse_allocation(
         return Ok(AllocationResult::Rejected {
             http_status,
             status: data.and_then(|d| d.get("status")).and_then(Value::as_i64),
+            message: data
+                .and_then(|d| d.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
     }
     // A ready allocation is JSON; a challenge page is HTML carrying a

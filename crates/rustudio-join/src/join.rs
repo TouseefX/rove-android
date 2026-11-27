@@ -258,11 +258,17 @@ fn run(
             });
             return Ok(());
         }
-        Ok(AllocationResult::Rejected { http_status, status }) => {
+        Ok(AllocationResult::Rejected { http_status, status, message }) => {
             settle(shared, |report| {
+                // Both halves: the number is what Roblox's own documentation
+                // indexes, and the sentence is what says which refusal it is.
                 report.failed(
                     "allocate",
-                    format!("refused (http {http_status}, status {})", status.map_or("none".to_owned(), |s| s.to_string())),
+                    format!(
+                        "refused (http {http_status}, status {}): {}",
+                        status.map_or("none".to_owned(), |s| s.to_string()),
+                        message.unwrap_or_else(|| "no message".to_owned())
+                    ),
                 )
             });
             return Ok(());
