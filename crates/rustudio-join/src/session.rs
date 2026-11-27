@@ -148,10 +148,14 @@ impl Session {
         &self.document
     }
 
-    /// A copy of the world as it stands, for a caller on another thread (the
-    /// join worker hands it to the editor once the session ends).
-    pub fn clone_document(&self) -> Document {
-        self.document.clone()
+    /// The world, moved out and replaced with an empty one.
+    ///
+    /// For the end of a session, when a caller on another thread (the join
+    /// worker) hands the place it built to the editor. A `Document` is not
+    /// `Clone` and is not made so here: it owns a DOM and a journal, and two
+    /// copies of a live place would be two different worlds.
+    pub fn take_document(&mut self) -> Document {
+        std::mem::replace(&mut self.document, Document::empty())
     }
 
     pub fn document_mut(&mut self) -> &mut Document {

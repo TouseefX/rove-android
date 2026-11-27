@@ -341,16 +341,17 @@ fn run(
     }
     let _ = ran;
 
-    // The world is handed over before the counters: a caller that sees a
-    // finished report can then take one consistent document.
-    if let Ok(mut slot) = document.lock() {
-        *slot = Some(world.clone_document());
-    }
     let applied = world.applied;
     let ingested = world.ingested;
     let journal_rows = world.journal_rows();
     let stage_tag = tag(&world.stage);
     let elapsed_ms = elapsed_ms(shared);
+    // The world is handed over before the counters: a caller that sees a
+    // finished report can then take a consistent document.
+    let place = world.take_document();
+    if let Ok(mut slot) = document.lock() {
+        *slot = Some(place);
+    }
     if let Ok(mut shared) = shared.lock() {
         shared.stats = Stats {
             stage_tag,
