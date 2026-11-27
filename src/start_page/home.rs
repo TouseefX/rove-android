@@ -210,7 +210,7 @@ impl Editor {
                                     CornerRadius::same(8),
                                     if hovered { theme::HOVER_BG } else { theme::PANEL_DARK },
                                 );
-                                let text = ui.new_child(
+                                let mut text = ui.new_child(
                                     egui::UiBuilder::new()
                                         .max_rect(rect.shrink(14.0))
                                         .layout(egui::Layout::top_down(egui::Align::Min)),

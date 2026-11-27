@@ -2060,7 +2060,10 @@ impl Editor {
         }
     }
 
-    fn confirm_ui(&mut self, ctx: &egui::Context) {
+    /// The discard / leave confirmation, which the Start Page draws too: the
+    /// page replaces the chrome, so it has to draw the windows that can open
+    /// over it (src/start_page.rs, `start_page_ui`).
+    pub(crate) fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(action) = self.confirm_discard.clone() else {
             return;
         };
