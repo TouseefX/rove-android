@@ -154,17 +154,22 @@ impl AccountSession {
                 headers.push(("X-CSRF-TOKEN".into(), token.expose().to_owned()));
             }
             let url = format!("https://{host}{path}");
-            let mut request = if method == "GET" {
-                self.agent.get(&url)
-            } else {
-                self.agent.post(&url)
+            // GET and POST are different request types in ureq 3
+            // (`RequestBuilder<WithoutBody>` / `<WithBody>`), so each arm builds
+            // and sends its own. A POST always carries a body — an empty object
+            // when the caller passed none — because the endpoints in play read
+            // the content type.
+            let with_headers = |mut request: ureq::RequestBuilder<_>| {
+                for (key, value) in &headers {
+                    request = request.header(key.as_str(), value.as_str());
+                }
+                request
             };
-            for (key, value) in &headers {
-                request = request.header(key.as_str(), value.as_str());
-            }
-            let result = match &body {
-                Some(bytes) => request.send(bytes.as_slice()),
-                None => request.call(),
+            let result = if method == "GET" {
+                with_headers(self.agent.get(&url)).call()
+            } else {
+                let bytes = body.clone().unwrap_or_else(|| b"{}".to_vec());
+                with_headers(self.agent.post(&url)).send(bytes.as_slice())
             };
             let mut response = result.map_err(|_| AllocationError::new("HTTPS request failed"))?;
             let status = response.status().as_u16();
@@ -212,7 +217,8 @@ impl AccountSession {
         }
         let data = reply
             .data
-            .as_object()
+            .as_ref()
+            .and_then(Value::as_object)
             .ok_or(AllocationError::new("The session reply was not an account"))?;
         let id = data
             .get("id")
