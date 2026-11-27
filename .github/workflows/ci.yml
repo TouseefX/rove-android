@@ -221,12 +221,12 @@ jobs:
             exit 0
           fi
           echo "=== the failure, verbatim"
-          grep -nE "(panicked at|FAILED|error\[|^error:)" out/diagnostics.log | head -20 || true
+          grep -nE "(panicked at|FAILED|DISAGREE|error\[|^error:)" out/diagnostics.log | head -20 || true
           sed -n '/panicked at/,+8p' out/diagnostics.log | head -40 || true
-          grep -E "(^|: )error(\[|:)" out/diagnostics.log | head -12 || true
-          for page in 0 1 2; do
-            python3 tools/ci/annotate.py out/diagnostics.log "$page" || true
-          done
+          # One call: a step keeps only its first ten error annotations, so
+          # paging from several calls drops everything past the first page. The
+          # script puts the failure itself in annotation 1, whole.
+          python3 tools/ci/annotate.py out/diagnostics.log 0 || true
 
   macos:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
