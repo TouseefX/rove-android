@@ -32,14 +32,27 @@ pub const DEFAULT_PLACE: u64 = 1818;
 /// world, short enough that a test run ends by itself.
 const SESSION_SECONDS: u64 = 30;
 
+/// The cookie as the app's own session holds it, for the join's worker.
+///
+/// Read inside the closure, on the worker thread, so the value exists only for
+/// the sign-in step: `rustudio_account` keeps the store (the keyring), and this
+/// crate keeps no copy.
+fn cookie_source() -> impl FnOnce() -> Option<String> + Send + 'static {
+    move || {
+        let client = rustudio_core::assets::session_client()?;
+        let client = client.lock().ok()?;
+        let client = client.as_ref()?;
+        Some(client.session.cookie().to_header())
+    }
+}
+
 /// A join the person started, and how it is going.
 pub struct JoinWindow {
     pub open: bool,
     pub place_text: String,
     join: Option<rustudio_join::join::Join>,
+    /// When the join was started.
     started: Option<Instant>,
-    /// The session's state at the last frame, for the overlay's counters.
-    last_stats: Option<rustudio_join::join::Stats>,
     /// A world already installed: the overlay then only shows the report, and
     /// closing it leaves the place open.
     pub installed: bool,
@@ -58,7 +71,6 @@ impl JoinWindow {
             place_text: DEFAULT_PLACE.to_string(),
             join: None,
             started: None,
-            last_stats: None,
             installed: false,
         }
     }
@@ -71,29 +83,6 @@ impl JoinWindow {
     fn place(&self) -> Option<u64> {
         self.place_text.trim().parse().ok()
     }
-
-    /// Start a join for what is typed in, if there is an account.
-    ///
-    /// The cookie comes from the app's own session (the same one Team Create
-    /// and the asset downloads use): nothing asks the person for it again, and
-    /// no second store is created.
-    pub fn start(&mut self, ed: &Editor) {
-        let Some(place) = self.place() else {
-            return;
-        };
-        let client = rustudio_core::assets::session_client();
-        let join = rustudio_join::join::start(place, SESSION_SECONDS, move || {
-            let client = client?;
-            let client = client.lock().ok()?;
-            let client = client.as_ref()?;
-            Some(client.session.cookie().to_header())
-        });
-        self.join = Some(join);
-        self.started = Some(Instant::now());
-        self.last_stats = None;
-        self.installed = false;
-        ed.info(format!("join {place}: signing in"));
-    }
 }
 
 impl Editor {
@@ -104,7 +93,6 @@ impl Editor {
         let mut install = false;
         let mut close = false;
         if !open {
-            self.join_win.open = false;
             return;
         }
         let running = self.join_win.running();
@@ -120,8 +108,24 @@ impl Editor {
             .as_ref()
             .map(|join| join.stats())
             .unwrap_or_default();
+        let verdict = self
+            .join_win
+            .join
+            .as_ref()
+            .and_then(|join| join.report())
+            .and_then(|report| report.verdict());
         let finished = self.join_win.join.is_some() && !running;
+        let installed = self.join_win.installed;
+        let waited = self
+            .join_win
+            .started
+            .map(|at| at.elapsed().as_secs())
+            .unwrap_or(0);
+        let started = self.join_win.join.is_some();
+        let mut place_text = std::mem::take(&mut self.join_win.place_text);
 
+        // `self.join_win` is not touched inside the closure: everything the
+        // window draws was taken above, and what it asks for is applied below.
         egui::Window::new("Join a place")
             .open(&mut open)
             .resizable(true)
@@ -130,7 +134,7 @@ impl Editor {
                 ui.horizontal(|ui| {
                     ui.label("Place");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.join_win.place_text)
+                        egui::TextEdit::singleline(&mut place_text)
                             .desired_width(120.0)
                             .hint_text("1818"),
                     );
@@ -143,7 +147,10 @@ impl Editor {
                     }
                     if running {
                         ui.spinner();
-                        ui.label(egui::RichText::new("joining…").color(rustudio_engine::theme::TEXT_DIM));
+                        ui.label(
+                            egui::RichText::new(format!("joining… {waited}s"))
+                                .color(rustudio_engine::theme::TEXT_DIM),
+                        );
                     }
                 });
                 ui.add_space(6.0);
@@ -156,13 +163,7 @@ impl Editor {
                 if finished {
                     ui.add_space(6.0);
                     ui.separator();
-                    let failed = self
-                        .join_win
-                        .join
-                        .as_ref()
-                        .and_then(|join| join.report())
-                        .and_then(|report| report.verdict());
-                    match failed {
+                    match verdict.clone() {
                         Some(why) => {
                             ui.colored_label(rustudio_engine::theme::ERROR, &why);
                             ui.label(
@@ -184,7 +185,7 @@ impl Editor {
                         if ui.button("Copy the report").clicked() {
                             ctx.copy_text(lines.join("\n"));
                         }
-                        if stats.packets > 0 && !self.join_win.installed {
+                        if stats.packets > 0 && !installed {
                             if ui
                                 .button("Open the place")
                                 .on_hover_text("Install the world the session built into the editor")
@@ -198,7 +199,7 @@ impl Editor {
                         }
                     });
                 }
-                if self.join_win.join.is_some() {
+                if started {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(format!(
@@ -212,14 +213,18 @@ impl Editor {
                     );
                 }
             });
+
+        // The field's text goes back, and the window's own ✕ is honoured.
+        self.join_win.place_text = place_text;
+        self.join_win.open = open && (running || !close);
         if start {
-            self.join_win.start(self);
+            match self.join_win.place() {
+                Some(place) => self.start_join(place),
+                None => self.join_win.open = true,
+            }
         }
         if install {
-            self.join_install();
-        }
-        if close || (!open && !running) {
-            self.join_win.open = false;
+            self.install_join_world();
         }
         // A running join repaints itself; a finished one stops asking.
         if self.join_win.running() {
@@ -229,23 +234,41 @@ impl Editor {
 
     /// Press Join for `place` (Start Page, the ribbon, `RUSTUDIO_JOIN`).
     pub fn join_place(&mut self, place: u64) {
+        self.start_join(place);
+    }
+
+    /// Start the join the window's own **Join** button asks for.
+    fn start_join(&mut self, place: u64) {
         self.join_win.place_text = place.to_string();
         self.join_win.open = true;
-        self.join_win.start(self);
+        self.join_win.join = Some(rustudio_join::join::start(
+            place,
+            SESSION_SECONDS,
+            cookie_source(),
+        ));
+        self.join_win.started = Some(Instant::now());
+        self.join_win.installed = false;
+        self.info(format!("join {place}: signing in"));
     }
 
     /// Install the world a finished session built into the editor.
-    fn join_install(&mut self) {
-        let Some(join) = self.join_win.join.as_ref() else {
+    fn install_join_world(&mut self) {
+        // Both taken before anything else touches `self`: `join` borrows the
+        // window, and `set_document` needs the editor mutably.
+        let Some((world, stats)) = self
+            .join_win
+            .join
+            .as_ref()
+            .map(|join| (join.take_document(), join.stats()))
+        else {
             return;
         };
-        let Some(world) = join.take_document() else {
+        let Some(world) = world else {
             self.info("join: the session built no world to open");
             return;
         };
         self.set_document(world);
         self.join_win.installed = true;
-        let stats = join.stats();
         self.info(format!(
             "join: {} instance(s) created, {} removed, {} propert{} written",
             stats.created,
