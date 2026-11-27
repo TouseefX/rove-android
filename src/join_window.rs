@@ -340,6 +340,28 @@ impl Editor {
                 services.len(),
                 made.join(", ")
             ));
+            // What *is* arriving, not only what is not. A report that lists
+            // refusals and nothing else cannot tell "properties are being
+            // written" from "nothing has been written since the world came".
+            let written = live.written_properties();
+            if written.is_empty() {
+                lines.push(
+                    "join world: no property has been written — the world arrived and stopped"
+                        .to_string(),
+                );
+            } else {
+                let top: Vec<String> = written
+                    .iter()
+                    .take(10)
+                    .map(|(name, count)| format!("{name} ×{count}"))
+                    .collect();
+                lines.push(format!(
+                    "join world: {} propert{} written — {}",
+                    written.len(),
+                    if written.len() == 1 { "y" } else { "ies" },
+                    top.join(", ")
+                ));
+            }
             let refused = live.refused_properties();
             if refused.is_empty() {
                 lines.push("join world: no property was refused".to_string());

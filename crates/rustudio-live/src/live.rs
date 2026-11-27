@@ -154,6 +154,11 @@ pub struct Live {
     /// named none). Every one of these made an instance nothing can draw or
     /// simulate, so the count is the answer to "why is the world half here".
     refused_classes: std::collections::BTreeMap<String, usize>,
+    /// Properties written, by `Class.Property`. Not a fault list — this is the
+    /// evidence that properties *are* replicating: a report with `Part.CFrame
+    /// ×1900` in it is a world being updated, and the same report without one
+    /// is a world that arrived and stopped.
+    written_properties: std::collections::BTreeMap<String, usize>,
     /// `$ref` targets that were not in the world when the property arrived and
     /// were dropped: a dangling reference, which is how a Model loses its
     /// PrimaryPart.
@@ -167,6 +172,7 @@ impl Live {
             refs: HashMap::new(),
             waiting_for_parent: HashMap::new(),
             dropped_events: 0,
+            written_properties: std::collections::BTreeMap::new(),
             refused_properties: std::collections::BTreeMap::new(),
             refused_classes: std::collections::BTreeMap::new(),
             dangling_refs: std::collections::BTreeMap::new(),
@@ -181,6 +187,7 @@ impl Live {
             refs: world.refs.clone(),
             waiting_for_parent: HashMap::new(),
             dropped_events: 0,
+            written_properties: std::collections::BTreeMap::new(),
             refused_properties: std::collections::BTreeMap::new(),
             refused_classes: std::collections::BTreeMap::new(),
             dangling_refs: std::collections::BTreeMap::new(),
@@ -226,6 +233,21 @@ impl Live {
     pub fn refused_properties(&self) -> Vec<(String, usize)> {
         let mut out: Vec<(String, usize)> = self
             .refused_properties
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Properties written, most-frequent first, by `Class.Property`.
+    ///
+    /// This is the positive counterpart to `refused_properties`: "are properties
+    /// arriving at all" is answered by `Part.CFrame ×1900` being here, and by
+    /// nothing else in the report.
+    pub fn written_properties(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = self
+            .written_properties
             .iter()
             .map(|(name, count)| (name.clone(), *count))
             .collect();
@@ -403,6 +425,10 @@ impl Live {
                     if let Some(instance) = doc.dom.get_by_ref_mut(r) {
                         instance.properties.insert(key, v);
                         stats.properties += 1;
+                        *self
+                            .written_properties
+                            .entry(format!("{class}.{property}"))
+                            .or_default() += 1;
                     }
                     // The mark is what tells the scene, the physics and the
                     // Properties panel that this instance changed. Without it a
@@ -802,6 +828,56 @@ mod tests {
         assert_eq!(stats.removed, 0, "there was nothing left to remove");
         assert_eq!(stats.unknown_ids, 1, "and it is counted, not ignored");
         assert_eq!(live.len(), 0, "the id map holds no dead refs");
+    }
+
+    /// A `set` on a part's `CFrame` reaches the document, and is recorded.
+    ///
+    /// This is the positive half of the missing-parts question. `refused` being
+    /// zero said the converter accepted every property, but nothing checked that
+    /// an accepted value was *written* — and a report listing only refusals
+    /// could not tell "properties are replicating" from "the world arrived and
+    /// stopped". A character that stands still is the second.
+    #[test]
+    fn a_set_writes_the_property_and_is_counted_by_class() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Part",
+                         "properties": {"Name": "Floor"}}}))],
+            &mut conv,
+        );
+        let r = live.referent("3:1").expect("the part is in the world");
+        let before = doc.prop(r, "CFrame");
+        // Built in two statements so the nested tags do not become a thicket of
+        // braces that a reader has to count.
+        let cframe = serde_json::json!({
+            "$cframe": {
+                "position": [0.0, 10.0, 0.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            }
+        });
+        let set = action(serde_json::json!({
+            "sequence": 2,
+            "kind": "set",
+            "id": "3:1",
+            "fields": { "CFrame": cframe },
+        }));
+        let stats = live.apply(&mut doc, &[set], &mut conv);
+        assert_eq!(stats.properties, 1, "one property written: {stats:?}");
+        assert_eq!(stats.refused_values, 0);
+        let after = doc.prop(r, "CFrame");
+        assert_ne!(
+            format!("{before:?}"),
+            format!("{after:?}"),
+            "the CFrame in the document changed"
+        );
+        let written = live.written_properties();
+        assert!(
+            written.iter().any(|(name, count)| name == "Part.CFrame" && *count == 1),
+            "the write is attributed to Part.CFrame: {written:?}"
+        );
     }
 
     #[test]

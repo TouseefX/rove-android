@@ -322,7 +322,26 @@ impl Game {
                 rig::write_pose(cdoc, &client_tool, None);
             }
         }
-        rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
+        // **A live client does not write its pose back.**
+        //
+        // In Play Solo the client owns the character: `write_pose` here is what
+        // moves it on the client half and is replicated to the server. A live
+        // client does not own it — the server does, and every limb's CFrame
+        // arrives through the delta stream. Writing this frame's *own* solve over
+        // them replaces the replicated motion with a pose derived from
+        // `ch.last_root`, which only moves when the local controller moves it.
+        // The result is a character standing still at the position it was bound
+        // at while the server's world moves on around it.
+        //
+        // The local solve is still needed (the Humanoid's state, the camera, the
+        // physics contacts this frame use it); it is simply not the truth.
+        let live_client = self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.mode == RunMode::Client);
+        if !live_client {
+            rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
+        }
     }
 
     /// An R6 rig's leg length for its full hip (the taller of Left Leg and
@@ -1105,7 +1124,26 @@ impl Game {
                 rig::write_pose(cdoc, &client_tool, None);
             }
         }
-        rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
+        // **A live client does not write its pose back.**
+        //
+        // In Play Solo the client owns the character: `write_pose` here is what
+        // moves it on the client half and is replicated to the server. A live
+        // client does not own it — the server does, and every limb's CFrame
+        // arrives through the delta stream. Writing this frame's *own* solve over
+        // them replaces the replicated motion with a pose derived from
+        // `ch.last_root`, which only moves when the local controller moves it.
+        // The result is a character standing still at the position it was bound
+        // at while the server's world moves on around it.
+        //
+        // The local solve is still needed (the Humanoid's state, the camera, the
+        // physics contacts this frame use it); it is simply not the truth.
+        let live_client = self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.mode == RunMode::Client);
+        if !live_client {
+            rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
+        }
         let humanoid = out.humanoid;
         if let Some(m) = out.floor_changed {
             let v = Variant::Enum(rbx_dom_weak::types::Enum::from_u32(m));
