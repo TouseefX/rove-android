@@ -39,9 +39,9 @@ const VECTORS: &str = include_str!("../../../rove/rust-client/tests/fixtures/log
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vectors: serde_json::Value = serde_json::from_str(VECTORS)?;
-    let mut checks = 0usize;
-    let mut compare = |what: &str, mine: Vec<u8>, theirs: Vec<u8>| {
-        checks += 1;
+    let checks = std::cell::Cell::new(0usize);
+    let compare = |what: &str, mine: Vec<u8>, theirs: Vec<u8>| {
+        checks.set(checks.get() + 1);
         if mine != theirs {
             eprintln!(
                 "DISAGREE {what}\n  port:      {} bytes {}\n  reference: {} bytes {}",
@@ -56,14 +56,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // The five packets of a join, from the vectors' own join document.
+    //
+    // A range either side refuses is a check too — both must refuse the *same*
+    // ranges. Comparing `?`-unwrapped results instead would exit on the first
+    // rejection and report it as a disagreement, which is how (6, 14) — a range
+    // neither implementation accepts, since 7, 8, 10, 11 and 12 are not
+    // supported bytecode — looked like a fidelity bug.
     let join = &vectors["protocol_sync"]["input_join"];
     let ticket = &vectors["protocol_sync"]["join_ticket"];
-    for range in [None, Some((13, 14)), Some((6, 14))] {
-        compare(
-            &format!("protocol_sync{range:?}"),
-            port::protocol_sync(join, Some(ticket), range)?,
-            reference_login::protocol_sync(join, Some(ticket), range)?,
-        );
+    for range in [
+        None,
+        Some((13, 14)),
+        Some((6, 6)),
+        Some((9, 9)),
+        Some((6, 14)),
+        Some((7, 7)),
+        Some((14, 13)),
+        Some((0, 0)),
+    ] {
+        checks.set(checks.get() + 1);
+        match (
+            port::protocol_sync(join, Some(ticket), range),
+            reference_login::protocol_sync(join, Some(ticket), range),
+        ) {
+            (Ok(mine), Ok(theirs)) => {
+                if mine != theirs {
+                    eprintln!(
+                        "DISAGREE protocol_sync{range:?}\n  port:      {} bytes {}\n  reference: {} bytes {}",
+                        mine.len(),
+                        hex(&mine),
+                        theirs.len(),
+                        hex(&theirs)
+                    );
+                    std::process::exit(1);
+                }
+                println!("  agree  protocol_sync{range:?} ({} bytes)", mine.len());
+            }
+            (Err(mine), Err(theirs)) => println!(
+                "  agree  protocol_sync{range:?} is refused by both ({mine} / {theirs})"
+            ),
+            (mine, theirs) => {
+                eprintln!(
+                    "DISAGREE protocol_sync{range:?}: port {} it, reference {} it",
+                    if mine.is_ok() { "accepted" } else { "refused" },
+                    if theirs.is_ok() { "accepted" } else { "refused" }
+                );
+                std::process::exit(1);
+            }
+        }
     }
     let ticket_join = &vectors["ticket"]["join"];
     compare(
@@ -118,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     for input in [0u32, 1, 0x1234_5678, u32::MAX] {
-        checks += 1;
+        checks.set(checks.get() + 1);
         if port::ticket_checksum(input) != reference_login::ticket_checksum(input) {
             eprintln!("DISAGREE ticket_checksum({input:#x})");
             std::process::exit(1);
@@ -138,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (0x8000_0000, "92efe1c19eeeffffffff01"),
         (u32::MAX, "92919ebee101"),
     ] {
-        checks += 1;
+        checks.set(checks.get() + 1);
         let mine = port::verification_with_nonce_for_check(nonce);
         let expected: Vec<u8> = expected
             .as_bytes()
@@ -152,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("  agree  the verification packet's four recorded nonces");
 
-    println!("{checks} cross-checks, no disagreement");
+    println!("{} cross-checks, no disagreement", checks.get());
     Ok(())
 }
 
