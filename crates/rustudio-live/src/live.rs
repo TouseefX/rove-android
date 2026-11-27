@@ -211,30 +211,33 @@ impl Live {
     /// top entry is almost always one property in one class, and knowing which
     /// is the difference between "the join is broken" and "`Part.Shape` is not
     /// converted yet".
-    pub fn refused_properties(&self) -> Vec<(&str, usize)> {
-        let mut out: Vec<(&str, usize)> = self
+    /// Owned strings on purpose: a caller reports these while holding `&mut`
+    /// elsewhere (the overlay prints them), and `&str` borrowed from the ledger
+    /// would make that borrow conflict for no reason.
+    pub fn refused_properties(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = self
             .refused_properties
             .iter()
-            .map(|(name, count)| (name.as_str(), *count))
+            .map(|(name, count)| (name.clone(), *count))
             .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
     }
 
     /// Creates refused because the node named no class.
-    pub fn refused_classes(&self) -> Vec<(&str, usize)> {
+    pub fn refused_classes(&self) -> Vec<(String, usize)> {
         self.refused_classes
             .iter()
-            .map(|(name, count)| (name.as_str(), *count))
+            .map(|(name, count)| (name.clone(), *count))
             .collect()
     }
 
     /// Properties dropped because the `$ref` target was not in the world yet,
     /// by `Class.Property`.
-    pub fn dangling_refs(&self) -> Vec<(&str, usize)> {
+    pub fn dangling_refs(&self) -> Vec<(String, usize)> {
         self.dangling_refs
             .iter()
-            .map(|(name, count)| (name.as_str(), *count))
+            .map(|(name, count)| (name.clone(), *count))
             .collect()
     }
 

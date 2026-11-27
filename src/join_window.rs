@@ -247,68 +247,84 @@ impl Editor {
     /// first, because a DataModel with holes in it is almost always one
     /// property in one class.
     fn live_datamodel_report(&mut self) {
-        let Some(live) = self.join_win.live_local.as_ref() else {
-            return;
-        };
-        let doc = &self.game.doc;
-        let root = doc.dom.root_ref();
-        // The services a place is made of, as they stand now.
-        let mut services: Vec<(String, usize)> = Vec::new();
-        for child in doc.dom.get_by_ref(root).map(|i| i.children().to_vec()).unwrap_or_default() {
-            let Some(instance) = doc.dom.get_by_ref(child) else {
-                continue;
+        // Everything is gathered into owned strings first, then printed: the
+        // ledger lives inside `self.join_win` and `self.info` takes `&mut self`,
+        // so a `&str` borrowed from the ledger would hold `self` immutably for
+        // the whole body. Nothing here needs to borrow across a print.
+        let lines: Vec<String> = {
+            let Some(live) = self.join_win.live_local.as_ref() else {
+                return;
             };
-            let count = doc.dom.descendants_of(child).count();
-            services.push((instance.class.to_string(), count));
-        }
-        services.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let made: Vec<String> = services
-            .iter()
-            .take(8)
-            .map(|(class, count)| format!("{class} {count}"))
-            .collect();
-        self.info(format!(
-            "join world: {} instance(s) in {} service(s) — {}",
-            doc.dom.len(),
-            services.len(),
-            made.join(", ")
-        ));
-        let refused = live.refused_properties();
-        if refused.is_empty() {
-            self.info("join world: no property was refused");
-        } else {
-            let top: Vec<String> = refused
+            let doc = &self.game.doc;
+            let root = doc.dom.root_ref();
+            let mut lines: Vec<String> = Vec::with_capacity(5);
+            // The services a place is made of, as they stand now.
+            let mut services: Vec<(String, usize)> = Vec::new();
+            let children = doc
+                .dom
+                .get_by_ref(root)
+                .map(|i| i.children().to_vec())
+                .unwrap_or_default();
+            for child in children {
+                let Some(instance) = doc.dom.get_by_ref(child) else {
+                    continue;
+                };
+                let count = doc.dom.descendants_of(child).count();
+                services.push((instance.class.to_string(), count));
+            }
+            services.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let made: Vec<String> = services
                 .iter()
-                .take(10)
-                .map(|(name, count)| format!("{name} ×{count}"))
+                .take(8)
+                .map(|(class, count)| format!("{class} {count}"))
                 .collect();
-            self.info(format!(
-                "join world: {} refused propert{} — {}",
-                refused.len(),
-                if refused.len() == 1 { "y" } else { "ies" },
-                top.join(", ")
+            lines.push(format!(
+                "join world: {} instance(s) in {} service(s) — {}",
+                doc.dom.len(),
+                services.len(),
+                made.join(", ")
             ));
-        }
-        let dangling = live.dangling_refs();
-        if !dangling.is_empty() {
-            let top: Vec<String> = dangling
-                .iter()
-                .take(6)
-                .map(|(name, count)| format!("{name} ×{count}"))
-                .collect();
-            self.info(format!(
-                "join world: {} dangling ref(s) — {}",
-                dangling.iter().map(|(_, c)| c).sum::<usize>(),
-                top.join(", ")
-            ));
-        }
-        let classes = live.refused_classes();
-        if !classes.is_empty() {
-            let top: Vec<String> = classes
-                .iter()
-                .map(|(name, count)| format!("{name} ×{count}"))
-                .collect();
-            self.info(format!("join world: refused creates — {}", top.join(", ")));
+            let refused = live.refused_properties();
+            if refused.is_empty() {
+                lines.push("join world: no property was refused".to_string());
+            } else {
+                let top: Vec<String> = refused
+                    .iter()
+                    .take(10)
+                    .map(|(name, count)| format!("{name} ×{count}"))
+                    .collect();
+                lines.push(format!(
+                    "join world: {} refused propert{} — {}",
+                    refused.len(),
+                    if refused.len() == 1 { "y" } else { "ies" },
+                    top.join(", ")
+                ));
+            }
+            let dangling = live.dangling_refs();
+            if !dangling.is_empty() {
+                let top: Vec<String> = dangling
+                    .iter()
+                    .take(6)
+                    .map(|(name, count)| format!("{name} ×{count}"))
+                    .collect();
+                lines.push(format!(
+                    "join world: {} dangling ref(s) — {}",
+                    dangling.iter().map(|(_, c)| c).sum::<usize>(),
+                    top.join(", ")
+                ));
+            }
+            let classes = live.refused_classes();
+            if !classes.is_empty() {
+                let top: Vec<String> = classes
+                    .iter()
+                    .map(|(name, count)| format!("{name} ×{count}"))
+                    .collect();
+                lines.push(format!("join world: refused creates — {}", top.join(", ")));
+            }
+            lines
+        };
+        for line in lines {
+            self.info(line);
         }
     }
 
