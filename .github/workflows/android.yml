@@ -229,7 +229,25 @@ jobs:
             # the APK an ordinary size.
             export CARGO_PROFILE_DEV_DEBUG=1
           fi
-          x "${args[@]}"
+          # Through a log, and annotated on failure: `x build` exits 1 with the
+          # reason in the middle of a long log, and this job's log cannot be
+          # fetched back. A red APK step that says only "Process completed with
+          # exit code 1" costs a whole rebuild to diagnose.
+          set +e
+          x "${args[@]}" 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          cp build.log out-build.log
+          if [ "$status" -ne 0 ]; then
+            echo "=== where the build stopped"
+            grep -nE "(^| )error(\[|:)|^Error|panicked|FAILED" build.log | tail -20 || true
+            echo "=== the last 40 lines"
+            tail -40 build.log || true
+            for page in 0; do
+              python3 tools/ci/annotate.py build.log "$page" || true
+            done
+            exit "$status"
+          fi
           apk="target/x/${{ matrix.profile }}/android/rustudio-android.apk"
           test -f "$apk"
           mkdir -p dist
