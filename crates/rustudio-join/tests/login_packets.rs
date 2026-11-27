@@ -88,24 +88,58 @@ fn wire_integers_are_leb128_and_match_python() {
 }
 
 #[test]
-fn protocol_sync_matches_the_python_layout() {
+fn protocol_sync_has_the_layout_rove_documents() {
+    // The vector's `packet_hex` is **stale**: it was produced when `input_join`
+    // had eleven fields, and the fixture's join has thirty-six now (its JSON
+    // tail shows only UserId, UserName, the platform strings and the three join
+    // documents). rove's own test pairs the two and is never run in this repo —
+    // only `rove/client-core` is a workspace member — so nothing has noticed.
+    //
+    // So the byte-for-byte check here is rove's *encoder* against this port's
+    // (examples/crosscheck.rs, which compiles both), and the vector is used for
+    // what it does still describe: the header, the platform strings and the
+    // constants. The vector's own header is
+    // `90 01 24 00 00 00 0d 0e 00 00` (packet, version 36 as LE, range, 0).
     let vectors = vectors();
     let vector = &vectors["protocol_sync"];
     let join = &vector["input_join"];
     let ticket = &vector["join_ticket"];
+
     let packet = protocol_sync(join, Some(ticket), Some((13, 14))).unwrap();
+    assert_eq!(&packet[..10], &[0x90, 0x01, 24, 0x00, 0x00, 0x00, 13, 14, 0x00, 0x00]);
+    // The six constants the packet ends with, from the vector's own tail.
     assert_eq!(
-        packet,
-        unhex(vector["packet_hex"].as_str().unwrap()),
-        "the bytecode-range variant"
+        &packet[packet.len() - 24..],
+        &[
+            0x5e, 0x1f, 0xcb, 0x85, 0x98, 0x7b, 0x90, 0xbf, 0x9e, 0xa7, 0xb1, 0x8a, 0x5e, 0x1f,
+            0xcb, 0x85, 0x16, 0x60, 0x49, 0x11, 0x78, 0xfe, 0xef, 0xcb
+        ][..]
     );
-    // ... and the player object it embeds is the one the vectors describe.
+    // The three ranges differ only in bytes 6..8: everything else is identical
+    // for one join, which is what "the range is a header field" means.
+    let mut built = Vec::new();
+    for range in [(6u8, 6u8), (9, 9), (13, 14)] {
+        built.push(protocol_sync(join, Some(ticket), Some(range)).unwrap());
+    }
+    let first = &built[0];
+    for other in &built[1..] {
+        assert_eq!(first.len(), other.len());
+        assert_eq!(&first[..6], &other[..6]);
+        assert_eq!(&first[8..], &other[8..], "only the range bytes may differ");
+    }
+    // And the player object it embeds is the one the vectors describe.
     let info = player_join_info(join, Some(ticket)).unwrap();
     let expected = vector["player_info"].as_object().unwrap();
     let names: Vec<&str> = info.iter().map(|(key, _)| key.as_str()).collect();
     for key in expected.keys() {
-        assert!(names.contains(&key.as_str()), "{key} is missing from the packet");
+        assert!(
+            names.contains(&key.as_str()),
+            "{key} is missing from the player object"
+        );
     }
+    // The order is ISSUED_JOIN_FIELDS', and the ticket goes last.
+    assert_eq!(names.first(), Some(&"UserId"));
+    assert_eq!(names.last(), Some(&"__joinTicket"));
 }
 
 #[test]
@@ -180,9 +214,12 @@ fn the_five_packets_of_a_join_are_their_own_ids_in_order() {
     );
     // Built from the issued values rather than placeholders: the place id is
     // in the player object, the session id in the ticket packet.
+    // The player object carries the issued identity. (It does not carry the
+    // place id: rove's ISSUED_JOIN_FIELDS list does not include PlaceId, and
+    // that list is the reference for what packet 144 contains.)
     let has = |packet: &Vec<u8>, needle: &[u8]| packet.windows(needle.len()).any(|w| w == needle);
-    assert!(has(&packets[1], b"\"PlaceId\":1818"), "the player object names the place");
-    assert!(has(&packets[1], b"\"UserId\":424242"), "and the account");
+    assert!(has(&packets[1], b"\"UserId\":424242"), "the player object names the account");
+    assert!(has(&packets[1], b"\"UserName\":\"SyntheticTester\""), "and the name");
     assert!(has(&packets[3], b"synthetic-session-id"), "the ticket carries the session");
     assert!(has(&packets[3], b"synthetic"), "and the client ticket");
     assert_eq!(packets[4], vec![0x8f, 0]);
