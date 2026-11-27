@@ -722,8 +722,17 @@ impl Editor {
                 }
                 Do::Account => self.game.account.open = true,
                 Do::Copy(s) => ctx.copy_text(s),
-                #[cfg(feature = "live")]
-                Do::Play(place) => self.join_place(place),
+                // Both arms: a `#[cfg]` on one arm only makes the match
+                // non-exhaustive in a build without the feature (E0004).
+                Do::Play(place) => {
+                    #[cfg(feature = "live")]
+                    self.join_place(place);
+                    #[cfg(not(feature = "live"))]
+                    {
+                        let _ = place;
+                        self.info("this build has no player join (built without `live`)");
+                    }
+                }
             }
         }
         if self.start.busy() || self.cloud.busy() || self.game.account.busy() {

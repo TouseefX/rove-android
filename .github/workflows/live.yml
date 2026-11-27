@@ -106,9 +106,9 @@ jobs:
             [ -f "$log" ] || continue
             found=$((found+1))
             echo "=== $log"
-            for page in 0 1 2 3 4 5 6 7; do
-              python3 tools/ci/annotate.py "$log" "$page" || true
-            done
+            # One call: a step keeps ten error annotations, whatever it emits,
+            # so paging from several calls drops everything after the first.
+            python3 tools/ci/annotate.py "$log" || true
           done
           if [ "$found" -eq 0 ]; then
             echo "::error::no build log was copied into out/; the compile step failed before it could"
