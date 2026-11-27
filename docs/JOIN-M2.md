@@ -117,6 +117,41 @@ The failing branches that need no account are tested in CI
 account, a cookie that cannot go into a header, and polling the report from
 another thread. Everything past `sign in` needs a phone.
 
+### Status 12: what the launcher refuses, and why
+
+The first phone run stopped at `allocate`, with
+
+```
+allocate failed: refused (http 200, status 12)
+```
+
+HTTP 200 and status 12 is Roblox's `gamejoin` launcher answering **"You are not
+allowed to play this game"**: it refuses a join request that identifies as a
+web client, and admits the same place and the same cookie once the request says
+it is a native client. The header that decides it is **`rbx-user-agent`**
+(`Roblox/Web` → refused, `Roblox/Darwin` → admitted); the ordinary HTTP
+`User-Agent` on its own changes nothing. This was measured on the live endpoint
+by the research in [H644b/Roblox-Public-Web-Play-Join](https://github.com/H644b/Roblox-Public-Web-Play-Join),
+which reports exactly this pair of responses for one public place.
+
+`rustudio_join::http` sent no `rbx-user-agent` at all, which reads as a web
+client. It now sends `rbx-user-agent: Roblox/Darwin` and a native-shaped
+`User-Agent`. That is only an admission decision: the session that follows is
+still this client's own — its own certificate pins, its own WebTransport
+connection, its own five packets.
+
+A refusal also carries the launcher's own sentence now, and the report prints
+it, because the number alone cannot tell these apart:
+
+| status | the launcher's message | what it means |
+|---|---|---|
+| 12 | "You are not allowed to play this game" | the request's identity is refused (or the place is not public) |
+| 12 | "… (Playtesters Only)" | the place is not open to this account |
+| 12 | "Unable to join Game N" | no server of that place accepted the request |
+
+If a run still reports 12 with the identity header in place, the sentence beside
+it is the next thing to act on.
+
 ### What to send back
 
 1. Install the APK from the run's artifact.
