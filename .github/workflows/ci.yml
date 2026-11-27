@@ -136,10 +136,22 @@ jobs:
       - name: Offline evidence (allocation, packets, session replay)
         shell: bash
         run: |
-          set -o pipefail
+          set +e
           cargo test -p rustudio-join --locked --message-format=short 2>&1 \
             | tee "$RUNNER_TEMP/join.log"
-          grep -E "^(running|test result)" "$RUNNER_TEMP/join.log" || true
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "--- tests:"
+          grep -E "^(running|test result|test .* (ok|FAILED))" "$RUNNER_TEMP/join.log" || true
+          if [ "$status" -ne 0 ]; then
+            echo "--- what failed:"
+            sed -n '/panicked at/,$p' "$RUNNER_TEMP/join.log" | head -30
+          fi
+          # The job log cannot be fetched back, so the log goes where the
+          # annotation step can always reach it.
+          mkdir -p out
+          cp "$RUNNER_TEMP/join.log" out/join.log 2>/dev/null || true
+          exit "$status"
       - name: The ported codec against rove's own encoder (both in one build)
         shell: bash
         # If this step goes red, the line to read is the `error` one above the
@@ -148,16 +160,66 @@ jobs:
         # comparison, not in the crate.
         if: always()
         run: |
-          set -o pipefail
+          set +e
           cargo run -p rustudio-join --example crosscheck --locked \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/join-crosscheck.log"
-          tail -1 "$RUNNER_TEMP/join-crosscheck.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          mkdir -p out
+          cp "$RUNNER_TEMP/join-crosscheck.log" out/join-crosscheck.log 2>/dev/null || true
+          tail -3 "$RUNNER_TEMP/join-crosscheck.log" || true
+          exit "$status"
       - name: The live feature compiles (WebTransport, sign in, join-game)
         shell: bash
         run: |
-          set -o pipefail
+          set +e
           cargo check -p rustudio-join --features live --locked \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/join-live.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          mkdir -p out
+          cp "$RUNNER_TEMP/join-live.log" out/join-live.log 2>/dev/null || true
+          exit "$status"
+
+      - name: Choose the log the annotations come from
+        if: always()
+        shell: bash
+        run: |
+          # The first failing step's log, in the order they run: a compile error
+          # in the tests and one in the live build are both `error:` lines, but
+          # only one of them is the reason the job stopped.
+          for name in join join-crosscheck join-live; do
+            [ -f "out/$name.log" ] || continue
+            # Compiler diagnostics in `--message-format=short` are
+            # "path:line:col: error[E0308]: ..." or "error: ...".
+            if grep -qE '(^|: )error(\[|:)' "out/$name.log"; then
+              cp "out/$name.log" out/diagnostics.log
+              echo "annotating out/$name.log"
+              exit 0
+            fi
+          done
+          # No compiler error and no panic: the failure was a test assertion or a
+          # disagreement from the cross-check, and its own lines are the report.
+          for name in join join-crosscheck join-live; do
+            [ -f "out/$name.log" ] && cp "out/$name.log" out/diagnostics.log && \
+              echo "annotating out/$name.log (no compiler error; the step's own lines are the report)" && exit 0
+          done
+          ls -l out/ || true
+
+      - name: Re-emit the build's diagnostics
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f out/diagnostics.log ]; then
+            echo "::notice::no failing log was captured"
+            exit 0
+          fi
+          echo "=== the failure, verbatim"
+          sed -n '/panicked at/,+6p' out/diagnostics.log | head -20 || true
+          grep -E "(^|: )error" out/diagnostics.log | head -12 || true
+          for page in 0 1 2; do
+            python3 tools/ci/annotate.py out/diagnostics.log "$page" || true
+          done
 
   macos:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}

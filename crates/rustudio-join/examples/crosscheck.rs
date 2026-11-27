@@ -18,6 +18,10 @@
 //! Run it with `cargo run -p rustudio-join --example crosscheck`. It prints one
 //! line per check and exits non-zero on the first disagreement, so CI can gate
 //! on it.
+//!
+//! The reference's own `#[cfg(test)] mod tests` (a copy of the vector checks,
+//! with an `include_str!` path relative to rove's crate) is not compiled here:
+//! `cfg(test)` is never set for an example's dependency graph.
 
 mod allocation {
     pub fn new_join_attempt_id() -> Result<String, &'static str> {
@@ -25,9 +29,6 @@ mod allocation {
     }
 }
 
-// The reference's own `#[cfg(test)] mod tests` (a copy of the vector checks,
-// with an `include_str!` path relative to rove's crate) is not compiled here:
-// `cfg(test)` is never set for an example's dependency graph.
 #[path = "../../../rove/rust-client/src/login.rs"]
 #[allow(dead_code, unused_imports)]
 mod reference_login;
