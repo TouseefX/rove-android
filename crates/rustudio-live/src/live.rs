@@ -60,6 +60,10 @@ pub struct ApplyStats {
     pub instances_removed: usize,
     /// Parent edges adopted (`fields.Parent`, and a create's parent).
     pub parents: usize,
+    /// Creates whose class the reflection database does not know. The instance
+    /// is still made; this is the count that explains a world of Models with
+    /// no parts in them.
+    pub unknown_classes: usize,
     /// Events carried by the journal (the Lua dispatch is the engine's).
     pub events: usize,
     /// Values the converter refused, so the property kept its default.
@@ -79,6 +83,7 @@ impl ApplyStats {
         self.removed += other.removed;
         self.instances_removed += other.instances_removed;
         self.parents += other.parents;
+        self.unknown_classes += other.unknown_classes;
         self.events += other.events;
         self.refused_values += other.refused_values;
         self.duration_ms += other.duration_ms;
@@ -88,8 +93,8 @@ impl ApplyStats {
     pub fn line(&self) -> String {
         format!(
             "{} actions: {} created ({} repeat), {} sets ({} properties), \
-             {} removed ({} instances), {} parents, {} events; {} unknown ids, \
-             {} values kept their default, in {:.2} ms",
+             {} removed ({} instances), {} parents, {} events; {} unknown classes, \
+             {} unknown ids, {} values kept their default, in {:.2} ms",
             self.actions,
             self.created,
             self.duplicate_creates,
@@ -99,6 +104,7 @@ impl ApplyStats {
             self.instances_removed,
             self.parents,
             self.events,
+            self.unknown_classes,
             self.unknown_ids,
             self.refused_values,
             self.duration_ms,
@@ -116,6 +122,7 @@ impl ApplyStats {
             "removed": self.removed,
             "instances_removed": self.instances_removed,
             "parents": self.parents,
+            "unknown_classes": self.unknown_classes,
             "events": self.events,
             "refused_values": self.refused_values,
             "duration_ms": self.duration_ms,
@@ -143,7 +150,9 @@ pub struct Live {
     /// number: "{} refused" is a fault, `Part.Shape` refused 412 times is a
     /// thing to go and fix.
     refused_properties: std::collections::BTreeMap<String, usize>,
-    /// Classes whose create was refused outright.
+    /// Creates whose class the reflection database does not know (or which
+    /// named none). Every one of these made an instance nothing can draw or
+    /// simulate, so the count is the answer to "why is the world half here".
     refused_classes: std::collections::BTreeMap<String, usize>,
     /// `$ref` targets that were not in the world when the property arrived and
     /// were dropped: a dangling reference, which is how a Model loses its
@@ -302,6 +311,16 @@ impl Live {
             .and_then(name_of)
             .or_else(|| node.get("name").and_then(name_of))
             .unwrap_or_default();
+        // A class the reflection database does not know cannot be rendered,
+        // simulated or edited — `Scene` has no geometry for it and the physics
+        // has no shape. It is still inserted (the server said it exists, and a
+        // later delta may make it real), but it is *named* in the report,
+        // because "the welds are missing" is answered by "Motor6D was created
+        // 214 times" and by nothing else.
+        if !rustudio_core::doc::class_known(class) {
+            *self.refused_classes.entry(class.to_owned()).or_default() += 1;
+            stats.unknown_classes += 1;
+        }
         let instance = InstanceBuilder::new(class);
         let instance = if name.is_empty() {
             instance

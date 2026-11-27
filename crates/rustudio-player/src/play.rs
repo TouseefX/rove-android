@@ -991,17 +991,25 @@ impl Game {
         // DataModel holds the collaborators' Player objects (a live Place A session:
         // Players.testuser1), and copied along they were a phantom first
         // player that Place A's match spawned and placed instead of the real one.
-        if let Some(players) = server_doc.find_child(server_doc.dom.root_ref(), "Players") {
-            let stale: Vec<_> = server_doc
-                .dom
-                .get_by_ref(players)
-                .map(|i| i.children().to_vec())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|c| server_doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "Player"))
-                .collect();
-            for c in stale {
-                server_doc.dom.destroy(c);
+        //
+        // **A live client keeps them.** This is Play's rule for a place opened
+        // from a file: the collaborators' Player objects in a Team Create place
+        // are not players of *this* session. But a joined game's `Players` holds
+        // the real ones, the server's, including ours — destroying them left a
+        // client with no LocalPlayer to name and no `Player.Character` to bind.
+        if !network_client {
+            if let Some(players) = server_doc.find_child(server_doc.dom.root_ref(), "Players") {
+                let stale: Vec<_> = server_doc
+                    .dom
+                    .get_by_ref(players)
+                    .map(|i| i.children().to_vec())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| server_doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "Player"))
+                    .collect();
+                for c in stale {
+                    server_doc.dom.destroy(c);
+                }
             }
         }
         // A place opened from Roblox plays with its real ids, as in Studio
@@ -1813,12 +1821,21 @@ impl Game {
     /// Cheap when there is nothing to do (one property read), so it runs every
     /// frame; it acts once per character.
     fn bind_live_character(&mut self) {
-        let Some(s) = self.play.as_ref() else { return };
-        if s.mode != RunMode::Client || s.server.is_some() {
+        // Both facts taken in one statement so no borrow of `self.play` lives
+        // on into the work below.
+        if !self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.mode == RunMode::Client && s.server.is_none())
+        {
             return;
         }
         // Already bound and the model is still there: nothing to do.
-        let bound = s.character.as_ref().map(|c| c.model);
+        let bound = self
+            .play
+            .as_ref()
+            .and_then(|s| s.character.as_ref())
+            .map(|c| c.model);
         let root = self.doc.dom.root_ref();
         let Some(players) = self.doc.find_child(root, "Players") else {
             return;
@@ -1914,13 +1931,19 @@ impl Game {
     /// `bind_live_character` picks it up when it arrives.
     fn setup_live_client_player(
         &mut self,
-        core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
+        mut core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
     ) {
-        let Some(s) = self.play.as_ref() else { return };
-        if s.server.is_some() {
-            // Not a live client after all: the Play Solo path owns this.
+        // Asked and answered in one statement, so no borrow of `self` survives
+        // into the work below (which needs `&mut self` throughout).
+        if !self.play.as_ref().is_some_and(|s| s.server.is_none()) {
             return;
         }
+        // Everything that reads or writes the document happens in this block,
+        // which returns only owned values: `self.info`, `self.with_side` and
+        // `sync_view_size` all take `&mut self`, and a `&mut self.doc` held
+        // across them is four borrow errors (which is how CI found this).
+        let uid = self.account.user_id();
+        let (name, local, has_scripts_now) = {
         let doc = &mut self.doc;
         let root = doc.dom.root_ref();
         let players = doc.find_child(root, "Players");
@@ -1946,6 +1969,7 @@ impl Game {
             })
         });
         let Some(player) = me else {
+            drop(doc);
             self.info(
                 "Live: Players.UserId is not in the world yet; the character binds when it arrives",
             );
@@ -2051,9 +2075,19 @@ impl Game {
                 }
             }
         }
+        let name = doc
+            .dom
+            .get_by_ref(player)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "?".to_string());
+        // Read after the insert above, so this says whether PlayerScripts is
+        // *there now* — which is what the log line is about.
+        let has_scripts_now = doc.find_child(player, "PlayerScripts").is_some();
+        (name, local, has_scripts_now)
+        };
         self.sync_view_size();
-        // Start them on the client side. CoreScripts first, as a Play client
-        // does, then the place's own — `start_collected` is idempotent per ref.
+        // Start them on the client side. `start_collected` is idempotent per
+        // ref, so a re-entry after a respawn starts nothing twice.
         let started = local.len();
         self.with_side(Side::Client, |rt, _, _| {
             for r in local {
@@ -2062,10 +2096,13 @@ impl Game {
             rt.dispatch();
         });
         self.info(format!(
-            "Live: Players.LocalPlayer = {} (UserId {}), {} client script(s) started",
-            doc.dom.get_by_ref(player).map(|i| i.name.as_str()).unwrap_or("?"),
-            self.account.user_id().unwrap_or(0),
-            started
+            "Live: Players.LocalPlayer = {name} (UserId {}), {started} client script(s) started{}",
+            uid.unwrap_or(0),
+            if has_scripts_now {
+                ""
+            } else {
+                " (PlayerScripts was not in the world yet)"
+            }
         ));
         // CoreScripts, if the patch gave any: a joined place needs the player
         // module, which is what binds the camera to the character.

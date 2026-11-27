@@ -670,6 +670,19 @@ pub fn is_service(class: &str) -> bool {
         .is_some_and(|c| c.tags.contains(&ClassTag::Service))
 }
 
+/// Whether the reflection database (or the API dump beyond it) knows this
+/// class at all.
+///
+/// Distinct from `is_creatable`, which asks whether `Instance.new` accepts it.
+/// A live stream can name a class this build has never heard of — a newer
+/// engine's, or a renamed one — and the difference between "the server sent a
+/// class I cannot make" and "the server never sent it" is the whole diagnosis
+/// for a world of Models with no parts in them.
+pub fn class_known(class: &str) -> bool {
+    db().classes.contains_key(class)
+        || crate::api::get().is_some_and(|a| a.classes.contains_key(class))
+}
+
 pub fn is_creatable(class: &str) -> bool {
     is_script_creatable(class) && db().classes.get(class).is_some_and(|c| !c.tags.contains(&ClassTag::Deprecated))
 }

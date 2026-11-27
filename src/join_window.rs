@@ -222,6 +222,23 @@ impl Editor {
                 self.join_win.live_report_at = Some(Instant::now());
             }
         }
+        if self.join_win.live_reported {
+            // The first report fires within seconds, when the world is half
+            // arrived: a class the server names later — a rig's Motor6Ds, a
+            // tool's welds — is not in it. Re-reporting every twenty seconds
+            // keeps the same numbers available for a session that keeps
+            // arriving, which is what a live join does.
+            let due = self
+                .join_win
+                .live_report_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(20));
+            if due {
+                self.join_win.live_report_at = Some(Instant::now());
+                self.live_datamodel_report();
+            } else if self.join_win.live_report_at.is_none() {
+                self.join_win.live_report_at = Some(Instant::now());
+            }
+        }
         if !self.join_win.installed {
             // The first instances are in the editor: from here on this is a
             // place being played, not a join being watched.
@@ -331,11 +348,20 @@ impl Editor {
             }
             let classes = live.refused_classes();
             if !classes.is_empty() {
+                // Sorted, because the point is the top of the list: a world of
+                // Models with no parts in it is usually one class repeated.
+                let mut classes = classes;
+                classes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 let top: Vec<String> = classes
                     .iter()
+                    .take(12)
                     .map(|(name, count)| format!("{name} ×{count}"))
                     .collect();
-                lines.push(format!("join world: refused creates — {}", top.join(", ")));
+                lines.push(format!(
+                    "join world: {} class(es) the database does not know, or a create with none — {}",
+                    classes.len(),
+                    top.join(", ")
+                ));
             }
             lines
         };
