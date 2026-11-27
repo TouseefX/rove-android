@@ -1950,7 +1950,8 @@ impl Game {
         // `sync_view_size` all take `&mut self`, and a `&mut self.doc` held
         // across them is four borrow errors (which is how CI found this).
         let uid = self.account.user_id();
-        let (name, local, has_scripts_now) = {
+        let mut no_player_yet = false;
+        let (_player, name, local, has_scripts_now) = {
         let doc = &mut self.doc;
         let root = doc.dom.root_ref();
         let players = doc.find_child(root, "Players");
@@ -1976,12 +1977,15 @@ impl Game {
             })
         });
         let Some(player) = me else {
-            drop(doc);
-            self.info(
-                "Live: Players.UserId is not in the world yet; the character binds when it arrives",
-            );
-            return;
+            // Reported after the block, not inside it: `doc` borrows `self`
+            // mutably for the whole block, and `self.info` needs `&mut self`.
+            // (A `drop(doc)` here would be a no-op on a reborrow, which is what
+            // the warning at this line said.)
+            no_player_yet = true;
+            return (None, String::new(), Vec::new(), false);
         };
+        // (the Player ref itself is only used inside the block: outside it, the
+        // `LocalPlayer` property is what names it)
         // The replicated Player is renamed here, as Roblox does: a client's own
         // Player is `Players.LocalPlayer` and its Name is its own.
         if let Some(players) = players {
@@ -2090,8 +2094,15 @@ impl Game {
         // Read after the insert above, so this says whether PlayerScripts is
         // *there now* — which is what the log line is about.
         let has_scripts_now = doc.find_child(player, "PlayerScripts").is_some();
-        (name, local, has_scripts_now)
+        (Some(player), name, local, has_scripts_now)
         };
+        if no_player_yet {
+            self.info(
+                "Live: our Player (by UserId) is not in the world yet; \
+                 LocalPlayer binds when it arrives",
+            );
+            return;
+        }
         self.sync_view_size();
         // Start them on the client side. `start_collected` is idempotent per
         // ref, so a re-entry after a respawn starts nothing twice.

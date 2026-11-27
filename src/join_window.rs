@@ -490,7 +490,7 @@ impl Editor {
         let Some(phase) = self.join_cover_phase() else {
             return;
         };
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let mut open_report = false;
         egui::Area::new(egui::Id::new("join_cover"))
             .fixed_pos(screen.min)
@@ -519,7 +519,7 @@ impl Editor {
                         egui::Pos2::new(centre.x, y),
                         egui::Align2::CENTER_CENTER,
                         format!("{mark}  {label}"),
-                        egui::FontId::proportional(if state == CoverStep::Now { 21.0 } else { 18.0 }),
+                        egui::FontId::proportional(if *state == CoverStep::Now { 21.0 } else { 18.0 }),
                         colour,
                     );
                     y += 30.0;
@@ -577,7 +577,7 @@ impl Editor {
             self.join_win.show_text = true;
         }
         if std::mem::take(&mut self.join_win.cancel_requested) {
-            self.cancel_join();
+            self.abandon_join();
         }
     }
 
@@ -608,7 +608,7 @@ impl Editor {
     ///
     /// A join the person cancelled must leave nothing half-made — no cover, no
     /// session, and Stop taken so the world it had started building is gone.
-    pub fn cancel_join(&mut self) {
+    pub fn abandon_join(&mut self) {
         self.join_win.join = None;
         self.join_win.live_world = None;
         self.join_win.live = None;
