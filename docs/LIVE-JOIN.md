@@ -168,6 +168,17 @@ asserts rustudio's world after the replay: the roots, a `Vector3` `Size` and a
 resolved, and the removal gone from the tree with its id forgotten. A truncated
 replication packet is refused by the decoder and counted, never half applied.
 
+**The run.** CI on this branch at the time of writing: `check (ubuntu-latest)`,
+`check (windows-latest)`, `linux-release`, `windows-release` and the `lockfile`
+job are green — the two checks compile the whole workspace including
+`rove-client-core` and `tests/live_replay.rs`, and the release jobs link the
+tests. The macOS jobs (the two `check`es and `macos-app`) sit in the runner
+backlog, which is where they were for M1 and the accepted M2 run as well. The
+test step runs there, and only there: Windows `cargo test` has never finished in
+this tree (26 minutes then a failure in the accepted run; a 35-minute bound here,
+with rustc dying on an "N warnings" summary), and the tree's own M0 record says
+tests run on macOS only.
+
 **What the recording is not.** It is a hand-built payload whose ids the decoder
 assigns, not a capture from a live server — no packet from Roblox has been
 recorded yet. The bytes are checked against rove's own grammar (and decode back
