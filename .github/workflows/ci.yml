@@ -48,9 +48,13 @@ jobs:
       - name: Test
         if: runner.os != 'Linux'
         shell: bash
+        timeout-minutes: 40
         run: |
           set -o pipefail
-          cargo test --workspace --locked \
+          # A test that never returns used to decide the job (26 minutes in the
+          # accepted run, 31 in the next). The suite is bounded so a hang shows
+          # up as a timeout with a log, not as a job that ran out of time.
+          timeout 2100 cargo test --workspace --locked \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/test.log"
       # Job logs are not readable back from here, but annotations are; see
       # tools/ci/annotate.py. A separate always-run step, because a step that
@@ -72,14 +76,17 @@ jobs:
             echo "::notice::$log: $(wc -l < "$log") line(s)"
             # Colour comes from CARGO_TERM_COLOR, and a log full of SGR escapes
             # reads as noise in an annotation.
+            # (grep exits 1 when nothing survives the filter, and this shell
+            # runs with -e: a reporter must never fail the job it reports on.)
             plain=$(mktemp)
             sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" \
-              | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain"
+              | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain" || true
             echo "--- first lines"
-            head -5 "$plain" | sed 's/^/::error::log: /'
+            head -5 "$plain" | sed 's/^/::error::log: /' || true
             echo "--- last lines"
-            tail -5 "$plain" | sed 's/^/::error::log: /'
+            tail -5 "$plain" | sed 's/^/::error::log: /' || true
             rm -f "$plain"
+            true
           done
 
   # macOS: Apple Silicon and Intel. The tests run here too (the GPU tests
@@ -123,14 +130,17 @@ jobs:
             echo "::notice::$log: $(wc -l < "$log") line(s)"
             # Colour comes from CARGO_TERM_COLOR, and a log full of SGR escapes
             # reads as noise in an annotation.
+            # (grep exits 1 when nothing survives the filter, and this shell
+            # runs with -e: a reporter must never fail the job it reports on.)
             plain=$(mktemp)
             sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" \
-              | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain"
+              | grep -vE '^$|generated [0-9]+ warning|warning:|^ *$|^ *\||^ *= |^ +--> |^ +(Compiling|Checking|Downloaded|Downloading|Updating|Finished|Running) ' > "$plain" || true
             echo "--- first lines"
-            head -5 "$plain" | sed 's/^/::error::log: /'
+            head -5 "$plain" | sed 's/^/::error::log: /' || true
             echo "--- last lines"
-            tail -5 "$plain" | sed 's/^/::error::log: /'
+            tail -5 "$plain" | sed 's/^/::error::log: /' || true
             rm -f "$plain"
+            true
           done
 
   # rustudio.app for Apple Silicon and Intel in one (ad-hoc signed, not
