@@ -1126,9 +1126,24 @@ impl Game {
         } else {
             None
         };
-        let saved_sel = std::mem::take(&mut edit_doc.as_mut().unwrap_or(&mut self.doc).selection);
-        let saved_doc = std::mem::replace(&mut self.doc, server_doc);
-        let saved_doc = edit_doc.take().unwrap_or(saved_doc);
+        let saved_sel = if network_client {
+            // A live client's `self.doc` *is* `server_doc` (the replicated
+            // place, moved out of it above), so there is no edit place to
+            // restore: Stop ends the session instead of returning to one.
+            Vec::new()
+        } else {
+            std::mem::take(&mut edit_doc.as_mut().unwrap_or(&mut self.doc).selection)
+        };
+        let saved_doc = if network_client {
+            // Put the replicated place back where the editor draws it. It is
+            // not an "edit document" and must not be saved as one, so the
+            // session has nothing to hand back on Stop.
+            self.doc = server_doc;
+            Document::empty()
+        } else {
+            let previous = std::mem::replace(&mut self.doc, server_doc);
+            edit_doc.take().unwrap_or(previous)
+        };
         let mut physics = Physics::new(&mut self.doc);
         rustudio_core::load_trace::mark("play: physics built");
         self.info(format!("Physics solver: {}", solver.name()));
@@ -1146,7 +1161,7 @@ impl Game {
         physics.groups = groups;
         self.play = Some(PlaySession {
             _scripts_running: Some(scripts_running),
-            server: Some(server),
+            server,
             client,
             other_doc: client_doc,
             map,
