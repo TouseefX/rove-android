@@ -20,7 +20,11 @@ rustudio-live = { path = "../rustudio-live" }
 
 [dependencies.tokio]
 version = "1"
-features = ["rt", "time", "macros"]
+# A current-thread executor (`rt`) driving one connection, as rove's own live
+# session does; `time` for the session's deadline, `net` for the QUIC socket
+# that `enable_all` turns on. The join runs on its own OS thread (join.rs) so a
+# render loop polls it without ever waiting on it.
+features = ["rt", "time", "macros", "net"]
 optional = true
 
 [features]

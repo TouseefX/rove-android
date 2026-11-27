@@ -148,6 +148,12 @@ impl Session {
         &self.document
     }
 
+    /// A copy of the world as it stands, for a caller on another thread (the
+    /// join worker hands it to the editor once the session ends).
+    pub fn clone_document(&self) -> Document {
+        self.document.clone()
+    }
+
     pub fn document_mut(&mut self) -> &mut Document {
         &mut self.document
     }

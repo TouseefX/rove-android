@@ -34,6 +34,11 @@
 
 pub mod allocation;
 pub mod diagnostics;
+// The whole of a real join, for the app: sign in, allocate, dial, log in,
+// receive, with a report. Needs the transport and the HTTPS calls, so it is
+// only built behind `live`.
+#[cfg(feature = "live")]
+pub mod join;
 pub mod login;
 // The session's state machine (stage, counters, feed) is not behind a feature:
 // the live transport is, but what a session *does* with bytes is testable
