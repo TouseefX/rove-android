@@ -65,6 +65,12 @@ pub struct Stats {
     /// The first few `(application, channel, id) → count` arrivals, for a
     /// session whose counters say nothing arrived.
     pub arrivals: Vec<(u8, u32, u8, usize)>,
+    /// Replication pings the server asked for (unanswered, and said so).
+    pub pings: usize,
+    /// Features the server's table offered.
+    pub features: usize,
+    /// Packets on a channel this client does not dispatch.
+    pub unhandled: usize,
 }
 
 // The stage is what an overlay draws, and the poller only ever sees a copy:
@@ -328,10 +334,14 @@ fn run(
         .build()
         .map_err(|_| "the transport runtime could not be started".to_owned())?;
     let mut world = session::Session::new();
+    let seen = shared.clone();
     let ran = runtime.block_on(async {
         // `session::run` reports the stage it reached even when it fails, so
-        // the report below can say connect-vs-log-in-vs-receive exactly.
-        session::run(&issued, &mut world, seconds).await
+        // the report below can say connect-vs-log-in-vs-receive exactly. Its
+        // callback publishes the counters *while* the session runs: before it,
+        // the overlay read the initial `Stats` for the whole join and a working
+        // session looked exactly like a stalled one.
+        session::run(&issued, &mut world, seconds, |session| publish(&seen, session)).await
     });
     let stage = world.stage.clone();
     match tag(&stage) {
@@ -359,7 +369,8 @@ fn run(
                 .collect();
             let arrival_note = if arrivals.is_empty() {
                 format!(
-                    "nothing on 4/1 ({} stream(s) opened that were not the world's)",
+                    "nothing at all on {} stream(s) ({} of them not the world's)",
+                    world.other_streams + 1,
                     world.other_streams
                 )
             } else {
@@ -367,16 +378,33 @@ fn run(
             };
             settle(shared, |report| report.ok("log in", "5 packets"));
             let note = format!(
-                "{} packet(s): {} schema, {} globals, {} replication, {} refused — {arrival_note}",
+                "{} packet(s): {} schema, {} globals, {} replication, {} refused — \
+                 {} feature(s), {} marker(s), {} ping(s), {} unhandled — {arrival_note}",
                 ingested.packets,
                 ingested.schema,
                 ingested.globals,
                 ingested.replication,
-                ingested.refused
+                ingested.refused,
+                world.features,
+                world.markers,
+                world.pings,
+                world.unhandled
             );
+            // A packet is not a world. `Receiving` means the decoder accepted
+            // one, and M2's acceptance is an instance: a session that read a
+            // schema and a feature table and built nothing has not joined a
+            // place, and calling that "ok" is how a stalled join got reported
+            // as a working one.
             if ingested.packets == 0 {
                 settle(shared, |report| {
                     report.failed("receive", format!("no packet arrived ({stage})"))
+                });
+            } else if applied.created == 0 {
+                settle(shared, |report| {
+                    report.failed(
+                        "receive",
+                        format!("no world was built — {note}"),
+                    )
                 });
             } else {
                 settle(shared, |report| report.ok("receive", note));
@@ -422,6 +450,9 @@ fn run(
             properties: applied.properties,
             elapsed_ms,
             other_streams: world_other_streams,
+            pings: world.pings,
+            features: world.features,
+            unhandled: world.unhandled,
             arrivals: world_arrivals,
         };
     }
@@ -433,6 +464,50 @@ fn elapsed_ms(shared: &Mutex<Shared>) -> u64 {
         .lock()
         .map(|shared| shared.report.elapsed().as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Copy a running session's counters into the shared stats the overlay reads.
+///
+/// Cheap on purpose: it runs from the join's own thread while a render loop is
+/// polling, so it takes the same lock for the length of a struct copy and never
+/// touches the document.
+fn publish(shared: &Mutex<Shared>, session: &session::Session) {
+    if let Ok(mut shared) = shared.lock() {
+        let ingested = session.ingested;
+        // Fields the session does not own (nothing is applied to the document
+        // until it is handed over) are carried across, not zeroed.
+        let (created, removed, properties) = (
+            shared.stats.created,
+            shared.stats.removed,
+            shared.stats.properties,
+        );
+        let elapsed_ms = shared.report.elapsed().as_millis() as u64;
+        shared.stats = Stats {
+            stage_tag: tag(&session.stage),
+            packets: ingested.packets,
+            schema: ingested.schema,
+            globals: ingested.globals,
+            replication: ingested.replication,
+            refused: ingested.refused,
+            journal_rows: session.journal_rows(),
+            created,
+            removed,
+            properties,
+            elapsed_ms,
+            other_streams: session.other_streams,
+            pings: session.pings,
+            features: session.features,
+            unhandled: session.unhandled,
+            arrivals: session
+                .arrivals
+                .iter()
+                .take(6)
+                .map(|((application, channel, kind), count)| {
+                    (*application, *channel, *kind, *count)
+                })
+                .collect(),
+        };
+    }
 }
 
 fn settle(shared: &Mutex<Shared>, change: impl FnOnce(&mut Report)) {

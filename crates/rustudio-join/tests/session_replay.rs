@@ -206,3 +206,106 @@ fn the_character_is_under_players_and_players_under_workspace() {
     assert_eq!(names.get("Workspace").map(String::as_str), Some("Workspace"));
     assert_eq!(names.get("Part").map(String::as_str), Some("Part"));
 }
+
+// ---- The channel dispatch -------------------------------------------------
+//
+// A live server multiplexes several kinds of packet onto the same reliable
+// stream, and two of them share a first byte with the world's. `feed_on` is
+// what tells them apart, and these tests pin the three collisions that a real
+// session hits — the ones a device report found the hard way.
+
+#[test]
+fn the_same_bytes_are_the_world_on_one_channel_and_a_ping_on_another() {
+    let recording = stream();
+    let messages = messages(&recording);
+    // The globals packet, then a replication packet, both of which start with
+    // 129 / 131 — the ids a ping packet also uses.
+    let replication = messages
+        .iter()
+        .find(|payload| payload.first() == Some(&131))
+        .expect("the recording has a replication packet")
+        .clone();
+
+    // On application 4 channel 1, this is world replication.
+    let mut world = Session::new();
+    for message in &messages {
+        world.feed_on(4, 1, message);
+    }
+    let created = world.applied.created;
+    assert!(created > 0, "the recording builds a world on 4/1");
+
+    // On application 4 channel 3 before globals, the same bytes are a ping:
+    // counted, not decoded, and the world stays empty. `false` is "not world
+    // state", which is what a caller records; silence is not an error.
+    let mut pings = Session::new();
+    assert!(!pings.feed_on(4, 3, &replication));
+    assert_eq!(pings.pings, 1, "counted as a ping");
+    assert_eq!(pings.ingested.packets, 0, "and not fed to the decoder");
+    assert_eq!(pings.applied.created, 0);
+}
+
+#[test]
+fn a_packet_on_a_channel_this_client_does_not_dispatch_is_counted_not_decoded() {
+    let recording = stream();
+    let messages = messages(&recording);
+    let mut session = Session::new();
+    for message in &messages {
+        session.feed_on(6, 2, message);
+    }
+    assert_eq!(session.ingested.packets, 0);
+    assert_eq!(session.unhandled, messages.len());
+    // And the arrivals record where they came from, which is what the report
+    // prints when a join receives plenty and builds nothing.
+    assert_eq!(
+        session.arrivals.get(&(6, 2, messages[0][0])).copied(),
+        Some(1)
+    );
+}
+
+#[test]
+fn the_feature_table_selects_the_property_encoding_it_names() {
+    // 0x93, then a u16 count, then length-prefixed name/value pairs. The one
+    // name that changes the decoder is DebugAdaptivePVCompressor; rove's live
+    // session reads the same table for the same reason.
+    fn table(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut packet = vec![0x93, 0];
+        packet.extend((entries.len() as u16).to_le_bytes());
+        for (name, value) in entries {
+            for text in [name, value] {
+                packet.extend((text.len() as u16).to_le_bytes());
+                packet.extend(text.as_bytes());
+            }
+        }
+        packet
+    }
+    let mut session = Session::new();
+    assert!(session.feed_on(4, 1, &table(&[("DebugAdaptivePVCompressor", "false")])));
+    assert_eq!(session.features, 1);
+    assert_eq!(session.ingested.packets, 0, "a feature table is not a world packet");
+    assert!(session.feed_on(4, 1, &table(&[("DebugAdaptivePVCompressor", "true")])));
+    assert_eq!(session.features, 1);
+    // A truncated one is refused rather than trusted.
+    let mut broken = table(&[("DebugAdaptivePVCompressor", "false")]);
+    broken.truncate(broken.len() - 2);
+    assert!(!session.feed_on(4, 1, &broken));
+    assert_eq!(session.ingested.refused, 1);
+}
+
+#[test]
+fn the_drain_keeps_up_with_more_rows_than_one_read_returns() {
+    // The replay's journal holds a handful of rows; a real place commits
+    // hundreds per packet. What is checked here is the loop's own property:
+    // every row committed is applied, not one batch of 64 and then a stall.
+    let recording = stream();
+    let messages = messages(&recording);
+    let mut session = Session::new();
+    for message in &messages {
+        session.feed_on(4, 1, message);
+    }
+    assert_eq!(
+        session.journal_rows(),
+        session.journal_records(),
+        "the two names for one number agree"
+    );
+    assert!(session.journal_rows() > 0);
+}

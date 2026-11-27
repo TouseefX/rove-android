@@ -160,3 +160,91 @@ it is the next thing to act on.
 3. Start Page → paste `1818` (or a URL) → **Play**.
 4. When the report settles, **Copy the report** and send that text unchanged.
    It names each stage, the failure and the counters; it holds no credential.
+
+## The stalled join: a logcat, and what it proved
+
+A real session on a phone (place 1818, 2026-11-27 15:38) logged this and then
+nothing at all for the rest of the session:
+
+```
+session: connected to 128.116.50.33:56753
+session: login packet 1 (103 bytes) sent
+...
+session: the server opened application 4 channel 13
+```
+
+No summary line, no packet counters, no report. Three separate faults were
+hiding behind that silence, and each one alone was enough to make the join look
+stuck.
+
+### 1. Packets were fed after the loop, so the loop had to end first
+
+The read loop collected packets into a `Vec` and handed them to the decoder when
+it finished. The borrow checker had pushed the code that way — a `select!` arm
+cannot hold `&mut Session` across an await — but the effect on the wire was that
+**nothing was decoded until the session ended**. A server keeps its reliable
+streams open for the life of the session, so "end" meant the 30 s deadline, and
+the overlay showed *logged in* with every counter at zero for the whole time.
+
+A reader task per stream now hands each packet to the loop through a bounded
+channel, and the loop feeds it immediately. This is rove's shape
+(`enqueue` → world owner), and it is why the counters move during a join.
+
+### 2. The final drain could wait forever
+
+`readers.join_next().await` on a stream the peer has not closed never resolves.
+After the loop, that drain ran over every reader, so a join could sit past its
+own deadline with the runtime blocked — which is exactly why the summary line
+never printed. Every wait is now bounded, the drain takes only what is already
+queued, and the rest is aborted.
+
+### 3. Fourteen streams, and a cap of sixteen
+
+Place 1818 opened **fourteen** reliable streams in the first millisecond:
+applications 0, 4 and 6 across channels 0, 1, 2, 4, 7, 8, 9, 10, 12, 13 and
+`0x6374726c` (the control channel). The cap was 16. Upstream's is **256**, and
+now so is this one — a busy place would otherwise have failed its join with
+"the server opened too many streams" for a reason unrelated to the join.
+
+### And the packets that are not the world's
+
+Reading every stream is only half of it: a server multiplexes several kinds of
+packet onto the same application, and two of them share a first byte with the
+world's.
+
+| stream | first byte | what it is | what this session does |
+|---|---|---|---|
+| 4/1 | `0x97` (151) | schema | decode |
+| 4/1 | `0x81` (129) | globals | decode |
+| 4/1 | `0x83` (131) | replication | decode |
+| 4/5 | `0xa1` (161) | instance state | decode via `ingest_instance_state` |
+| 4/1 | `0x93` (147) | feature table | read, and set the property encoding it names |
+| 4/1 | `0x84` (132) | marker acknowledgement | counted |
+| 4/3 | `0x83` (131) | **replication ping** | counted, *not* decoded |
+| anything else | — | — | counted as unhandled |
+
+The ping row is the dangerous one: before the dispatch existed, a ping on 4/3
+would have been handed to the replication decoder, which is a corrupt world
+rather than a slow one. Pings are counted and not answered — a reply has to
+carry measured replication statistics and a complete integrity inventory, and
+upstream blocks a reply rather than inventing one. Porting that measurement is
+the next step, and the report says how many pings were asked for.
+
+### What the report prints now
+
+```
+receive  ok     412 packet(s): 1 schema, 1 globals, 380 replication, 3 refused —
+                0 feature(s), 2 marker(s), 26 ping(s), 0 unhandled —
+                4/1 id 131 ×380, 4/3 id 131 ×26, 4/1 id 132 ×2, ...
+```
+
+A session that receives and builds nothing reads differently from one that
+receives nothing, which was the point of asking for the report in the first
+place.
+
+### What to send back
+
+Same as above, and the overlay is now worth watching *during* the join: it
+shows the stage, the packet count, the other-stream count and the seconds left,
+updated as packets arrive. If it stays on `logged in` with zero packets, the
+next thing to look at is the arrivals list in the report.

@@ -265,14 +265,23 @@ impl Editor {
                 }
                 if started {
                     ui.add_space(4.0);
+                    // The counters move as packets arrive, so a join that is
+                    // working looks different from one that is not; the
+                    // deadline says how much longer it will try.
+                    let left = SESSION_SECONDS.saturating_sub(waited);
                     ui.label(
                         egui::RichText::new(format!(
-                            "stage {} · {} packet(s) · {} created · {} removed · {} other stream(s)",
+                            "stage {} · {} packet(s) · {} created · {} other stream(s) · {} unhandled{}",
                             stats.stage_name(),
                             stats.packets,
                             stats.created,
-                            stats.removed,
-                            stats.other_streams
+                            stats.other_streams,
+                            stats.unhandled,
+                            if running {
+                                format!(" · {} s left", left)
+                            } else {
+                                String::new()
+                            }
                         ))
                         .color(rustudio_engine::theme::TEXT_DIM),
                     );
