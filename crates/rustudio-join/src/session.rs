@@ -549,7 +549,10 @@ impl Session {
             self.live
                 .referent(id)
                 .is_some_and(|r| match self.document.prop(r, "Character") {
-                    Some(rbx_dom_weak::types::Variant::Ref(c)) => self.document.exists(c),
+                    // `rustudio-core` re-exports the DOM crate as `__rbx`, which
+                    // is how a crate that only holds a `Document` names its
+                    // values without depending on `rbx_dom_weak` itself.
+                    Some(rustudio_core::__rbx::types::Variant::Ref(c)) => self.document.exists(c),
                     _ => false,
                 })
         })
@@ -724,7 +727,11 @@ impl Session {
         self.feed_inner_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload)
     }
 
-    fn feed_inner_on(&mut self, application: u8, channel: u32, payload: &[u8]) -> bool {
+    /// The decoder, on a packet already dispatched. The application and channel
+    /// are kept in the signature because every call site names them and a reader
+    /// wants to see *which* stream a packet came from at the call; the decoder
+    /// itself takes only the payload.
+    fn feed_inner_on(&mut self, _application: u8, _channel: u32, payload: &[u8]) -> bool {
         self.ingested.packets += 1;
         match self.core.ingest(payload) {
             Ok(outcome) => {
@@ -933,22 +940,7 @@ impl Session {
         read
     }
 
-    /// `"scope:index"` as the wire's two-number instance key.
-///
-/// The stream names instances this way and `replication_out` wants the pair;
-/// scope 0 is not a real scope and the encoder refuses it, so it is refused
-/// here too rather than at the encoder, where the reason is less clear.
-fn parse_instance_guid(id: &str) -> Result<(u32, u32), ()> {
-    let (scope, index) = id.split_once(':').ok_or(())?;
-    let scope: u32 = scope.parse().map_err(|_| ())?;
-    let index: u32 = index.parse().map_err(|_| ())?;
-    if scope == 0 {
-        return Err(());
-    }
-    Ok((scope, index))
-}
-
-/// Rows the journal holds. A counter, not a scan: this is polled by a
+    /// Rows the journal holds. A counter, not a scan: this is polled by a
     /// progress callback while the session runs, and `read_after(.., 4096)`
     /// walks the whole journal every time it is asked.
     pub fn journal_rows(&self) -> usize {
@@ -1416,3 +1408,17 @@ pub fn login_packets(issued: &IssuedJoinAllocation) -> Result<Vec<Vec<u8>>, &'st
     ])
 }
 
+/// `"scope:index"` as the wire's two-number instance key.
+///
+/// The stream names instances this way and `replication_out` wants the pair;
+/// scope 0 is not a real scope and the encoder refuses it, so it is refused
+/// here too rather than at the encoder, where the reason is less clear.
+fn parse_instance_guid(id: &str) -> Result<(u32, u32), ()> {
+    let (scope, index) = id.split_once(':').ok_or(())?;
+    let scope: u32 = scope.parse().map_err(|_| ())?;
+    let index: u32 = index.parse().map_err(|_| ())?;
+    if scope == 0 {
+        return Err(());
+    }
+    Ok((scope, index))
+}
