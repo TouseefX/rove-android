@@ -27,6 +27,14 @@ test_ok = re.compile(r"^test \S+ \.\.\. ok")
 short = re.compile(r"^(?P<file>[^:\s][^:]*?):(?P<line>\d+):(?P<col>\d+):\s+(?:error|warning)(?:\[\w+\])?:\s*(?P<msg>.*)$")
 plain = re.compile(r"^\s*(?:error|warning)(?:\[\w+\])?:\s*(?P<msg>\S.*)$")
 
+def is_warning(line):
+    """`warning: ...` at the start, or `: warning` mid-line (cargo's short
+    format): the trailing `warning: \`crate\` (lib) generated 2 warnings`
+    summary is the one that used to be reported as an error."""
+    stripped = line.strip()
+    return stripped.startswith("warning: ") or ": warning" in line
+
+
 try:
     with open(path, errors="replace") as f:
         text = f.read()
@@ -62,12 +70,12 @@ for i, line in enumerate(lines):
         detail = m.group("msg")
         if i + 1 < len(lines) and lines[i + 1].strip().startswith(("= help", "= note")):
             detail += " — " + lines[i + 1].strip()
-        level = "warning" if ": warning" in line else "error"
+        level = "warning" if is_warning(line) else "error"
         found.append((level, m.group("file"), m.group("line"), detail))
         continue
     m = plain.match(line)
     if m and not line.strip().startswith("="):
-        level = "warning" if ": warning" in line else "error"
+        level = "warning" if is_warning(line) else "error"
         found.append((level, None, None, m.group("msg")))
 
 # A red run is about its errors. Warnings are real but they are not why the job

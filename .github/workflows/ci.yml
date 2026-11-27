@@ -151,6 +151,7 @@ jobs:
           # annotation step can always reach it.
           mkdir -p out
           cp "$RUNNER_TEMP/join.log" out/join.log 2>/dev/null || true
+          echo "$status" > out/join.status
           exit "$status"
       - name: The ported codec against rove's own encoder (both in one build)
         shell: bash
@@ -167,6 +168,7 @@ jobs:
           set -e
           mkdir -p out
           cp "$RUNNER_TEMP/join-crosscheck.log" out/join-crosscheck.log 2>/dev/null || true
+          echo "$status" > out/join-crosscheck.status
           tail -3 "$RUNNER_TEMP/join-crosscheck.log" || true
           exit "$status"
       - name: The live feature compiles (WebTransport, sign in, join-game)
@@ -179,30 +181,34 @@ jobs:
           set -e
           mkdir -p out
           cp "$RUNNER_TEMP/join-live.log" out/join-live.log 2>/dev/null || true
+          echo "$status" > out/join-live.status
           exit "$status"
 
       - name: Choose the log the annotations come from
         if: always()
         shell: bash
         run: |
-          # The first failing step's log, in the order they run: a compile error
-          # in the tests and one in the live build are both `error:` lines, but
-          # only one of them is the reason the job stopped.
+          # The first failing step's log, by its recorded exit status: a compile
+          # error in the tests and one in the live build are both `error:` lines,
+          # but only one of them is the reason the job stopped. Without the
+          # status the choice fell to whichever log merely contained `error`,
+          # which is how a green tests step's dependency *warnings* got reported
+          # as the failure.
           for name in join join-crosscheck join-live; do
             [ -f "out/$name.log" ] || continue
-            # Compiler diagnostics in `--message-format=short` are
-            # "path:line:col: error[E0308]: ..." or "error: ...".
-            if grep -qE '(^|: )error(\[|:)' "out/$name.log"; then
+            status=$(cat "out/$name.status" 2>/dev/null || echo 0)
+            echo "$name exited $status"
+            if [ "$status" != "0" ]; then
               cp "out/$name.log" out/diagnostics.log
-              echo "annotating out/$name.log"
+              echo "annotating out/$name.log (exit $status)"
               exit 0
             fi
           done
-          # No compiler error and no panic: the failure was a test assertion or a
-          # disagreement from the cross-check, and its own lines are the report.
+          # Nothing recorded a failure: annotate the quietest last resort so the
+          # job still says something, rather than nothing.
           for name in join join-crosscheck join-live; do
             [ -f "out/$name.log" ] && cp "out/$name.log" out/diagnostics.log && \
-              echo "annotating out/$name.log (no compiler error; the step's own lines are the report)" && exit 0
+              echo "annotating out/$name.log (no step recorded a failure)" && exit 0
           done
           ls -l out/ || true
 
@@ -215,8 +221,9 @@ jobs:
             exit 0
           fi
           echo "=== the failure, verbatim"
-          sed -n '/panicked at/,+6p' out/diagnostics.log | head -20 || true
-          grep -E "(^|: )error" out/diagnostics.log | head -12 || true
+          grep -nE "(panicked at|FAILED|error\[|^error:)" out/diagnostics.log | head -20 || true
+          sed -n '/panicked at/,+8p' out/diagnostics.log | head -40 || true
+          grep -E "(^|: )error(\[|:)" out/diagnostics.log | head -12 || true
           for page in 0 1 2; do
             python3 tools/ci/annotate.py out/diagnostics.log "$page" || true
           done
