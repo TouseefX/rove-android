@@ -70,3 +70,35 @@ fn the_report_is_readable_from_another_thread_while_the_join_runs() {
         started.elapsed()
     );
 }
+
+/// The capability the transport offers and the range the login declares are the
+/// same promise, and a client that sends one without the other is asking for a
+/// feature its own handshake refused. This file is `--features live`, which is
+/// the only build where `transport_allocation` exists.
+#[test]
+fn the_transport_offers_the_bytecode_range_the_login_declares() {
+    use rustudio_join::allocation::{parse_allocation, AllocationResult, JoinTarget};
+    use rustudio_join::session::{transport_allocation, BYTECODE_RANGE_CAPABILITY};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/join_game.json")).unwrap();
+    let target = JoinTarget::place(1818);
+    let issued = match parse_allocation(
+        200,
+        fixture["ready"].as_object(),
+        &target,
+        None,
+        424_242,
+        "application/json",
+    )
+    .unwrap()
+    {
+        AllocationResult::Ready(issued) => issued,
+        other => panic!("{other:?}"),
+    };
+    let transport = transport_allocation(&issued).expect("the allocation is transport-ready");
+    assert_eq!(
+        transport.capabilities, BYTECODE_RANGE_CAPABILITY,
+        "the offer has to include the bit protocol sync asks the server for"
+    );
+    assert!(transport.validate().is_ok(), "0x100000 is the one value it accepts");
+}

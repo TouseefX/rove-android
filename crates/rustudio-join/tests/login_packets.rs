@@ -225,3 +225,45 @@ fn the_five_packets_of_a_join_are_their_own_ids_in_order() {
     assert!(has(&packets[3], b"synthetic"), "and the client ticket");
     assert_eq!(packets[4], vec![0x8f, 0]);
 }
+
+#[test]
+fn the_login_offers_the_bytecode_range_its_capability_bit_promises() {
+    use rustudio_join::allocation::{parse_allocation, AllocationResult, JoinTarget};
+    use rustudio_join::session::{BYTECODE_RANGE, BYTECODE_RANGE_CAPABILITY};
+
+    // The two halves have to agree. The transport handshake offers
+    // `BYTECODE_RANGE_CAPABILITY` in `x-rbx-capabilities`, and protocol sync
+    // declares the range that bit is a promise about; rove's live session does
+    // both, and a client that offers the range without the bit (which is what
+    // this one did, with capabilities 0 and `None`) is asking for a feature the
+    // handshake says it cannot use.
+    assert_eq!(BYTECODE_RANGE, (13, 14));
+    assert_eq!(BYTECODE_RANGE_CAPABILITY, 0x10_0000);
+
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/join_game.json")).unwrap();
+    let target = JoinTarget::place(1818);
+    let issued = match parse_allocation(
+        200,
+        fixture["ready"].as_object(),
+        &target,
+        None,
+        424_242,
+        "application/json",
+    )
+    .unwrap()
+    {
+        AllocationResult::Ready(issued) => issued,
+        other => panic!("{other:?}"),
+    };
+    let packets = rustudio_join::session::login_packets(&issued).expect("the five packets");
+    // Bytes 6 and 7 of protocol sync are the range, present because `None`
+    // would leave them out entirely and the header would then be `[.., 0, 0]`.
+    let sync = &packets[1];
+    assert_eq!(&sync[..10], &[0x90, 0x01, 36, 0x00, 0x00, 0x00, 13, 14, 0x00, 0x00]);
+
+    // The transport half is checked by `--features live` in
+    // `session_replay.rs`: `cfg(feature = ...)` in an integration test reads
+    // the *test crate's* features, not the library's, so a gate here would
+    // compile out those lines and pass without checking anything.
+}

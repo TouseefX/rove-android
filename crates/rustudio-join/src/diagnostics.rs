@@ -52,6 +52,8 @@ pub struct Report {
     pub user_id: u64,
     steps: Vec<Step>,
     started: Instant,
+    /// Where the last step ended; a step's `took` is the span from here.
+    mark: Duration,
     /// The furthest stage reached, which is the one line that matters.
     pub stage: &'static str,
 }
@@ -63,6 +65,7 @@ impl Report {
             user_id: 0,
             steps: Vec::new(),
             started: Instant::now(),
+            mark: Duration::ZERO,
             stage: "start",
         }
     }
@@ -106,13 +109,15 @@ impl Report {
     }
 
     fn push(&mut self, mut step: Step, stage: &'static str) {
-        step.took = self.started.elapsed().saturating_sub(self.elapsed_before_last());
+        step.took = self.started.elapsed().saturating_sub(self.mark);
+        // The mark is where this step was pushed, not the sum of the steps
+        // before it. The difference matters: `log in` is pushed when the
+        // session *ends*, so measuring from the sum charged connect and a
+        // thirty-second receive to a step that took two seconds, and a report
+        // reading "log in 33157 ms" said nothing about where the time went.
+        self.mark = self.started.elapsed();
         self.steps.push(step);
         self.stage = stage;
-    }
-
-    fn elapsed_before_last(&self) -> Duration {
-        self.steps.iter().map(|step| step.took).sum()
     }
 
     pub fn failed_any(&self) -> bool {
@@ -210,6 +215,34 @@ mod tests {
         );
         assert_eq!(report.stage, "allocate", "the stage it stopped at");
         assert!(report.lines()[0].contains("failed"));
+    }
+
+    #[test]
+    fn a_steps_time_is_its_own_span_not_everything_before_it() {
+        // The bug this pins: `log in` is pushed after the session ends, so
+        // measuring from the report's start charged the whole thirty-second
+        // receive to it. Each step now measures from where the last one ended.
+        let mut report = Report::begin(1818);
+        report.ok("sign in", "user 424242");
+        std::thread::sleep(Duration::from_millis(30));
+        report.ok("allocate", "5.5.5.5:443");
+        std::thread::sleep(Duration::from_millis(30));
+        report.ok("connect", "webtransport");
+        std::thread::sleep(Duration::from_millis(30));
+        report.ok("log in", "5 packets");
+        let steps = report.steps();
+        assert_eq!(steps.len(), 4);
+        // Every step took roughly its own sleep, not the growing total.
+        for step in steps.iter().skip(1) {
+            assert!(
+                step.took >= Duration::from_millis(20) && step.took < Duration::from_millis(120),
+                "{} took {:?}, which is the elapsed total rather than its own span",
+                step.name,
+                step.took
+            );
+        }
+        let total: Duration = steps.iter().map(|step| step.took).sum();
+        assert!(total >= Duration::from_millis(90), "the steps add up to the elapsed time");
     }
 
     #[test]

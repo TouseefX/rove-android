@@ -269,21 +269,21 @@ impl Editor {
                     // working looks different from one that is not; the
                     // deadline says how much longer it will try.
                     let left = SESSION_SECONDS.saturating_sub(waited);
+                    let mut line = format!(
+                        "stage {} · {} stream(s) · {} packet(s) · {} created · sync {}/{} · {} unhandled",
+                        stats.stage_name(),
+                        stats.streams,
+                        stats.packets,
+                        stats.created,
+                        stats.sync_replies,
+                        stats.sync_requests,
+                        stats.unhandled
+                    );
+                    if running {
+                        line.push_str(&format!(" · {} s left", left));
+                    }
                     ui.label(
-                        egui::RichText::new(format!(
-                            "stage {} · {} packet(s) · {} created · {} other stream(s) · {} unhandled{}",
-                            stats.stage_name(),
-                            stats.packets,
-                            stats.created,
-                            stats.other_streams,
-                            stats.unhandled,
-                            if running {
-                                format!(" · {} s left", left)
-                            } else {
-                                String::new()
-                            }
-                        ))
-                        .color(rustudio_engine::theme::TEXT_DIM),
+                        egui::RichText::new(line).color(rustudio_engine::theme::TEXT_DIM),
                     );
                 }
             });

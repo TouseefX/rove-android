@@ -71,6 +71,14 @@ pub struct Stats {
     pub features: usize,
     /// Packets on a channel this client does not dispatch.
     pub unhandled: usize,
+    /// Reliable streams the server opened and the session accepted.
+    pub streams: usize,
+    /// Unreliable datagrams read, and the time-sync probe's request/reply
+    /// counts. A probe with requests and no replies is a server that is not
+    /// answering the handshake, which is a different fault from a quiet one.
+    pub datagrams: usize,
+    pub sync_requests: usize,
+    pub sync_replies: usize,
 }
 
 // The stage is what an overlay draws, and the poller only ever sees a copy:
@@ -404,7 +412,18 @@ fn run(
             // as a working one.
             if ingested.packets == 0 {
                 settle(shared, |report| {
-                    report.failed("receive", format!("no packet arrived ({stage})"))
+                    report.failed(
+                        "receive",
+                        format!(
+                            "no packet arrived on {} stream(s), {} datagram(s), \
+                             {} ping(s); time-sync {} request(s), {} reply(ies) ({stage})",
+                            world.streams,
+                            world.datagrams,
+                            world.pings,
+                            world.sync_requests,
+                            world.sync_replies
+                        ),
+                    )
                 });
             } else if applied.created == 0 {
                 settle(shared, |report| {
@@ -459,6 +478,10 @@ fn run(
             pings: world.pings,
             features: world.features,
             unhandled: world.unhandled,
+            streams: world.streams,
+            datagrams: world.datagrams,
+            sync_requests: world.sync_requests,
+            sync_replies: world.sync_replies,
             arrivals: world_arrivals,
         };
     }
@@ -504,6 +527,10 @@ fn publish(shared: &Mutex<Shared>, session: &session::Session) {
             pings: session.pings,
             features: session.features,
             unhandled: session.unhandled,
+            streams: session.streams,
+            datagrams: session.datagrams,
+            sync_requests: session.sync_requests,
+            sync_replies: session.sync_replies,
             arrivals: session
                 .arrivals
                 .iter()

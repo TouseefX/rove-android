@@ -34,7 +34,11 @@ use crate::allocation::IssuedJoinAllocation;
 use crate::login;
 
 #[cfg(feature = "transport")]
-use rove_client_core::transport::session::{ReliableReceiver, ReliableSender};
+use rove_client_core::timing::{SessionWireClock, TimeSyncProbe};
+#[cfg(feature = "transport")]
+use rove_client_core::transport::session::{
+    receive_unreliable, ReliableReceiver, ReliableSender,
+};
 #[cfg(feature = "transport")]
 use rove_client_core::transport::{connect_webtransport, IssuedAllocation};
 
@@ -53,6 +57,13 @@ pub const PING_CHANNEL: u32 = 3;
 /// Compact instance-state packets (161), where most of a real place's world
 /// arrives. Upstream routes them on application 4 channel 5.
 pub const INSTANCE_STATE_CHANNEL: u32 = 5;
+
+/// The bytecode range `protocol_sync` offers, and the capability bit that says
+/// this client asked for it. Upstream's `BYTECODE_RANGE_CAPABILITY`, and the
+/// pair has to agree: offering the range without the capability (or the other
+/// way round) asks the server for a feature the handshake says we cannot use.
+pub const BYTECODE_RANGE: (u8, u8) = (13, 14);
+pub const BYTECODE_RANGE_CAPABILITY: u64 = 0x10_0000;
 
 /// How many journal rows one read takes. The journal is read in batches and
 /// drained fully, so this is a page size and not a limit.
@@ -152,6 +163,16 @@ pub struct Session {
     /// Packets on a channel this client does not dispatch: counted so the
     /// report can name a stream the session saw and did nothing with.
     pub unhandled: usize,
+    /// Reliable streams the server opened and this session accepted. A report
+    /// that says "no packet arrived" has to say how many streams it was
+    /// reading, or it cannot tell silence from a stream that never opened.
+    pub streams: usize,
+    /// Unreliable datagrams read, and the time-sync probe's requests and
+    /// replies. The probe is part of the pre-login handshake, so its silence is
+    /// a diagnosis: a request with no reply is a server that is not answering.
+    pub datagrams: usize,
+    pub sync_requests: usize,
+    pub sync_replies: usize,
 }
 
 impl Session {
@@ -180,6 +201,10 @@ impl Session {
             features: 0,
             markers: 0,
             unhandled: 0,
+            streams: 0,
+            datagrams: 0,
+            sync_requests: 0,
+            sync_replies: 0,
         }
     }
 
@@ -461,9 +486,12 @@ pub fn transport_allocation(issued: &IssuedJoinAllocation) -> Result<IssuedAlloc
         backend: issued.backend.expect("checked"),
         token: *issued.token().expect("checked"),
         certificate_sha256: issued.certificate_sha256.clone(),
-        // This client implements no optional features; offering none is what
-        // rove's allocation-only path does, and the server intersects it.
-        capabilities: 0,
+        // The offer is a statement about what *this client* implements, not
+        // about the server, and the server intersects it. `protocol_sync` now
+        // sends the 13..14 bytecode range, so the range has to be offered:
+        // rove's live session sets exactly this bit for exactly this reason,
+        // and logs in with `Some((13, 14))` to match.
+        capabilities: BYTECODE_RANGE_CAPABILITY,
     })
 }
 
@@ -549,6 +577,44 @@ pub async fn run(
             .map_err(|_| "control channel could not be opened")?;
     }
 
+    // The capability the login packets ask for has to be the one the handshake
+    // negotiated. Before this check a server that did not advertise it was sent
+    // a range it had refused, and rove's live session closes the connection at
+    // exactly this point rather than continue into a mismatched login.
+    let negotiated = connection
+        .capability_negotiation()
+        .map(|caps| caps.negotiated())
+        .ok_or("the server negotiated no capabilities")?;
+    if negotiated & BYTECODE_RANGE_CAPABILITY == 0 {
+        connection.close(0u32.into(), b"bytecode range unsupported");
+        return Err("the server did not negotiate the bytecode range");
+    }
+    log::info!("session: capabilities negotiated: {negotiated:016x}");
+
+    // --- Before the login packets: the clock and time-sync the server expects
+    // a client to have set up. rove's live session does exactly this, in this
+    // order, and the omitted steps are not decoration: the replicator register
+    // (6/1) and the two announced clock datagram channels (6/2 on wire 2, 6/3
+    // on wire 4) are what the server's timing probe answers on, and it waits.
+    let mut clock = SessionWireClock::new();
+    clock.initialize_replicator().map_err(|_| "the wire clock could not be initialized")?;
+    sender
+        .open(6, 1)
+        .await
+        .map_err(|_| "the clock register could not be opened")?;
+    for (channel, wire) in [(2u8, 2u32), (3, 4)] {
+        let announcement =
+            rove_client_core::channels::control_open(6, channel, wire)
+                .map_err(|_| "a clock channel could not be announced")?;
+        sender
+            .send(6, rove_client_core::channels::CONTROL_CHANNEL, &announcement)
+            .await
+            .map_err(|_| "a clock channel could not be announced")?;
+    }
+    let mut sync = TimeSyncProbe::default();
+    sync.start(&clock).map_err(|_| "the time-sync probe could not be started")?;
+    log::info!("session: wire clock initialized, clock channels 6/1, 6/2, 6/3 announced");
+
     // The five login packets, in the order the server reads them.
     let packets = login_packets(issued).map_err(|_| "login packets could not be encoded")?;
     for (index, packet) in packets.iter().enumerate() {
@@ -569,7 +635,6 @@ pub async fn run(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let (packets_tx, mut packets_rx) = tokio::sync::mpsc::channel::<(u8, u32, Vec<u8>)>(READER_QUEUE);
     let mut readers = tokio::task::JoinSet::new();
-    let mut total = 0usize;
     let mut fed = 0usize;
     // Why the loop stopped; `None` means the peer finished every stream.
     let end: Option<&'static str>;
@@ -583,6 +648,11 @@ pub async fn run(
     // arm existed, a server that hung up was indistinguishable from one that
     // had gone quiet, and both were reported as the deadline passing.
     let mut connection_closed = Box::pin(connection.closed());
+    // The probe emits a request on an interval and is quiet otherwise, so it is
+    // polled on a coarse tick rather than on every turn. Its replies arrive as
+    // datagrams, never on a reliable stream, which is why the loop reads them.
+    let mut sync_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+    sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if std::time::Instant::now() >= deadline {
             end = Some("the session's deadline passed");
@@ -607,8 +677,8 @@ pub async fn run(
                 let mut receiver = accepted.expect("checked");
                 let channel = receiver.channel();
                 log::info!("session: the server opened application {application} channel {channel}");
-                total += 1;
-                if total > MAX_STREAMS {
+                session.streams += 1;
+                if session.streams > MAX_STREAMS {
                     end = Some("the server opened too many streams");
                     break;
                 }
@@ -666,6 +736,51 @@ pub async fn run(
                     log::warn!("session: a stream reader failed: {error}");
                 }
             }
+            // A time-sync request due now. Unreliable on purpose: it is a
+            // probe, and a lost one is retried on the next interval.
+            _ = sync_tick.tick() => {
+                match sync.due(&clock) {
+                    Ok(Some(packet)) => {
+                        session.sync_requests += 1;
+                        if let Err(error) =
+                            rove_client_core::transport::session::send_unreliable(
+                                &connection,
+                                4,
+                                session.sync_requests as u64,
+                                &packet,
+                            )
+                        {
+                            log::warn!("session: time-sync request could not be sent: {error}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => log::warn!("session: time-sync clock error: {error}"),
+                }
+            }
+            // A datagram. Only the time-sync channel's replies are interpreted
+            // here; everything else is counted, because a datagram a server
+            // sent and nobody read sits in the connection's queue, and the
+            // probe's answer is exactly the kind of packet that never arrives
+            // on a reliable stream.
+            datagram = receive_unreliable(&connection) => {
+                session.datagrams += 1;
+                match datagram {
+                    Ok(packet) => {
+                        if packet.wire_id == 4 && packet.complete {
+                            match sync.receive(&packet.payload, &clock, true) {
+                                Ok(true) => session.sync_replies += 1,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    log::warn!("session: time-sync reply refused: {error}")
+                                }
+                            }
+                        }
+                    }
+                    // A datagram that will not parse is not the end of the
+                    // connection: count it and read the next one.
+                    Err(error) => log::debug!("session: a datagram was unreadable: {error}"),
+                }
+            }
             _ = &mut connection_closed => {
                 log::warn!("session: the connection ended");
                 end = Some("the connection ended");
@@ -687,11 +802,15 @@ pub async fn run(
     readers.abort_all();
     while readers.join_next().await.is_some() {}
     log::info!(
-        "session: {} stream(s) accepted, {} packet(s) fed, {} refusal(s), {} other stream(s)",
-        total,
+        "session: {} stream(s) accepted, {} packet(s) fed, {} refusal(s), \
+         {} other stream(s), {} datagram(s), time-sync {}/{}",
+        session.streams,
         session.ingested.packets,
         session.ingested.refused,
-        session.other_streams
+        session.other_streams,
+        session.datagrams,
+        session.sync_replies,
+        session.sync_requests
     );
     if let Some(reason) = end {
         session.stage = Stage::Closed(reason);
@@ -722,8 +841,14 @@ pub fn login_packets(issued: &IssuedJoinAllocation) -> Result<Vec<Vec<u8>>, &'st
         .ok_or("the allocation has no client ticket")?;
     let early_auth = login::issued_early_auth(client_ticket)
         .map_err(|_| "the client ticket is not a join ticket")?;
-    let sync = login::protocol_sync(&issued.join_fields, issued.join_ticket_value.as_ref(), None)
-        .map_err(|_| "the player object could not be encoded")?;
+    // The range, not `None`: the server reads this to decide which bytecode the
+    // client will accept, and rove's live session sends `Some((13, 14))`.
+    let sync = login::protocol_sync(
+        &issued.join_fields,
+        issued.join_ticket_value.as_ref(),
+        Some(BYTECODE_RANGE),
+    )
+    .map_err(|_| "the player object could not be encoded")?;
     let verification = login::verification_packet().map_err(|_| "no verification nonce")?;
     let ticket = login::ticket_packet(&issued.join_fields)
         .map_err(|_| "the ticket packet could not be encoded")?;

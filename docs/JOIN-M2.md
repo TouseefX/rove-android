@@ -248,3 +248,45 @@ Same as above, and the overlay is now worth watching *during* the join: it
 shows the stage, the packet count, the other-stream count and the seconds left,
 updated as packets arrive. If it stays on `logged in` with zero packets, the
 next thing to look at is the arrivals list in the report.
+
+### The pre-login handshake this client was not doing
+
+The phone report settled one question and raised a better one: sign in and
+allocate pass, the server opens its streams, and then **zero packets in thirty
+seconds**. A server that opens streams and then says nothing is waiting for the
+client, and diffing `session::run` against `rove/rust-client/src/live_session.rs`
+shows what it was waiting for. Upstream, before a single login packet goes out:
+
+```
+clock.initialize_replicator()                 // the replicator wire clock
+send(0, CONTROL, [0,0]) send(4, …) send(6, …) // control opens
+sender.open(6, 1)                             // the clock register
+control_open(6, 2, 2) control_open(6, 3, 4)   // announced clock datagram channels
+sync.start(&clock)                            // the time-sync probe
+```
+
+This client did the three control opens and then went straight to the login
+packets. Everything else was missing, and two of the omissions are the kind a
+server notices:
+
+- **The capabilities were never offered.** `transport_allocation` passed
+  `capabilities: 0` while `protocol_sync` declared no bytecode range. Upstream
+  offers `BYTECODE_RANGE_CAPABILITY` (`0x10_0000`) and logs in with
+  `Some((13, 14))`; the two are one promise. Here both are now made, and the
+  negotiated mask is checked after the handshake — upstream closes the
+  connection at that point rather than continue into a login that asks for a
+  feature the handshake refused.
+- **The time-sync probe never ran, and its replies are datagrams.** A reply is
+  an unreliable packet on wire id 4, so a loop that reads only reliable streams
+  can never see one. The loop now polls `receive_unreliable`, feeds wire-4
+  packets to `TimeSyncProbe::receive`, and sends its requests on the interval
+  `due` asks for.
+
+### The report's times were not the steps' times
+
+Steps were stamped as `elapsed − sum(previous steps)`. `log in` is pushed after
+the session *ends*, so it absorbed connect, the login, and the whole thirty
+seconds of receive: "log in 33157 ms" named a step that took two seconds. A
+report like that cannot say where the time went, which is the one thing it is
+for. Each step now measures from the moment the previous one was pushed, and
+`a_steps_time_is_its_own_span_not_everything_before_it` pins it.
