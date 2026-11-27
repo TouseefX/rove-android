@@ -124,7 +124,10 @@ impl Editor {
                 // A place still loading would defer the Play and lose it.
                 self.join_win.play_next_tick = true;
             } else {
-                self.start_play(crate::runtime::RunMode::Play);
+                // `rustudio_engine::runtime::RunMode`, not `crate::runtime`'s:
+                // `start_play` and `play_when_loaded` use the engine's enum,
+                // and the two are separate types with the same variant names.
+                self.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.info("join: playing the joined place (Shift+F5 stops it)");
             }
         }
