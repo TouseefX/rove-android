@@ -9,9 +9,9 @@ little-endian ids, and rove's own framing rules.
 
 Five packets, in the order a join receives them:
 
-1. schema (151) - three classes (DataModel, Workspace, Part) with the property
-                  ids rove's decoder assigns, inside the length-prefixed zstd
-                  frame `parse_schema` inflates;
+1. schema (151) - four classes (DataModel, Workspace, Players, Part), each top
+                  container carrying its own class, inside the length-prefixed
+                  zstd frame `parse_schema` inflates;
 2. globals (129) - the top containers (DataModel, Workspace, Players), which
                   make the world's roots. Read unframed, as the globals reader
                   does;
@@ -285,8 +285,15 @@ def walk_replication(blob, schema_classes):
 CLASSES = (
     ("DataModel", ()),
     ("Workspace", ()),
+    # A real join's third top container. The recording used to give Players the
+    # Workspace class (id 1), which makes an instance named "Workspace" bound to
+    # the Players id — the class a container is created with decides its name.
+    ("Players", ()),
     ("Part", (("Size", 22), ("Anchored", 9))),
 )
+
+# The Part's class index, for the creates below.
+PART_CLASS = [name for name, _ in CLASSES].index("Part")
 
 # How many bytes each type's value occupies, for the walker.
 VALUE_SIZE = {22: 12, 9: 1}
@@ -305,7 +312,7 @@ def schema_bytes():
     out += varuint(3)                     # schema version
     out += struct.pack("<Q", 0)           # flags
     out += varuint(0)                     # enums
-    out += varuint(3)                     # classes
+    out += varuint(len(CLASSES))          # classes
     out += varuint(sum(len(props) for _, props in CLASSES))  # counted over all classes
     out += varuint(0)                     # events
 
@@ -410,7 +417,7 @@ def build():
         SCOPE,
         [(key_of(DM), 0, (1, 0)),          # DataModel
          (key_of(WORKSPACE), 1, (1, 0)),   # Workspace
-         (key_of(PLAYERS), 1, (1, 0))],    # Players
+         (key_of(PLAYERS), 2, (1, 0))],    # Players
     )
     # Replication packets are their own bytes: no zstd frame, no length header.
     # The Part under Workspace; the Character with a parent of its own; and
@@ -420,9 +427,9 @@ def build():
     # edge this recording is about. Keeping it out of the Part's subtree also
     # keeps the last packet's removal to exactly one instance.
     place = replication_packet(
-        create(SCOPE, PART, 2, [(0, vector3(4.0, 1.0, 2.0)), (1, boolean(True))],
+        create(SCOPE, PART, PART_CLASS, [(0, vector3(4.0, 1.0, 2.0)), (1, boolean(True))],
                key_of(WORKSPACE)),
-        create(SCOPE, CHARACTER, 2, [(0, vector3(1.0, 1.0, 1.0))], None),
+        create(SCOPE, CHARACTER, PART_CLASS, [(0, vector3(1.0, 1.0, 1.0))], None),
         set_parent(SCOPE, PLAYERS, WORKSPACE),
     )
     # The Character's edge, one packet later: a create that arrived without a
@@ -443,8 +450,8 @@ def build():
            "character": "%d:%d" % key_of(CHARACTER)}
     manifest = {
         "id": ids,
-        "schema": {"classes": 3, "properties": 2,
-                   "names": ["DataModel", "Workspace", "Part"]},
+        "schema": {"classes": len(CLASSES), "properties": 2,
+                   "names": [name for name, _ in CLASSES]},
         "globals": {"containers": [ids["datamodel"], ids["workspace"], ids["players"]]},
         # What the replication packets do, in order, as the decoder will see it.
         "replication": [
@@ -459,8 +466,8 @@ def build():
     }
     recording = {
         "note": "A join as a recording: rove's own decoder reads the schema "
-                "(DataModel, Workspace, Part) and the globals (the place's top "
-                "containers), then the place itself. The Part is created under "
+                "(DataModel, Workspace, Players, Part) and the globals (the "
+                "place's top containers), then the place itself. The Part is created under "
                 "Workspace and destroyed in the last packet; Players gets its "
                 "parent edge in the packet that creates the Part; the "
                 "Character arrives with a null parent and is parented by the "
@@ -483,8 +490,8 @@ def check(recording, manifest):
     if schema["version"] != 3:
         raise SystemExit("schema version %d" % schema["version"])
     declared = [(name, [prop for prop, _ in props]) for name, props in schema["classes"]]
-    expected_classes = list(zip(manifest["schema"]["names"],
-                                [[], [], ["Size", "Anchored"]]))
+    expected_classes = [(name, [] if name != "Part" else ["Size", "Anchored"])
+                        for name in manifest["schema"]["names"]]
     if declared != expected_classes:
         raise SystemExit("the schema declares %s" % declared)
     if schema["property_count"] != manifest["schema"]["properties"]:

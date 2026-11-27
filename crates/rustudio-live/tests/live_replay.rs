@@ -330,11 +330,12 @@ fn ingest_outcomes_name_what_each_packet_did() {
         matches!(
             first,
             IngestOutcome::SchemaInstalled {
-                classes: 3,
+                classes: 4,
                 properties: 2
             }
         ),
-        "the schema packet installs three classes and two properties: {first:?}"
+        "the schema packet installs four classes — one per container, plus the \
+         Part — and two properties: {first:?}"
     );
     let second = core.ingest(&packets.next().unwrap().1).unwrap();
     assert!(
