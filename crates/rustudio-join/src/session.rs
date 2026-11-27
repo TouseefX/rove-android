@@ -24,6 +24,7 @@
 
 use std::fmt;
 
+use rove_client_core::journal::ReaderId;
 use rove_client_core::session::{IngestOutcome, SessionCore};
 use rustudio_core::doc::Document;
 use rustudio_live::live::{ApplyStats, Live};
@@ -115,7 +116,9 @@ pub struct Session {
     /// cannot diverge in how they read the decoder's output.
     live: Live,
     converter: ValueConverter,
-    reader: u64,
+    /// Opaque journal handle, as rove hands it out. The read cursor is the
+    /// sequence number, which is a `u64`.
+    reader: ReaderId,
     cursor: u64,
     pub ingested: Ingested,
     pub applied: ApplyStats,
@@ -223,7 +226,7 @@ impl Session {
             .unwrap_or(0)
     }
 
-    pub fn journal_records(&self) -> u64 {
+    pub fn journal_records(&self) -> usize {
         self.core.journal_stats().records
     }
 
@@ -235,6 +238,14 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // A reader lease holds journal entries alive; releasing it here keeps a
+        // long-lived session from pinning rows it has already applied.
+        let _ = self.core.release(self.reader);
     }
 }
 

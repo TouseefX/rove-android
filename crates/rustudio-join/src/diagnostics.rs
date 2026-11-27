@@ -68,7 +68,7 @@ impl Report {
     }
 
     /// Record a step that succeeded, with a note that is safe to show.
-    pub fn ok(&mut self, name: &'static str, note: impl Into<String>) -> &mut Self {
+    pub fn ok(&mut self, name: &'static str, note: impl Into<String>) {
         self.push(
             Step {
                 name,
@@ -79,9 +79,10 @@ impl Report {
         )
     }
 
-    /// Record a step that failed. A report keeps going after a failure so the
-    /// overlay can show what was tried, but [`Report::failed`] then answers yes.
-    pub fn failed(&mut self, name: &'static str, why: impl Into<String>) -> &mut Self {
+    /// Record a step that failed. The report keeps going after a failure so the
+    /// overlay can show what was tried; [`Report::failed_step`] then answers
+    /// with it.
+    pub fn failed(&mut self, name: &'static str, why: impl Into<String>) {
         self.push(
             Step {
                 name,
@@ -93,7 +94,7 @@ impl Report {
     }
 
     /// A step reached but not finished: the overlay draws it as waiting.
-    pub fn waiting(&mut self, name: &'static str) -> &mut Self {
+    pub fn waiting(&mut self, name: &'static str) {
         self.push(
             Step {
                 name,
@@ -115,11 +116,11 @@ impl Report {
     }
 
     pub fn failed_any(&self) -> bool {
-        self.failed().is_some()
+        self.failed_step().is_some()
     }
 
     /// The first step that failed, if any.
-    pub fn failed(&self) -> Option<&Step> {
+    pub fn failed_step(&self) -> Option<&Step> {
         self.steps.iter().find(|step| step.outcome.is_failed())
     }
 
@@ -167,7 +168,7 @@ impl Report {
     /// The one sentence to show when the join failed, or `None` when it has
     /// not failed.
     pub fn verdict(&self) -> Option<String> {
-        self.failed().map(|step| {
+        self.failed_step().map(|step| {
             match &step.outcome {
                 Outcome::Failed(why) => format!("{} failed: {why}", step.name),
                 _ => unreachable!("only a failed step is returned"),
@@ -183,12 +184,11 @@ mod tests {
     #[test]
     fn a_finished_join_reads_as_its_stages_in_order() {
         let mut report = Report::begin(1818);
-        report
-            .ok("sign in", "user 424242")
-            .ok("allocate", "203.0.113.9:443, 2 pins, token yes")
-            .ok("connect", "webtransport")
-            .ok("log in", "5 packets")
-            .waiting("receive");
+        report.ok("sign in", "user 424242");
+        report.ok("allocate", "203.0.113.9:443, 2 pins, token yes");
+        report.ok("connect", "webtransport");
+        report.ok("log in", "5 packets");
+        report.waiting("receive");
         let lines = report.lines();
         assert!(lines[0].starts_with("join 1818: in progress"), "{lines:?}");
         let text = lines.join("\n");
@@ -202,9 +202,8 @@ mod tests {
     #[test]
     fn a_failed_join_names_the_step_and_stops_naming_later_ones() {
         let mut report = Report::begin(1818);
-        report
-            .ok("sign in", "user 424242")
-            .failed("allocate", "the account needs a challenge");
+        report.ok("sign in", "user 424242");
+        report.failed("allocate", "the account needs a challenge");
         assert_eq!(
             report.verdict().as_deref(),
             Some("allocate failed: the account needs a challenge")

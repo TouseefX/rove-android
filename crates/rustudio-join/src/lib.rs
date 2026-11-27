@@ -34,6 +34,7 @@
 
 pub mod allocation;
 pub mod diagnostics;
+pub mod login;
 // The session's state machine (stage, counters, feed) is not behind a feature:
 // the live transport is, but what a session *does* with bytes is testable
 // everywhere, and that is the half the recording proves.
