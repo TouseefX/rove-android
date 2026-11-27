@@ -245,6 +245,19 @@ pub(crate) fn retain_issued_game_fields(join: &serde_json::Map<String, Value>) -
     Value::Object(fields)
 }
 
+/// What the join tells the server about the client.
+///
+/// These are rove's own strings, character for character, and deliberately not
+/// `cfg!(target_os=...)`: the platform in packet 144 is part of what the server
+/// reads, the reference vectors were produced with exactly these, and a client
+/// that claims a platform it has not been tested as is a wire change. An
+/// Android build is the interesting case (there is no `Android` value here),
+/// and that is a decision for the join path to make with evidence, not for a
+/// constant to make by accident.
+pub const USER_AGENT: &str = "RobloxProtocolResearch/0.1 (macOS)";
+pub const OS_PLATFORM: &str = "OSX";
+pub const OS_PLATFORM_NAME: &str = "MacOS";
+
 /// Packet `0x90`'s player object, in the order the server expects.
 pub fn player_join_info(
     join: &Value,
@@ -304,29 +317,6 @@ pub fn player_join_info(
     }
     Ok(result)
 }
-
-/// The platform this build claims. A join is platform-typed, and reporting the
-/// platform the binary is actually running on is more honest — and better for
-/// diagnostics — than a fixed string.
-pub const USER_AGENT: &str = "RustudioJoin/0.5 (rustudio)";
-pub const OS_PLATFORM: &str = if cfg!(target_os = "android") {
-    "Android"
-} else if cfg!(target_os = "macos") {
-    "OSX"
-} else if cfg!(target_os = "windows") {
-    "Windows"
-} else {
-    "Linux"
-};
-pub const OS_PLATFORM_NAME: &str = if cfg!(target_os = "android") {
-    "Android"
-} else if cfg!(target_os = "macos") {
-    "MacOS"
-} else if cfg!(target_os = "windows") {
-    "Windows"
-} else {
-    "Linux"
-};
 
 fn insert_or_replace(fields: &mut Vec<(String, Value)>, name: &str, value: Value) {
     if let Some((_, existing)) = fields.iter_mut().find(|(key, _)| key == name) {
