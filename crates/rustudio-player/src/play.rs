@@ -1076,7 +1076,7 @@ impl Game {
         // DataModelPatch.rbxm does not stall wall-clock time between server
         // startup and client join. CoreScripts still start in
         // `setup_client_player` once LocalPlayer exists.
-        let core_scripts = if let Some(cdoc) = client_doc.as_mut() {
+        let mut core_scripts = if let Some(cdoc) = client_doc.as_mut() {
             if rustudio_core::rustudio_settings::core_scripts()
                 && (rustudio_core::core_scripts::patch_path().is_some()
                     || rustudio_core::rustudio_settings::core_scripts_forced())
@@ -1283,7 +1283,7 @@ impl Game {
             rustudio_core::load_trace::mark("play: player added");
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
             rustudio_core::load_trace::mark("play: client queries warmed");
-            self.setup_client_player(core_scripts);
+            self.setup_client_player(core_scripts.take());
             // Client CoreScripts startup ran synchronously after server scripts
             // started (still at s.time == 0, before frame 1). Re-anchor server
             // timer wall clocks so server waits do not burst-fire on frame 1.
@@ -1315,7 +1315,7 @@ impl Game {
             // character: the character is the server's, and it arrives through
             // the deltas like everything else.
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
-            self.setup_client_player(core_scripts);
+            self.setup_client_player(core_scripts.take());
             rustudio_core::load_trace::mark("play: live client player set up");
             if self.play_shows_client {
                 self.show_play_side(Side::Client, host);
