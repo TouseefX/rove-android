@@ -1151,7 +1151,10 @@ impl Game {
         // set it, the client's queries and the physics read it.
         let mut client = client;
         let groups = rustudio_core::collision_groups::shared();
-        for w in [server.world.as_mut(), client.as_mut().and_then(|c| c.world.as_mut())]
+        for w in [
+            server.as_mut().and_then(|s| s.world.as_mut()),
+            client.as_mut().and_then(|c| c.world.as_mut()),
+        ]
             .into_iter()
             .flatten()
         {
