@@ -92,24 +92,34 @@ fn the_session_reaches_the_world_the_offline_replay_proved() {
 
     // The bridge's own counters: the removal destroyed one instance.
     assert_eq!(session.applied.removed, 1, "{:?}", session.applied);
-    assert!(session.journal_records() > 0);
+    // Rows were read and acknowledged (so pruned); nothing was rejected.
+    assert!(session.acknowledged_through > 0);
     assert_eq!(session.rejected(), 0);
 }
 
 #[test]
-fn the_journal_holds_four_receipts_for_five_packets() {
+fn the_journal_commits_four_receipts_for_five_packets_and_prunes_them() {
     let session = replayed();
     // A schema installs the decoder and commits no world, so it is the one
     // accepted packet with no receipt; the globals and three replications are
     // the four rows.
     assert_eq!(
-        session.journal_rows(),
-        4,
-        "one receipt per committed packet, and a schema commits nothing"
-    );
-    assert_eq!(
         session.ingested.without_actions, 1,
         "the schema is the packet with no actions"
+    );
+    // Those four rows were all read, so all four are acknowledged, so the
+    // journal has pruned them: `records` is *retained* records, not a lifetime
+    // count. This is the fix under test, and asserting 4 here is what let the
+    // leak hide — a session that never acknowledges reads as "4 retained" for
+    // ever, then as `Backpressure` on a real server.
+    assert_eq!(
+        session.journal_rows(),
+        0,
+        "everything read is acknowledged and pruned"
+    );
+    assert_eq!(
+        session.acknowledged_through, session.cursor,
+        "and the acknowledgment is the cursor"
     );
 }
 
@@ -307,7 +317,18 @@ fn the_drain_keeps_up_with_more_rows_than_one_read_returns() {
         session.journal_records(),
         "the two names for one number agree"
     );
-    assert!(session.journal_rows() > 0);
+    // Retained, not total: every row this recording committed was read by the
+    // drain, so the journal pruned all of them and holds none. A non-zero
+    // count here is a session that read without acknowledging.
+    assert_eq!(
+        session.journal_rows(),
+        0,
+        "read rows are pruned, not retained"
+    );
+    assert!(
+        session.acknowledged_through > 0,
+        "and there were rows to prune"
+    );
 }
 
 #[test]

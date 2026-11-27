@@ -177,6 +177,9 @@ pub struct Session {
     /// a join is measured against wall time, not against packets.
     pub started: std::time::Instant,
     pub acknowledged_through: u64,
+    /// Rows applied over the session's life. Distinct from the journal's
+    /// retained count, which prunes to zero as the session keeps up.
+    pub rows_applied: u64,
     pub acknowledged_errors: usize,
     /// Ping packets that carried no request (a pure reply packet) and those
     /// whose request this client cannot answer truthfully. Both counted so a
@@ -263,6 +266,7 @@ impl Session {
             markers: 0,
             marker_refused: 0,
             started: std::time::Instant::now(),
+            rows_applied: 0,
             acknowledged_through: 0,
             acknowledged_errors: 0,
             ping_unanswered: 0,
@@ -650,8 +654,14 @@ impl Session {
             pings: self.pings,
             sync_requests: self.sync_requests,
             sync_replies: self.sync_replies,
-            rows: self.journal_rows(),
+            // Cumulative, not retained: the journal now prunes what was read, so
+            // `journal_rows()` is almost always 0. The overlay's "rows" is what
+            // the session has *applied*, which is the number that tells a
+            // person the world is moving.
+            rows: self.rows_applied as usize,
             markers: self.markers,
+            acked: self.acknowledged_through,
+            journal: self.journal_rows(),
             replies_sent: self.replies_sent,
             replies_failed: self.replies_failed,
             // The session's own elapsed time. It was hardcoded to 0, so every
@@ -694,6 +704,7 @@ impl Session {
                 .unwrap_or_default();
             self.cursor = row.sequence;
             through = row.sequence;
+            self.rows_applied += 1;
             if actions.is_empty() {
                 self.ingested.without_actions += 1;
                 continue;

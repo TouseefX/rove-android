@@ -80,6 +80,11 @@ pub struct Counters {
     /// session with markers and no replies is one the server will throttle, and
     /// the two numbers next to each other are how that is seen.
     pub markers: usize,
+    /// The journal sequence acknowledged, and the retained record count. A
+    /// session whose retained count climbs while `acked` stands still is one
+    /// whose journal is about to refuse packets.
+    pub acked: u64,
+    pub journal: usize,
     pub replies_sent: usize,
     pub replies_failed: usize,
     pub seconds: u64,
@@ -91,7 +96,7 @@ impl Counters {
     pub fn line(&self) -> String {
         format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
-             markers {}/{} · {} s",
+             acked {}/{} held · markers {}/{} · {} s",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -100,6 +105,8 @@ impl Counters {
             self.released,
             self.refused,
             self.rows,
+            self.acked,
+            self.journal,
             self.markers,
             self.replies_sent,
             self.seconds
