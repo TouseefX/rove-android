@@ -428,6 +428,13 @@ fn every_applied_delta_is_marked_for_the_scene() {
     let mut conv = ValueConverter::default();
     let mut live = Live::new();
 
+    // Prime the reader, exactly as the renderer does on its first frame: a
+    // reader that has never read is owed `Marks::All` by design (it has no
+    // scene to update incrementally), so the first read is taken and dropped
+    // here. What is asserted below is every read *after* that one — which is
+    // the steady state a live session actually runs in.
+    let _ = doc.marks_for(Reader::Scene);
+
     // Walk the recording packet by packet, taking the marks after each one: a
     // batch's marks are the whole point, and reading them per packet is the
     // only way to say which packet produced them.

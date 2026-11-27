@@ -152,10 +152,15 @@ impl Editor {
     /// redraws them and nothing else. `mark_all()` is never called on this path:
     /// a full rebuild every frame is the opposite of a live session.
     pub fn live_join_frame(&mut self) {
-        let Some(join) = self.join_win.join.as_ref() else {
-            return;
-        };
-        let Some(live) = join.live().cloned() else {
+        // The channel is cloned out in its own statement, so the borrow of
+        // `join_win` ends here: everything below writes to the editor, and a
+        // live borrow of the window would forbid it.
+        let Some(live) = self
+            .join_win
+            .join
+            .as_ref()
+            .and_then(|join| join.live())
+        else {
             return;
         };
         // Nothing waiting: the common case, and the reason this is cheap enough
@@ -185,7 +190,7 @@ impl Editor {
         }
         self.join_win.live_local = Some(live_local);
         self.join_win.live_converter = converter;
-        self.live_applied += written;
+        self.join_win.live_applied += written;
         if !self.join_win.installed {
             // The first instances are in the editor: from here on this is a
             // place being played, not a join being watched.
@@ -226,7 +231,7 @@ impl Editor {
         self.info(format!(
             "join live: {} · {} written here{}",
             counters.line(),
-            self.live_applied,
+            self.join_win.live_applied,
             if dropped > 0 {
                 format!(" · {dropped} batch(es) dropped")
             } else {
@@ -247,11 +252,21 @@ impl Editor {
                 // A place still loading would defer the Play and lose it.
                 self.join_win.play_next_tick = true;
             } else {
-                // `rustudio_engine::runtime::RunMode`, not `crate::runtime`'s:
-                // `start_play` and `play_when_loaded` use the engine's enum,
-                // and the two are separate types with the same variant names.
-                self.start_play(rustudio_engine::runtime::RunMode::Play);
-                self.info("join: playing the joined place (Shift+F5 stops it)");
+                // `RunMode::Client`, not `RunMode::Play`. `Play` is Play *Solo*:
+                // it clones the edit DataModel into a local server, runs that
+                // server's `Script`s and spawns a character from the place's own
+                // SpawnLocation. A person who joined someone else's place is not
+                // running that place — a server somewhere else is — and a local
+                // copy of it is a second world that nothing replicates to. The
+                // native client has no local server at all; it draws the
+                // replicated DataModel and binds to the character the server
+                // makes.
+                //
+                // (`rustudio_engine::runtime::RunMode`, not `crate::runtime`'s:
+                // `start_play` and `play_when_loaded` use the engine's enum, and
+                // the two are separate types with the same variant names.)
+                self.start_play(rustudio_engine::runtime::RunMode::Client);
+                self.info("join: entered the placed live (Shift+F5 leaves)");
             }
         }
         let mut open = self.join_win.open;

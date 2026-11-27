@@ -532,7 +532,9 @@ impl Session {
             }
             .to_string(),
             packets: self.ingested.packets,
-            applied: self.applied.created + self.applied.properties,
+            schema: self.ingested.schema,
+            globals: self.ingested.globals,
+            replication: self.ingested.replication,
             refused: self.ingested.refused,
             held: self.held,
             released: self.released,
@@ -542,7 +544,7 @@ impl Session {
             pings: self.pings,
             sync_requests: self.sync_requests,
             sync_replies: self.sync_replies,
-            schedule: self.journal_rows() as u64,
+            rows: self.journal_rows(),
             seconds: 0,
         }
     }

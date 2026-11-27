@@ -1148,6 +1148,7 @@ impl Game {
         self.info(match mode {
             RunMode::Play => "▶ Play: a server and a client are running; WASD + Space to move, Shift+F5 to stop",
             RunMode::Run => "▶ Run: server scripts and physics running (no client, no character), Shift+F5 to stop",
+            RunMode::Client => "▶ Live: the server's world, its character; WASD + Space to move, Shift+F5 to leave",
             RunMode::Edit => "",
         });
 
@@ -5094,6 +5095,9 @@ impl Game {
     pub fn play_sides(&self) -> Vec<Side> {
         match self.play.as_ref() {
             Some(s) if s.mode == RunMode::Play => vec![Side::Server, Side::Client],
+            // A networked client has no server side at all: the world it draws
+            // is the remote one, replicated into its document.
+            Some(s) if s.mode == RunMode::Client => vec![Side::Client],
             Some(_) => vec![Side::Server],
             None => Vec::new(),
         }

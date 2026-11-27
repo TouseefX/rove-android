@@ -135,12 +135,13 @@ pub struct Join {
     /// The session's document, once there is one. `None` until then, so a
     /// caller can wait for a world before replacing what it shows.
     ///
-    /// For a *live* join this is the fallback, not the path: `handover` carries
-    /// the world every frame the session runs, and this holds it only when the
-    /// session has ended.
+    /// For a *live* join this is never used: the editor builds the world from
+    /// the deltas `handover` publishes, so there is one document per side and
+    /// nothing to hand over when the session ends.
     document: Arc<Mutex<Option<rustudio_core::doc::Document>>>,
-    /// The world handover, for a caller that draws while the session runs
-    /// (M3). `None` for a bounded join, which has nothing to hand over.
+    /// The delta stream, for a caller that draws while the session runs (M3).
+    /// `None` for a bounded join, which builds the place on this side and hands
+    /// it over at the end.
     handover: Option<crate::live_world::LiveWorld>,
 }
 
@@ -511,11 +512,10 @@ fn run(
     // The world is handed over before the counters: a caller that sees a
     // finished report can then take a consistent document.
     //
-    // A live session has already given its world away — the caller has been
-    // drawing it for as long as the session ran — so there is nothing left to
-    // take here, and taking it would replace a world the caller is using with
-    // an empty one. `document` stays for the bounded join (M2), where the place
-    // genuinely does arrive at the end.
+    // A live session has been publishing deltas the whole time and the editor
+    // has been applying them to its own document, so there is no document to
+    // hand over here: the two sides disagree about nothing. `document` stays for
+    // the bounded join (M2), where the place genuinely does arrive at the end.
     if let Some(live) = handover {
         // A live session has been publishing deltas the whole time, and the
         // editor has been applying them: there is no document to hand over at

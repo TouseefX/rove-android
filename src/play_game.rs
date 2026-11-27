@@ -969,7 +969,7 @@ impl Editor {
         let reqs = {
             let Some(s) = self.play.as_mut() else { return };
             let w = match side {
-                Side::Server => s.server.world.as_mut(),
+                Side::Server => s.server.as_mut().and_then(|v| v.world.as_mut()),
                 Side::Client => s.client.as_mut().and_then(|c| c.world.as_mut()),
             };
             match w {
@@ -1684,7 +1684,7 @@ impl Editor {
         s.client
             .as_ref()
             .and_then(|c| c.world.as_ref())
-            .or(s.server.world.as_ref())
+            .or(s.server.as_ref().and_then(|v| v.world.as_ref()))
             .and_then(|w| w.input.sound_listener)
     }
     fn start_sound(&mut self, key: u64) {
@@ -1852,7 +1852,7 @@ impl Editor {
         f: impl Fn(&mut crate::runtime::ext::Inputs, Ref),
     ) {
         let Some(s) = self.play.as_mut() else { return };
-        if let (Some(r), Some(w)) = (server, s.server.world.as_mut()) {
+        if let (Some(r), Some(w)) = (server, s.server.as_mut().and_then(|v| v.world.as_mut())) {
             f(&mut w.input, r);
         }
         if let (Some(r), Some(w)) = (client, s.client.as_mut().and_then(|c| c.world.as_mut())) {
@@ -2138,7 +2138,11 @@ impl Editor {
             .play
             .as_ref()
             .map(|s| {
-                let server = s.server.world.as_ref().map(|w| &w.requests.sounds);
+                let server = s
+                    .server
+                    .as_ref()
+                    .and_then(|v| v.world.as_ref())
+                    .map(|w| &w.requests.sounds);
                 let client = s
                     .client
                     .as_ref()

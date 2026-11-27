@@ -1007,6 +1007,9 @@ impl Editor {
             let instances = self.game.doc.dom.descendants_of(self.game.doc.dom.root_ref()).count() as i64;
             let (models, players) = match self.game.play.as_ref() {
                 Some(p) if p.mode == rustudio_engine::runtime::RunMode::Play => (3, 1),
+                // A live session is one client and one player, with no server
+                // of its own to count.
+                Some(p) if p.mode == rustudio_engine::runtime::RunMode::Client => (2, 0),
                 Some(_) => (2, 0),
                 None => (1, 0),
             };

@@ -57,6 +57,18 @@ pub enum RunMode {
     /// The edit DataModel: only plugins run (src/plugin_host); RunService
     /// answers Studio's edit values (IsEdit, IsClient and IsServer true).
     Edit,
+    /// A **networked client**, as the Roblox player is: no local server
+    /// DataModel, no server `Script`s, no locally spawned character. The
+    /// DataModel is the replicated one, the character is the one the server
+    /// makes, and `RunService:IsServer()` is false on both sides because there
+    /// is only one.
+    ///
+    /// This exists because `Play` is Play *Solo*: it copies the edit DataModel
+    /// into a local server, runs that server's scripts and spawns a character
+    /// from the place's own SpawnLocation. A person who joined someone else's
+    /// place is not running that place — the server is — and a local copy of it
+    /// is a second world that nothing replicates to.
+    Client,
 }
 
 /// Which DataModel a runtime drives in a Play session.
@@ -316,7 +328,14 @@ impl World {
         };
         let enabled = !matches!(d.prop(r, "Disabled"), Some(Variant::Bool(true)))
             && !matches!(d.prop(r, "Enabled"), Some(Variant::Bool(false)));
-        if !enabled || self.mode != RunMode::Play && self.side == Side::Client {
+        // A client side only runs scripts in a mode that has one: `Play` runs a
+        // client beside the server, and `Client` *is* a client (a native one,
+        // attached to a remote server). Anything else on a client side is a
+        // leftover and starts nothing.
+        if !enabled
+            || !matches!(self.mode, RunMode::Play | RunMode::Client)
+                && self.side == Side::Client
+        {
             return false;
         }
         // In edit mode no place script runs; the plugin host starts plugin
