@@ -233,6 +233,18 @@ impl Editor {
                 "join: the world is here ({} instance(s)); it keeps arriving while you play",
                 self.game.doc.dom.len()
             ));
+            // **And enter it.** Installing the world is not playing it: the
+            // document sits in the editor looking like an opened `.rbxl`, with
+            // the explorer, the tabs and no camera bound to a character, which
+            // is exactly what a person who joined someone's place must not see.
+            // `play_next_tick` was only ever set by the *button*, so an
+            // automatic join arrived at the world and stopped there.
+            //
+            // Deferred by a frame for the same reason the button's path is: the
+            // install gave `set_document` a document, and Play reads it.
+            if self.game.play.is_none() {
+                self.join_win.play_next_tick = true;
+            }
         }
         self.live_join_overlay();
     }

@@ -149,7 +149,9 @@ pub struct Session {
     /// Opaque journal handle, as rove hands it out. The read cursor is the
     /// sequence number, which is a `u64`.
     reader: ReaderId,
-    cursor: u64,
+    /// The last applied journal sequence: the read cursor, and what every
+    /// acknowledgment names after its batch has been applied.
+    pub cursor: u64,
     pub ingested: Ingested,
     pub applied: ApplyStats,
     pub stage: Stage,
@@ -168,6 +170,14 @@ pub struct Session {
     pub markers: usize,
     /// Marker requests that could not be answered (an unreadable one).
     pub marker_refused: usize,
+    /// The highest journal sequence acknowledged, and how many acknowledgments
+    /// failed. The journal prunes behind the acknowledgment, so a session whose
+    /// `acknowledged_through` is stuck at 0 is one the journal will fill.
+    /// When this session was created. The overlay's `seconds` is read from it:
+    /// a join is measured against wall time, not against packets.
+    pub started: std::time::Instant,
+    pub acknowledged_through: u64,
+    pub acknowledged_errors: usize,
     /// Ping packets that carried no request (a pure reply packet) and those
     /// whose request this client cannot answer truthfully. Both counted so a
     /// session with pings and no replies names the reason.
@@ -252,6 +262,9 @@ impl Session {
             features: 0,
             markers: 0,
             marker_refused: 0,
+            started: std::time::Instant::now(),
+            acknowledged_through: 0,
+            acknowledged_errors: 0,
             ping_unanswered: 0,
             ping_refused: 0,
             integrity_status: 0,
@@ -641,7 +654,11 @@ impl Session {
             markers: self.markers,
             replies_sent: self.replies_sent,
             replies_failed: self.replies_failed,
-            seconds: 0,
+            // The session's own elapsed time. It was hardcoded to 0, so every
+            // overlay line read "0 s" for a session that had been joined for
+            // forty seconds — the one number a person uses to tell "still
+            // joining" from "stuck" was the one number that never moved.
+            seconds: self.started.elapsed().as_secs(),
         }
     }
 
@@ -655,6 +672,19 @@ impl Session {
             }
         };
         let read = rows.len();
+        // The highest sequence this batch got through, applied or not: the
+        // journal prunes behind a reader's *acknowledgment*, and this session
+        // never made one. So every record retained since the join stayed
+        // retained, and at 1277 records / 8.4 MB the journal refused the next
+        // packet — "journal is full while a reader needs retained data" — and
+        // after that refused every packet, which is exactly what a stuck join
+        // looks like from the outside: packets arriving, rows counted, the world
+        // frozen at 2039 instances.
+        //
+        // Acknowledging `self.cursor` *after* the row it names has been applied
+        // is the contract the journal documents; acknowledging before applying
+        // would let it prune data this loop still has to read.
+        let mut through = self.cursor;
         for row in rows {
             // `SessionDelta` derefs to rove's delta JSON, so this is the
             // actions array rather than a field of the record.
@@ -663,6 +693,7 @@ impl Session {
                 .cloned()
                 .unwrap_or_default();
             self.cursor = row.sequence;
+            through = row.sequence;
             if actions.is_empty() {
                 self.ingested.without_actions += 1;
                 continue;
@@ -685,6 +716,17 @@ impl Session {
                 row.sequence,
                 stats
             );
+        }
+        if read > 0 {
+            if let Err(error) = self.core.acknowledge(self.reader, through) {
+                // Acknowledgment that fails is not fatal — the world it named is
+                // already applied — but it is the one error that makes the
+                // journal grow without bound, so it is counted and said out loud.
+                self.acknowledged_errors += 1;
+                log::warn!("session: journal acknowledgment failed: {error}");
+            } else {
+                self.acknowledged_through = through;
+            }
         }
         read
     }

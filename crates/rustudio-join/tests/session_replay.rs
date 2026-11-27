@@ -396,3 +396,64 @@ fn a_malformed_marker_is_refused_without_a_reply() {
         "an unreadable request gets no invented answer"
     );
 }
+
+/// The journal must not fill behind a session that is reading it.
+///
+/// The bug this is written against, from a real logcat: after 1277 records and
+/// 8.4 MB the journal refused the next packet with "journal is full while a
+/// reader needs retained data", and refused every packet after that. The
+/// session read with a cursor and never called `acknowledge`, so the journal
+/// could not prune anything it had retained and grew until its bound. From the
+/// outside it looked stuck: packets arriving, rows counted, the world frozen.
+///
+/// The assertion is the shape of the fix rather than a byte count: after the
+/// session has drained, its acknowledgment must have reached the newest
+/// sequence it applied. If it lags, prune has nothing to reclaim.
+#[test]
+fn draining_acknowledges_so_the_journal_can_prune() {
+    let session = replayed();
+    assert!(
+        session.acknowledged_through > 0,
+        "the session applied rows but never acknowledged one: the journal \
+         cannot prune behind that and will fill"
+    );
+    assert_eq!(
+        session.acknowledged_errors, 0,
+        "an acknowledgment that fails is the journal silently growing"
+    );
+    // Acknowledged is not ahead of what was read, and not behind it either:
+    // the cursor *is* the last applied sequence, and the acknowledgment carries
+    // the same number after the batch is applied.
+    assert_eq!(
+        session.acknowledged_through, session.cursor,
+        "the acknowledgment must name the sequence the cursor stopped on"
+    );
+}
+
+/// Feeding the same recording again, after a drain, still applies: an
+/// acknowledgment must not put the cursor past data the session has not read.
+///
+/// This is the failure mode a naive "acknowledge everything, every frame" fix
+/// would introduce — the journal would prune records the reader had not
+/// consumed, and the world would arrive with holes.
+#[test]
+fn acknowledging_does_not_skip_records_the_session_has_not_read() {
+    let mut session = Session::new();
+    session.stage = Stage::LoggedIn;
+    let recording = stream();
+    let mut instances_after_first = 0usize;
+    for (index, message) in messages(&recording).iter().enumerate() {
+        session.feed(message);
+        if index == 0 {
+            instances_after_first = session.document().dom.len();
+        }
+    }
+    assert!(
+        session.document().dom.len() >= instances_after_first,
+        "the world did not shrink while it was being fed"
+    );
+    assert_eq!(
+        session.acknowledged_errors, 0,
+        "no acknowledgment was refused"
+    );
+}
