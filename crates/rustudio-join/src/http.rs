@@ -29,6 +29,21 @@ const MAX_COOKIE: usize = 32 * 1024;
 const MAX_REQUEST: usize = 1024 * 1024;
 const TIMEOUT_SECS: u64 = 20;
 
+/// The same headers on either request builder.
+///
+/// ureq 3's `RequestBuilder` is generic over whether a body has been attached,
+/// so this cannot be a closure: a closure infers `B` from its first use and
+/// then refuses the other one.
+fn with_headers<B>(
+    mut request: ureq::RequestBuilder<B>,
+    headers: &[(String, String)],
+) -> ureq::RequestBuilder<B> {
+    for (key, value) in headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+    request
+}
+
 /// A credential whose value is never printed.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Secret(String);
@@ -159,17 +174,11 @@ impl AccountSession {
             // and sends its own. A POST always carries a body — an empty object
             // when the caller passed none — because the endpoints in play read
             // the content type.
-            let with_headers = |mut request: ureq::RequestBuilder<_>| {
-                for (key, value) in &headers {
-                    request = request.header(key.as_str(), value.as_str());
-                }
-                request
-            };
             let result = if method == "GET" {
-                with_headers(self.agent.get(&url)).call()
+                with_headers(self.agent.get(&url), &headers).call()
             } else {
                 let bytes = body.clone().unwrap_or_else(|| b"{}".to_vec());
-                with_headers(self.agent.post(&url)).send(bytes.as_slice())
+                with_headers(self.agent.post(&url), &headers).send(bytes.as_slice())
             };
             let mut response = result.map_err(|_| AllocationError::new("HTTPS request failed"))?;
             let status = response.status().as_u16();
