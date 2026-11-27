@@ -31,9 +31,11 @@ fn a_join_with_no_account_stops_at_sign_in_and_says_so() {
 }
 
 #[test]
-fn a_cookie_that_is_not_a_cookie_is_refused_before_any_request() {
-    // A newline would be a request split; `AccountSession::new` refuses it, and
-    // the report must say so rather than claim a network failure.
+fn a_cookie_that_cannot_go_into_a_header_fails_at_sign_in_not_at_the_join() {
+    // A space or a newline in the value would be a request split;
+    // `AccountSession::new` refuses it, and the step that reports it must be
+    // sign in — a failure attributed to "join" says nothing about where it
+    // happened.
     let join = rustudio_join::join::start(1818, 1, || Some("not a cookie".to_owned()));
     let deadline = Instant::now() + Duration::from_secs(10);
     while join.running() && Instant::now() < deadline {
@@ -41,13 +43,15 @@ fn a_cookie_that_is_not_a_cookie_is_refused_before_any_request() {
     }
     let report = join.report().expect("a report");
     let verdict = report.verdict().expect("a failed step");
-    // "not a cookie" is all printable ASCII, so it is a *request*: it is the
-    // host allowlist and then Roblox that decide. What must not happen is the
-    // report holding the value.
+    assert_eq!(
+        verdict,
+        "sign in failed: Cookie must contain only the .ROBLOSECURITY value"
+    );
+    assert_eq!(report.stage, "sign in");
+    // And the value itself is nowhere in what an overlay draws.
     for line in report.lines() {
         assert!(!line.contains("not a cookie"), "the cookie value must not appear: {line}");
     }
-    assert!(verdict.starts_with("sign in failed:"), "{verdict}");
 }
 
 #[test]

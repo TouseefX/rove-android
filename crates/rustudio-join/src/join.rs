@@ -196,7 +196,17 @@ fn run(
 ) -> Result<(), String> {
     // 1. Sign in. The value is used here and nowhere else.
     let mut account = match cookie() {
-        Some(raw) => AccountSession::new(&raw).map_err(|error| error.to_string())?,
+        // A value that cannot go into a header is a sign-in problem, not a
+        // network one: say so here rather than let it fall out of `?` and be
+        // reported against the join as a whole.
+        Some(raw) => match AccountSession::new(&raw) {
+            Ok(account) => account,
+            Err(error) => {
+                let why = describe(&error);
+                settle(shared, |report| report.failed("sign in", why));
+                return Ok(());
+            }
+        },
         None => {
             settle(shared, |report| {
                 report.failed("sign in", "no account is signed in");
