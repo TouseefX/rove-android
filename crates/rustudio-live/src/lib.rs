@@ -15,7 +15,7 @@
 //! The live half is M2: [`live::Live`] applies replication as it arrives — a
 //! create, a set, a parent edge, a remove — to a world that is already being
 //! drawn, in rove's own action vocabulary (`create`/`set`/`remove`/`event`).
-//! It shares [`snapshot::ValueConverter`] and the id ⇄ `Ref` map with the
+//! It shares [`snapshot::ValueConverter`] and the id and `Ref` map with the
 //! offline half, so a value or an id means the same thing whichever way it
 //! arrived.
 

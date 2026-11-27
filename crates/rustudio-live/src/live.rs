@@ -123,7 +123,7 @@ impl ApplyStats {
     }
 }
 
-/// The id ⇄ `Ref` mapping a live session adds to a built world, and the one
+/// The id to `Ref` mapping a live session adds to a built world, and the one
 /// place actions are applied.
 ///
 /// It borrows nothing: the document is passed in on every call, because a live

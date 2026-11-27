@@ -291,7 +291,9 @@ impl Editor {
         clip.text(
             Pos2::new(x0 + 2.0, top + 231.0),
             egui::Align2::LEFT_CENTER,
-            format!("\u{23E3}{}", view.robux),
+            // The Robux mark is U+23E3, which the text faces do not carry; the
+            // bundled icon set's coin is what the menu shows instead.
+            format!("{}{}", crate::ti::glyph("coin").expect("coin").0, view.robux),
             font(&ctx, 16.0, Weight::Regular),
             white(0.85),
         );
@@ -310,7 +312,7 @@ impl Editor {
                     white(1.0),
                 );
                 let p = match price {
-                    Some(p) => format!("\u{23E3}{p}"),
+                    Some(p) => format!("{}{p}", crate::ti::glyph("coin").expect("coin").0),
                     None => "Off sale".to_string(),
                 };
                 clip.text(

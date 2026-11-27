@@ -30,6 +30,14 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                 };
                 for ch in value.chars().filter(|c| !c.is_ascii()) {
                     let file = path.file_name().unwrap().to_str().unwrap();
+                    // A char literal in a test module is fixture data, not UI
+                    // text: the colour-glyph and ligature tests use private-use
+                    // codepoints as map keys, and no font is asked to draw them.
+                    if path.components().any(|c| c.as_os_str() == "tests")
+                        && matches!(value, syn::Lit::Char(_))
+                    {
+                        continue;
+                    }
                     if matches!(
                         (file, ch),
                         // Unicode transport/segmentation test data.

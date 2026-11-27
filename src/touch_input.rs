@@ -742,7 +742,8 @@ impl Touch {
             painter.text(
                 j.center(),
                 egui::Align2::CENTER_CENTER,
-                "⤒",
+                // U+2912 is not in the text faces; the icon set's arrow is.
+                crate::ti::glyph("arrow-bar-to-up").expect("arrow").0,
                 egui::FontId::proportional(26.0),
                 Color32::from_rgba_unmultiplied(255, 255, 255, 190),
             );
