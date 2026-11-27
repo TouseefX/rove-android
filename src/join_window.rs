@@ -1073,7 +1073,7 @@ impl Editor {
         // the whole window, not the dock's 3D view with Studio around it. That
         // is also what makes the joining cover a cover — and it is what
         // `play_full_frame` (no Stop or Studio buttons for a live client) draws.
-        self.game.ui.play_full = true;
+        self.ui.play_full = true;
         self.play_full_exit = false;
         // The cover goes up now, on the tap, not when the first packet lands:
         // what it is hiding is the *editor*, and the editor is what is on
