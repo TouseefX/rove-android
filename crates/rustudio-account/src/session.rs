@@ -75,7 +75,14 @@ impl Cookie {
         (!v.is_empty()).then(|| Cookie(v.to_string()))
     }
 
-    pub(crate) fn header(&self) -> String {
+    /// The value of the `Cookie` header this cookie is sent as.
+    ///
+    /// Public because it is the only way to *use* a cookie: `Display` and
+    /// `Debug` are redacted on purpose, and the one caller outside this crate
+    /// (the player join, `rustudio_join::http::AccountSession`) builds its own
+    /// request and needs the header. Call it where the header is made, not
+    /// where anything might be shown or stored.
+    pub fn header(&self) -> String {
         format!(".ROBLOSECURITY={}", self.0)
     }
 

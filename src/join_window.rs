@@ -42,7 +42,7 @@ fn cookie_source() -> impl FnOnce() -> Option<String> + Send + 'static {
         let client = rustudio_core::assets::session_client()?;
         let client = client.lock().ok()?;
         let client = client.as_ref()?;
-        Some(client.session.cookie().to_header())
+        Some(client.session.cookie().header())
     }
 }
 
