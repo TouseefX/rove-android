@@ -166,6 +166,13 @@ pub struct Session {
     pub features: usize,
     /// Markers the server acknowledged.
     pub markers: usize,
+    /// Marker requests that could not be answered (an unreadable one).
+    pub marker_refused: usize,
+    /// Replies the session wrote back (markers, handshakes) and those the
+    /// transport refused. A session with a rising `replies_failed` is one the
+    /// server will throttle.
+    pub replies_sent: usize,
+    pub replies_failed: usize,
     /// Packets on a channel this client does not dispatch: counted so the
     /// report can name a stream the session saw and did nothing with.
     pub unhandled: usize,
@@ -200,6 +207,14 @@ pub struct Session {
     /// every drain the world here changes hands with the one the renderer is
     /// drawing.
     pub handover: Option<crate::live_world::LiveWorld>,
+    /// Packets this session must send back on `(application, channel)`.
+    ///
+    /// A join is not receive-only: the server asks the client things and waits
+    /// for the answer before it sends the next thing. The marker handshake
+    /// (`132` → `131, 4`) is answered here rather than in the network loop so
+    /// the decision lives next to the packet that caused it, and the loop only
+    /// writes what it finds.
+    pub outbound: Vec<(u8, u32, Vec<u8>)>,
 }
 
 impl Session {
@@ -227,6 +242,9 @@ impl Session {
             pings: 0,
             features: 0,
             markers: 0,
+            marker_refused: 0,
+            replies_sent: 0,
+            replies_failed: 0,
             unhandled: 0,
             streams: 0,
             held: 0,
@@ -237,6 +255,7 @@ impl Session {
             sync_requests: 0,
             sync_replies: 0,
             handover: None,
+            outbound: Vec::new(),
         }
     }
 
@@ -340,11 +359,28 @@ impl Session {
             // The server's feature-name/value table: the one packet that says
             // which encoding the server will use for the session.
             (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 147) => self.features_offered(payload),
-            // A marker: the server telling the client its initial world tag
-            // round-trip succeeded.
+            // A marker round-trip. The server sends `132` and waits for the
+            // reply before it streams: rove's client answers with
+            // `replication_out::marker_reply` (kind 131, sub 4, the marker
+            // echoed, a zero trailer), and a client that only *counted* the
+            // request left the handshake open — the world arrived slowly or not
+            // at all. Answered here, where the request is understood.
             (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 132) => {
                 self.markers += 1;
-                true
+                match rove_client_core::replication_out::marker_reply(payload) {
+                    Ok(reply) => {
+                        self.outbound
+                            .push((application, channel, reply));
+                        true
+                    }
+                    Err(error) => {
+                        // A marker we cannot read is the server's, not a reason
+                        // to drop the session; counted so the report says so.
+                        self.marker_refused += 1;
+                        log::warn!("session: marker request refused: {error}");
+                        false
+                    }
+                }
             }
             _ => {
                 self.unhandled += 1;
@@ -545,6 +581,9 @@ impl Session {
             sync_requests: self.sync_requests,
             sync_replies: self.sync_replies,
             rows: self.journal_rows(),
+            markers: self.markers,
+            replies_sent: self.replies_sent,
+            replies_failed: self.replies_failed,
             seconds: 0,
         }
     }
@@ -900,6 +939,28 @@ pub async fn run(
                     break;
                 };
                 session.feed_on(application, channel, &payload);
+                // Anything the packet asked for, written before the next one is
+                // read: a handshake the server is waiting on must not queue
+                // behind the world it is holding back.
+                if !session.outbound.is_empty() {
+                    for (out_application, out_channel, reply) in session.outbound.drain(..) {
+                        if let Err(error) = sender
+                            .send(out_application, out_channel, &reply)
+                            .await
+                        {
+                            // A reply that cannot be written is counted, not
+                            // fatal: the session keeps reading, and the report
+                            // says the handshake was not answered.
+                            session.replies_failed += 1;
+                            log::warn!(
+                                "session: a reply on {out_application}/{out_channel} could not be \
+                                 sent: {error}"
+                            );
+                        } else {
+                            session.replies_sent += 1;
+                        }
+                    }
+                }
                 // Republished every 16 packets: often enough that the overlay
                 // moves, rarely enough that the lock is not the hot path.
                 fed += 1;

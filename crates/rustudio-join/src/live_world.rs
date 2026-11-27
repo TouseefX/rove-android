@@ -76,6 +76,12 @@ pub struct Counters {
     pub sync_replies: usize,
     /// Journal rows the session has read.
     pub rows: usize,
+    /// Marker round-trips (`132` requests) and the replies written back. A
+    /// session with markers and no replies is one the server will throttle, and
+    /// the two numbers next to each other are how that is seen.
+    pub markers: usize,
+    pub replies_sent: usize,
+    pub replies_failed: usize,
     pub seconds: u64,
 }
 
@@ -84,7 +90,8 @@ impl Counters {
     /// view on a phone, and a wide line is an unreadable one.
     pub fn line(&self) -> String {
         format!(
-            "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · {} s",
+            "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
+             markers {}/{} · {} s",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -93,6 +100,8 @@ impl Counters {
             self.released,
             self.refused,
             self.rows,
+            self.markers,
+            self.replies_sent,
             self.seconds
         )
     }
