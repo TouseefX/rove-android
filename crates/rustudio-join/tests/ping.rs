@@ -130,7 +130,7 @@ fn both_refuse_the_same_packets() {
     // The malformed shapes: no header, no terminator, trailing bytes, a
     // truncated item, an unknown item kind, bad flags, a bad route.
     let malformed: [Vec<u8>; 7] = [
-        vec![0x83, 0],             // 0x83 is a reply's header, not a ping's
+        vec![0x84, 0],             // 0x84 is not the ping header (0x83 is)
         vec![port::PING_HEADER],   // no terminator
         vec![port::PING_HEADER, 0, 1], // bytes after the terminator
         vec![port::PING_HEADER, 5, 0], // truncated item

@@ -26,15 +26,18 @@ pub const MAX_PING_ITEMS: usize = 64;
 pub const PING_APPLICATION: u8 = 4;
 pub const PING_CHANNEL: u32 = 3;
 
-/// The packet header every ping starts with. **131**, not `0x83`: rove's own
-/// `PingCounts::from_packet` refuses anything else, and `0x83` is what a *reply*
-/// to the marker handshake starts with — the two are easy to confuse, and
-/// reading one as the other is a silent no-op.
-pub const PING_HEADER: u8 = 131;
+/// The packet header every ping starts with: `0x83`, which is 131.
+///
+/// Worth writing both ways because the two notations are read apart: rove's
+/// `PingCounts::from_packet` compares against `131`, and `encode_ping_reply`
+/// writes `0x83`. They are the same byte, and a reader who takes "not 0x83" for
+/// "not 131" goes looking for a bug that is not there.
+pub const PING_HEADER: u8 = 0x83;
 const ITEM_REQUEST: u8 = 5;
 const ITEM_RESPONSE: u8 = 6;
-/// The reply's item kind/sub pair, as rove writes it.
-const REPLY_PREFIX: [u8; 3] = [0x83, ITEM_RESPONSE, 1];
+/// The reply prefix, as rove writes it: the same header byte, the response
+/// item kind, and sub-kind 1.
+const REPLY_PREFIX: [u8; 3] = [PING_HEADER, ITEM_RESPONSE, 1];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PingKind {
@@ -159,7 +162,7 @@ impl std::fmt::Display for PingCodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PacketTooLarge => write!(f, "the packet is too large to be a ping"),
-            Self::InvalidHeader => write!(f, "it does not start 131"),
+            Self::InvalidHeader => write!(f, "it does not start 0x83 (131)"),
             Self::InvalidKind(kind) => write!(f, "item kind {kind} is not a ping"),
             Self::InvalidFlags(bits) => write!(f, "flags {bits:#x} are not a ping's"),
             Self::InvalidRoute(route) => write!(f, "route {route} is not reliable or unreliable"),
@@ -308,7 +311,7 @@ mod tests {
         assert_eq!(items[0].request_word, 0x9abc_def0);
 
         let reply = encode_ping_reply(&items[0], &TELEMETRY).expect("a request takes a reply");
-        assert_eq!(&reply[..3], &[0x83, 6, 1], "a reply starts 0x83, not 131");
+        assert_eq!(&reply[..3], &[0x83, 6, 1], "rove's response prefix");
         assert_eq!(
             &reply[3..11],
             &0x1122_3344_5566_7788u64.to_le_bytes(),
@@ -352,12 +355,39 @@ mod tests {
 
     #[test]
     fn a_flagged_request_is_not_answered() {
-        // Flags 1 (reply words) asks for six words in the request, which this
-        // packet does not carry — so it is malformed rather than supportable.
+        // Flags 1 ("reply words") is a shape this client does not collect: the
+        // packet is well-formed but the item is not a plain request, so it takes
+        // no reply. A port that answered it would send telemetry it does not
+        // have — which is the failure rove's responder exists to avoid.
         let mut payload = request(1, 2, false);
         payload[2] = 1;
-        let error = decode_ping_packet(&payload).expect_err("flags 1 needs reply words");
-        assert_eq!(error, PingCodecError::Truncated);
+        // The item itself is readable; there are simply six more words to skip,
+        // which this packet does not carry.
+        assert_eq!(
+            decode_ping_packet(&payload).expect_err("flags 1 needs six more words"),
+            PingCodecError::Truncated
+        );
+    }
+
+    /// A flagged item that *is* complete is read, and refused a reply.
+    #[test]
+    fn a_complete_flagged_item_gets_no_reply() {
+        let mut payload = vec![PING_HEADER, ITEM_REQUEST, 1];
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        for word in 1..=6u32 {
+            payload.extend_from_slice(&word.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0);
+        payload.push(0);
+        let items = decode_ping_packet(&payload).expect("six reply words are present");
+        assert_eq!(items[0].flags, PingFlags::ReplyWords);
+        assert_eq!(
+            encode_ping_reply(&items[0], &TELEMETRY).expect_err("not a plain request"),
+            PingCodecError::NotARequest
+        );
     }
 
     #[test]
@@ -379,8 +409,9 @@ mod tests {
 
     #[test]
     fn a_packet_that_is_not_a_ping_is_refused_with_a_reason() {
+        // 0x84 is not the header. (0x83 *is*, which is 131 — see PING_HEADER.)
         assert_eq!(
-            decode_ping_packet(&[0x83, 0, 0, 0]).expect_err("0x83 is a reply, not a ping"),
+            decode_ping_packet(&[0x84, 0, 0, 0]).expect_err("not a ping"),
             PingCodecError::InvalidHeader
         );
         assert_eq!(
