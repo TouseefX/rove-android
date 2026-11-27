@@ -341,7 +341,9 @@ fn run(
     }
     let _ = ran;
 
-    let applied = world.applied;
+    // Copied, not moved: `Session` implements `Drop` (it releases a journal
+    // lease), and a partly-moved value cannot be dropped.
+    let applied = world.applied.clone();
     let ingested = world.ingested;
     let journal_rows = world.journal_rows();
     let stage_tag = tag(&world.stage);
