@@ -37,7 +37,7 @@ const SESSION_SECONDS: u64 = 30;
 /// An auto-install of an empty world would replace whatever the person had
 /// open with nothing, so this asks for instances; a session that only read a
 /// schema and ended is reported, not installed.
-fn world_worth_opening(stats: rustudio_join::join::Stats) -> bool {
+fn world_worth_opening(stats: &rustudio_join::join::Stats) -> bool {
     stats.created > 0
 }
 
@@ -319,7 +319,7 @@ impl Editor {
         // only sign of a successful session was a number in a report — the
         // place stayed empty until a button was found. The report still says
         // what happened, and the window stays up over the world.
-        if has_world && world_worth_opening(stats) {
+        if has_world && world_worth_opening(stats.as_ref()) {
             self.install_join_world();
         }
         if let Some(place) = self.join_win.place() {

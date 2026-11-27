@@ -378,7 +378,8 @@ pub async fn run(
     // arm that also awaits would have to hold that borrow across it.
     let mut collected: Vec<(u8, u32, Vec<u8>)> = Vec::new();
     let mut accepting = Box::pin(ReliableReceiver::accept(&connection));
-    let mut end: Option<&'static str> = None;
+    // Why the loop stopped; `None` means the peer finished every stream.
+    let end: Option<&'static str>;
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {

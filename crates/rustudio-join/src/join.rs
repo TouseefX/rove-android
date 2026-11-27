@@ -45,7 +45,7 @@ use crate::http::AccountSession;
 use crate::session::{self, Stage};
 
 /// The session's own counters, as an overlay shows them while it runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// The stage the session reached.
     pub stage_tag: u8,
@@ -132,8 +132,15 @@ impl Join {
         }
     }
 
-    pub fn stats(&self) -> Stats {
-        self.shared.lock().map(|shared| shared.stats).unwrap_or_default()
+    /// The session's counters as of now.
+    ///
+    /// `Arc`, not `Stats`: the report's newest field is a list of arrivals, so
+    /// the struct is no longer `Copy`, and an overlay asks every frame.
+    pub fn stats(&self) -> std::sync::Arc<Stats> {
+        self.shared
+            .lock()
+            .map(|shared| std::sync::Arc::new(shared.stats.clone()))
+            .unwrap_or_default()
     }
 
     /// True while the worker is still going.
