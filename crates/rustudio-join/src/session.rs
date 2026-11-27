@@ -123,6 +123,13 @@ pub struct Session {
     pub ingested: Ingested,
     pub applied: ApplyStats,
     pub stage: Stage,
+    /// What arrived, by `(application, channel, first byte)`, counted: a
+    /// session that received 900 packets the decoder does not want reads the
+    /// same as a silent one without this.
+    pub arrivals: std::collections::BTreeMap<(u8, u32, u8), usize>,
+    /// Streams the server opened that this session did not read (it reads the
+    /// one with the world on it; rove's client reads them all).
+    pub other_streams: usize,
 }
 
 impl Session {
@@ -141,6 +148,8 @@ impl Session {
             ingested: Ingested::default(),
             applied: ApplyStats::default(),
             stage: Stage::Idle,
+            arrivals: std::collections::BTreeMap::new(),
+            other_streams: 0,
         }
     }
 
@@ -169,6 +178,24 @@ impl Session {
     /// A refusal is counted and returned as `false`; it never aborts the
     /// session.
     pub fn feed(&mut self, payload: &[u8]) -> bool {
+        // The channel is not known here; `feed_on` records it.
+        self.note_arrival(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload);
+        self.feed_inner(payload)
+    }
+
+    /// A packet that arrived on a known channel: the same feed, plus a record
+    /// of where it came from.
+    pub fn feed_on(&mut self, application: u8, channel: u32, payload: &[u8]) -> bool {
+        self.note_arrival(application, channel, payload);
+        self.feed_inner(payload)
+    }
+
+    fn note_arrival(&mut self, application: u8, channel: u32, payload: &[u8]) {
+        let kind = payload.first().copied().unwrap_or(0);
+        *self.arrivals.entry((application, channel, kind)).or_default() += 1;
+    }
+
+    fn feed_inner(&mut self, payload: &[u8]) -> bool {
         self.ingested.packets += 1;
         match self.core.ingest(payload) {
             Ok(outcome) => {
@@ -334,33 +361,109 @@ pub async fn run(
     }
     session.stage = Stage::LoggedIn;
 
-    let mut receiver = ReliableReceiver::accept(&connection)
-        .await
-        .map_err(|_| "the server opened no reliable stream")?;
+    // Every stream the server opens, as rove's client does — not only the
+    // first. A real server opens several (login replies, ping, the world), and
+    // reading one of them is how a session sits at "logged in" while the world
+    // it asked for arrives on another. Each has its own header, which is where
+    // its application and channel come from.
+    const MAX_STREAMS: usize = 16;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut readers = tokio::task::JoinSet::new();
+    let mut total = 0usize;
+    // Fed after the loop: `session` is borrowed mutably here, and a `select!`
+    // arm that also awaits would have to hold that borrow across it.
+    let mut collected: Vec<(u8, u32, Vec<u8>)> = Vec::new();
+    let mut accepting = Box::pin(ReliableReceiver::accept(&connection));
+    let mut end: Option<&'static str> = None;
     loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            session.stage = Stage::Closed("the session's deadline passed");
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            end = Some("the session's deadline passed");
             break;
         }
-        match tokio::time::timeout(remaining, receiver.next()).await {
-            Ok(Ok(Some(payload))) => {
-                session.feed(&payload);
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::select! {
+            accepted = &mut accepting => {
+                let application = match &accepted {
+                    Ok(receiver) => receiver.application(),
+                    Err(_) => {
+                        end = Some("the server opened no reliable stream");
+                        break;
+                    }
+                };
+                let channel = accepted.as_ref().map(|r| r.channel()).unwrap_or(0);
+                log::info!("session: the server opened application {application} channel {channel}");
+                let mut receiver = accepted.expect("checked");
+                total += 1;
+                if total > MAX_STREAMS {
+                    end = Some("the server opened too many streams");
+                    break;
+                }
+                if application != REPLICATION_APPLICATION || channel != REPLICATION_CHANNEL {
+                    // Read it anyway: this is where a ping request or a login
+                    // reply arrives, and a refused one is data. The counters
+                    // keep the two apart.
+                    session.other_streams += 1;
+                }
+                accepting = Box::pin(ReliableReceiver::accept(&connection));
+                let application_tag = receiver.application();
+                let channel_tag = receiver.channel();
+                readers.spawn(async move {
+                    let mut fed = Vec::new();
+                    loop {
+                        match receiver.next().await {
+                            Ok(Some(payload)) => {
+                                fed.push((application_tag, channel_tag, payload));
+                                if fed.len() >= 4096 {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                log::warn!(
+                                    "session: stream {application_tag}/{channel_tag} read failed: {error}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    fed
+                });
             }
-            Ok(Ok(None)) => {
-                session.stage = Stage::Closed("the server finished the stream");
-                break;
+            Some(joined) = readers.join_next(), if !readers.is_empty() => {
+                match joined {
+                    Ok(packets) => collected.extend(packets),
+                    Err(_) => {
+                        end = Some("a stream reader failed");
+                        break;
+                    }
+                }
             }
-            Ok(Err(_)) => {
-                session.stage = Stage::Closed("a stream read failed");
-                break;
-            }
-            Err(_) => {
-                session.stage = Stage::Closed("the session's deadline passed");
+            _ = tokio::time::sleep(remaining) => {
+                end = Some("the session's deadline passed");
                 break;
             }
         }
+    }
+    // A last drain: a reader that finished while the deadline fired still has
+    // its packets, and they are the most interesting ones.
+    while let Some(joined) = readers.join_next().await {
+        if let Ok(packets) = joined {
+            collected.extend(packets);
+        }
+    }
+    for (application, channel, payload) in collected {
+        session.feed_on(application, channel, &payload);
+    }
+    log::info!(
+        "session: {} stream(s), {} packet(s) fed, {} refusal(s)",
+        total,
+        session.ingested.packets,
+        session.ingested.refused
+    );
+    match end {
+        Some(reason) => session.stage = Stage::Closed(reason),
+        None => {}
     }
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;

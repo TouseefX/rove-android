@@ -267,11 +267,12 @@ impl Editor {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "stage {} · {} packet(s) · {} created · {} removed",
+                            "stage {} · {} packet(s) · {} created · {} removed · {} other stream(s)",
                             stats.stage_name(),
                             stats.packets,
                             stats.created,
-                            stats.removed
+                            stats.removed,
+                            stats.other_streams
                         ))
                         .color(rustudio_engine::theme::TEXT_DIM),
                     );

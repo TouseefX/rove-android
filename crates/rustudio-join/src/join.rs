@@ -59,6 +59,12 @@ pub struct Stats {
     pub removed: usize,
     pub properties: usize,
     pub elapsed_ms: u64,
+    /// Streams the server opened that were not the world's (read so their
+    /// packets are counted, not dropped).
+    pub other_streams: usize,
+    /// The first few `(application, channel, id) → count` arrivals, for a
+    /// session whose counters say nothing arrived.
+    pub arrivals: Vec<(u8, u32, u8, usize)>,
 }
 
 // The stage is what an overlay draws, and the poller only ever sees a copy:
@@ -334,9 +340,27 @@ fn run(
         }
         RECEIVING | CLOSED => {
             let ingested = world.ingested;
+            // What arrived, on which channel: the one line that tells a
+            // silent session from one receiving packets the decoder drops.
+            let arrivals: Vec<String> = world
+                .arrivals
+                .iter()
+                .take(6)
+                .map(|((application, channel, kind), count)| {
+                    format!("{application}/{channel} id {kind} ×{count}")
+                })
+                .collect();
+            let arrival_note = if arrivals.is_empty() {
+                format!(
+                    "nothing on 4/1 ({} stream(s) opened that were not the world's)",
+                    world.other_streams
+                )
+            } else {
+                arrivals.join(", ")
+            };
             settle(shared, |report| report.ok("log in", "5 packets"));
             let note = format!(
-                "{} packet(s): {} schema, {} globals, {} replication, {} refused",
+                "{} packet(s): {} schema, {} globals, {} replication, {} refused — {arrival_note}",
                 ingested.packets,
                 ingested.schema,
                 ingested.globals,
@@ -364,6 +388,13 @@ fn run(
     let journal_rows = world.journal_rows();
     let stage_tag = tag(&world.stage);
     let elapsed_ms = elapsed_ms(shared);
+    let world_other_streams = world.other_streams;
+    let world_arrivals = world
+        .arrivals
+        .iter()
+        .take(6)
+        .map(|((application, channel, kind), count)| (*application, *channel, *kind, *count))
+        .collect();
     // The world is handed over before the counters: a caller that sees a
     // finished report can then take a consistent document.
     let place = world.take_document();
@@ -383,6 +414,8 @@ fn run(
             removed: applied.removed,
             properties: applied.properties,
             elapsed_ms,
+            other_streams: world_other_streams,
+            arrivals: world_arrivals,
         };
     }
     Ok(())
