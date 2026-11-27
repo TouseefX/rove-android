@@ -23,6 +23,7 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                 let Ok(value) = syn::parse2::<syn::Lit>(TokenTree::Literal(literal).into()) else {
                     continue;
                 };
+                let is_char = matches!(value, syn::Lit::Char(_));
                 let value = match value {
                     syn::Lit::Str(text) => text.value(),
                     syn::Lit::Char(ch) => ch.value().to_string(),
@@ -33,9 +34,7 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                     // A char literal in a test module is fixture data, not UI
                     // text: the colour-glyph and ligature tests use private-use
                     // codepoints as map keys, and no font is asked to draw them.
-                    if path.components().any(|c| c.as_os_str() == "tests")
-                        && matches!(value, syn::Lit::Char(_))
-                    {
+                    if is_char && path.components().any(|c| c.as_os_str() == "tests") {
                         continue;
                     }
                     if matches!(
