@@ -8,7 +8,7 @@ checked separately, and each one says which stage it reached.
 | **M2a** | the join-game response, parsed: the dial address, the port, the certificate pins, the token, the identity | `crates/rustudio-join/tests/allocation.rs` against recorded bodies | no |
 | | the five login packets | `tests/login_packets.rs` against rove's Python vectors **and** rove's own encoder | no |
 | **M2b** | a session fed a recorded stream through the same `Session` a live join uses | `tests/session_replay.rs` — the world it builds is compared to the one `rustudio-live`'s offline replay proved | no |
-| **M2c** | a real join: sign in, allocate, dial, log in, receive | a phone, with the overlay on | yes |
+| **M2c** | a real join: sign in, allocate, dial, log in, receive | a phone, with the overlay on (started from the Start Page's **Play**; `tests/join_worker.rs` covers the pre-request branches) | yes |
 
 ## What the wire actually looks like
 
@@ -72,6 +72,28 @@ ships, against rove's own Rust encoder compiled in as a dev-dependency, and
 against each other (the vectors cover the shapes; the encoder covers the
 branches).
 
+## How a person starts a join
+
+The Android APK is built with `--features live` (`.github/workflows/android.yml`);
+a desktop build without it is unchanged and has no QUIC stack.
+
+| where | what |
+|---|---|
+| Start Page, open-by-ID row | **Play** beside **Open**: Open downloads the place to edit, Play joins an official server of it as a player |
+| `RUSTUDIO_JOIN=1818` | starts the same join on the first frame (a phone has no command line, so this is also how the APK can be told to join straight away) |
+| the join window | every stage with its time, the failing one named, the session's counters, **Copy the report**, and **Open the place** |
+
+*Open the place* installs the world the session built into the editor: the same
+`Document` a file becomes, so what replication created is Explorer rows and
+renderable parts, not a number in a log. It appears once a session has replicated
+something, and taking it twice takes nothing the second time (a `Document` moves
+into the editor; two copies of a live place would be two different worlds).
+
+`src/join_window.rs` is the app's end; `rustudio_join::join` is the whole join,
+on a thread of its own, with the report a render loop polls. The cookie comes
+from the account the app already holds (`rustudio_account`), is passed to the
+worker as a closure, and is never returned or logged.
+
 ## M2c: the part only a phone can answer
 
 Nothing in CI can stand in for this, because it needs an account, a live server
@@ -89,3 +111,17 @@ stops at **connect** means the pins or the address; one that reaches **log in**
 and then closes means the server accepted the connection and rejected the
 credentials. Those are three different bugs, and the overlay is what tells them
 apart without a capture.
+
+The failing branches that need no account are tested in CI
+(`crates/rustudio-join/tests/join_worker.rs`, run with `--features live`): no
+account, a cookie that cannot go into a header, and polling the report from
+another thread. Everything past `sign in` needs a phone.
+
+### What to send back
+
+1. Install the APK from the run's artifact.
+2. Sign in (Start Page → the account button) with the account that owns the
+   place's access.
+3. Start Page → paste `1818` (or a URL) → **Play**.
+4. When the report settles, **Copy the report** and send that text unchanged.
+   It names each stage, the failure and the counters; it holds no credential.
