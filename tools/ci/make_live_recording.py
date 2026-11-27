@@ -79,8 +79,20 @@ def zstd_frame(payload):
 
 
 def packet(kind, expanded):
+    """A compressed packet: kind byte, compressed length, expanded length, frame.
+
+    Only the schema and globals packets are framed this way. A replication
+    packet (131) is its own bytes: rove's replication reader starts at the kind
+    byte and never expects a length header, so wrapping one would be read as a
+    replication item of kind 0x28.
+    """
     compressed = zstd_frame(expanded)
     return bytes([kind]) + struct.pack("<I", len(compressed)) + struct.pack("<I", len(expanded)) + compressed
+
+
+def raw_packet(payload):
+    """A packet with no envelope (replication)."""
+    return payload
 
 
 # ---------------------------------------------------------------- the schema
@@ -195,6 +207,7 @@ def main():
     ))
     # 3: a Part created under Workspace.
     # 4 and 2: a second Part and a Player created with no parent yet.
+    # A replication packet is sent as-is: no zstd frame and no length header.
     joins = replication_packet(
         create(SCOPE, PART, 2, [(0, vector3(4.0, 1.0, 2.0)), (1, boolean(True))],
                (SCOPE, WORKSPACE)),
@@ -211,9 +224,9 @@ def main():
     packets = [
         {"at_ms": 0, "kind": "schema", "base64": b64(schema)},
         {"at_ms": 0, "kind": "globals", "base64": b64(globals_)},
-        {"at_ms": 40, "kind": "replication", "base64": b64(joins)},
-        {"at_ms": 60, "kind": "replication", "base64": b64(edges)},
-        {"at_ms": 80, "kind": "replication", "base64": b64(removals)},
+        {"at_ms": 40, "kind": "replication", "base64": b64(raw_packet(joins))},
+        {"at_ms": 60, "kind": "replication", "base64": b64(raw_packet(edges))},
+        {"at_ms": 80, "kind": "replication", "base64": b64(raw_packet(removals))},
     ]
     recording = {
         "note": "A join as a recording: rove's own decoder reads the schema "
