@@ -133,20 +133,46 @@ before its parent, a parent edge as a later `set`, a `$ref` before its target, a
 repeat `create` (rove re-sends on rejoin), and a `remove` that takes a subtree
 and its ids.
 
-**What is not wired, and why.** The packets are still rove's to decode, and that
-is the one thing M2 has not joined: `rove-client-core` as a workspace member
-needs its `transport` feature, whose `wtransport` dependency brings six crates
-(`pem`, `x509-parser`, `octets`, `httlib-huffman`, `wtransport`,
-`wtransport-proto`) that are not in `Cargo.lock`. The lock cannot be generated
-here (this environment has no cargo), and a hand-written lock entry for a crate
-I cannot resolve is not something to guess at. The work is otherwise staged:
-the recording format, its generator (`tools/ci/make_live_recording.py`, whose
-schema packet round-trips through a real zstd encoder and is written in the byte
-layout rove's own schema tests use), and the replay seam are described here and
-in `crates/rustudio-live/tests/fixtures/live_session.json`. Finishing it needs
-one environment with cargo (`cargo add rove-client-core --features transport`
-from the workspace root, then `cargo update`), after which `SessionCore::ingest`
-→ journal → `Live::apply` is a few dozen lines.
+**The decoder is rove's, in the workspace.** `rove/client-core` is a member
+(`rove/client-core`, `rove/client-core/src/session.rs`), and it is the same code
+a live connection runs: `SessionCore::ingest` takes the payloads off the wire,
+journals the receipt, and hands back the actions. Nothing in the replay path
+re-derives them from a world afterwards, which is what would let a fixture agree
+with itself.
+
+Getting it there took three things that belong in the record, because each was a
+silent mismatch rather than a missing file:
+
+- **the lock.** Six crates (`pem`, `wtransport`, `wtransport-proto`,
+  `x509-parser`, `httlib-huffman`, `octets`) had no entries, and this
+  environment has no cargo. The repository resolves its lock in CI now
+  (`ci.yml`'s `lockfile` job: `cargo fetch`, a minimal refresh that leaves pins
+  alone, committed back with `contents: write`). 628 packages became 681.
+- **the vendored manifests.** `rove/vendor/wtransport` and `vendor/epaint`
+  declare example and bench targets whose files are not in the tree, and Cargo
+  refuses to load such a manifest at all — the lock could not even be resolved
+  until those target declarations were dropped.
+- **rove's exact pins.** `rustls =0.23.37` leaves no slot for the root's
+  `vendor/rustls` 0.23.46 patch, which is where `rbx_transport_capabilities`
+  lives (accepted code, `rustudio-net/src/transport.rs:204`), and it drags
+  `ureq` to a 3.4 that has no `timeout_per_read`. Three pins (rustls, tokio,
+  bytes) now name the versions the rest of the workspace builds, still exact.
+
+**The offline evidence.** `crates/rustudio-live/tests/live_replay.rs` replays
+`tests/fixtures/live_session.json` through that path: five packets — schema
+(DataModel, Workspace, Part), globals (the place's top containers), then
+replication carrying a Part under Workspace, a Player and a second Part whose
+parent edges arrive in a later packet, and the first Part destroyed. The test
+asserts rustudio's world after the replay: the roots, a `Vector3` `Size` and a
+`bool` `Anchored` (the packet's types, not JSON floats), the deferred parent edge
+resolved, and the removal gone from the tree with its id forgotten. A truncated
+replication packet is refused by the decoder and counted, never half applied.
+
+**What the recording is not.** It is a hand-built payload whose ids the decoder
+assigns, not a capture from a live server — no packet from Roblox has been
+recorded yet. The bytes are checked against rove's own grammar (and decode back
+cleanly), but the claim is "the replay path works", not "this is what 1818
+sends".
 
 ## What M3 adds
 
@@ -170,7 +196,8 @@ recording:
 
 ## Scale, unmeasured
 
-The fixture is seven nodes and the recording is a schema packet. The numbers M3
+The fixture is seven nodes and the recording is a five-packet session that builds
+four instances. The numbers M3
 has to stand behind — 1818 ≈ 5.6k nodes, BedWars ≈ 3.4k, Phantom Forces ≈ 89k —
 need a capture of each and a frame budget measured against them. Nothing here
 claims them.
