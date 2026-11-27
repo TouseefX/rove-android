@@ -136,7 +136,11 @@ impl Session {
     /// A session over an empty place. The document is a bare DataModel, which
     /// is what a join's globals packet fills with the place's roots.
     pub fn new() -> Self {
-        let mut core = SessionCore::with_limits(4096, 8 << 20).expect("a session with sane limits");
+        // `with_limits_live`: a join's packets come from a real server, and a
+        // record this client cannot fully decode must cost that record, not
+        // the packet (upstream's lenient ISR policy; see rove's session.rs).
+        let mut core = SessionCore::with_limits_live(4096, 8 << 20)
+            .expect("a session with sane limits");
         let reader = core.retain(0).expect("a journal reader");
         Self {
             core,

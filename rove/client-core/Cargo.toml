@@ -25,6 +25,14 @@ getrandom = "=0.3.4"
 tokio = { version = "=1.54.1", optional = true, features = ["rt", "net", "macros", "sync", "time", "io-util"] }
 quinn-proto = { version = "=0.11.19", optional = true, default-features = false }
 quinn = { version = "=0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "=0.23.46", optional = true, default-features = false, features = ["ring", "std"] }
+sha2 = { version = "=0.10.9", optional = true }
+bytes = { version = "=1.12.1", optional = true }
+wtransport = { path = "../vendor/wtransport", optional = true, default-features = false, features = ["ring", "quinn"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Time"] }
+
 # Three of the exact pins above are raised to the versions the rest of this
 # workspace already builds against (rustls 0.23.46, tokio 1.54.1, bytes 1.12.1),
 # because rove's own pins do not merely lower them:
@@ -35,16 +43,17 @@ quinn = { version = "=0.11.12", optional = true, default-features = false, featu
 # - ureq is what loses it: 3.5.0 needs the newer rustls, so the resolver fell
 #   back to 3.4.2, which has no per-read timeout.
 # The pins stay exact; only their values match this workspace.
-rustls = { version = "=0.23.46", optional = true, default-features = false, features = ["ring", "std"] }
-sha2 = { version = "=0.10.9", optional = true }
-bytes = { version = "=1.12.1", optional = true }
-wtransport = { path = "../vendor/wtransport", optional = true, default-features = false, features = ["ring", "quinn"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Time"] }
-# The [profile.release] and [patch.crates-io] this crate carried as rove's own
-# root are removed here, and both carry over to the workspace root instead:
-# profiles and patches in a member are ignored (with a warning) by the root. The
-# root does not take rove's profile (lto = thin, codegen-units = 1) — that would
-# recompile the whole engine; it takes the quinn-proto patch, which the vendored
-# wtransport's transport path needs.
+# The [profile.release] and [patch.crates-io] this crate carries as rove's own
+# root are removed here; both carry over to the workspace root instead. Profiles
+# and patches in a member are ignored (with a warning) by the root. The root
+# does not take rove's profile (lto = thin, codegen-units = 1) — that would
+# recompile the whole engine — it takes the quinn-proto patch, which the
+# vendored wtransport's transport path needs.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[patch.crates-io]
+quinn-proto = { path = "../vendor/quinn-proto" }

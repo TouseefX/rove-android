@@ -235,9 +235,44 @@ impl SessionCore {
     }
 
     pub fn with_limits(max_records: usize, max_bytes: usize) -> Result<Self, JournalError> {
+        Self::with_limits_mode(max_records, max_bytes, false)
+    }
+
+    /// [`with_limits`] for a **network** session: a join feeding this from a
+    /// live server.
+    ///
+    /// The difference is the decoder's ISR policy, and it is a real one. A
+    /// live server sends instance-state records some of which this client does
+    /// not fully decode (a newer type, a property it does not model); the
+    /// strict decoder drops such a *packet*, which on a real join is most of
+    /// them. The lenient decoder drops the individual records and keeps the
+    /// rest — upstream measured 99.6% packet acceptance with it. Recordings and
+    /// fixtures keep the strict path, so a replay still fails loudly.
+    pub fn with_limits_live(max_records: usize, max_bytes: usize) -> Result<Self, JournalError> {
+        Self::with_limits_mode(max_records, max_bytes, true)
+    }
+
+    fn with_limits_mode(
+        max_records: usize,
+        max_bytes: usize,
+        live: bool,
+    ) -> Result<Self, JournalError> {
         Ok(Self {
             decoder: None,
-            instance_state: crate::instance_state::Receiver::default(),
+            instance_state: {
+                // Upstream reads this at construction from `ROVE_LENIENT_ISR` /
+                // `ROVE_LIVE_SESSION`. Here it is a property of how the session
+                // was made instead: a network ingress sets it in its constructor
+                // (`with_limits_live`), a recording or a fixture does not. An
+                // environment variable would make a test's decoding depend on
+                // the machine it ran on, which is the one thing a replay is for
+                // ruling out.
+                let mut receiver = crate::instance_state::Receiver::default();
+                if live {
+                    receiver.set_lenient(true);
+                }
+                receiver
+            },
             world: None,
             journal: ReplayJournal::with_limits(max_records, max_bytes)?,
             next_packet_sequence: 1,

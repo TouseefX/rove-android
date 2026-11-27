@@ -1,8 +1,28 @@
 # `rove/`: rove, kept as the network reference
 
-This directory is **rove pinned at `70b24c3b7d94`** (`alexkkork/rove`, the
-commit whose gamejoin shape this client follows), copied in unmodified except
-for the removals listed below. It is not a workspace member and nothing in the
+This directory is **rove, `alexkkork/rove` at `3c375c274696`** (main of
+2026-11-27), copied in unmodified except for the removals listed below and the
+pins in `client-core/Cargo.toml` (which follow this workspace's versions, with
+the reason stated there).
+
+It was first pinned at `70b24c3b7d94` — the branch's own base — and the network
+files were updated to `3c375c27` when that revision still refused joins with
+status 12. What that update changed, and why it matters here:
+
+| file | the change |
+|---|---|
+| `client-core/src/instance_state.rs`, `session.rs` | **lenient ISR decoding**: a record that fails part-way is dropped instead of the whole packet (upstream measured 99.6% acceptance on a live server). This is *the* fix for "logged in, receiving nothing". |
+| `client-core/src/property_storage.rs` | 16 KiB pages instead of 64 KiB: a cold read maps only what it needs |
+| `client-core/src/replication.rs`, `runtime_delta.rs` | `pub(crate)` visibility for helpers the delta path shares; unknown delta payloads keep their kind |
+| `rust-client/src/allocation.rs` | the `User-Agent` names a **live** client version (`client_version.rs`), `Accept-Language` and `Roblox-Browser-Asset-Request`; a status-12 refusal refetches the version once |
+| `rust-client/src/live_session.rs` | `RandomSeed1/2` seeding the asset keys, character-resolved evidence, owned-part uploads |
+| `rust-client/src/client_version.rs`, `asset_crypto*.rs` | new: the version fetch and the asset-key registry |
+
+The env-var switches upstream added (`ROVE_LENIENT_ISR`, `ROVE_LIVE_SESSION`)
+are **not** used. This copy of `client-core/src/session.rs` takes the policy as
+a constructor argument instead (`SessionCore::with_limits_live`), so a live join
+is lenient and a replayed recording is strict, whatever the machine's
+environment holds. It is not a workspace member and nothing in the
 app builds from it: `cargo check --workspace` never enters it. It is here so
 the bridge work (M1–M6) can read the reference decoder, transport and session
 code beside the client it is being ported into, with `git log`/`git blame`

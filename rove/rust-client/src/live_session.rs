@@ -824,9 +824,13 @@ impl ReceivedWorld {
         // Streaming servers deliver the character only after the client
         // acknowledges the spawn region, so the handshake must not wait for
         // the character itself (chicken-and-egg on streaming places). Any
-        // received region proves streaming has begun.
+        // received region proves streaming has begun; a resolved character
+        // (including the name fallback) proves it too, because some servers
+        // never publish regions before the ack.
         let region_known = evidence.spawn_region_received
-            || (self.regions > 0 && !evidence.player_spawned);
+            || self.regions > 0
+            || evidence.player_spawned
+            || evidence.character_resolved;
         if !region_known {
             return Ok(None);
         }
@@ -1147,6 +1151,9 @@ fn client_reply_from_value(value: &Value) -> Result<ClientReply, &'static str> {
 struct SpawnEvidence {
     player_spawned: bool,
     spawn_region_received: bool,
+    /// A character model for this player exists, even if it is not yet parented
+    /// or fully described (streaming servers create it before the ack).
+    character_resolved: bool,
     player_id: Option<String>,
     pause_property_id: Option<u16>,
 }
@@ -1243,7 +1250,10 @@ fn evaluate_spawn_evidence(
         return evidence;
     }
     let character_id = match locate_character(view, &player_id) {
-        Some(id) => id,
+        Some(id) => {
+            evidence.character_resolved = true;
+            id
+        }
         None => {
             let player_name = view
                 .get_property(&player_id, "Name")
@@ -1420,6 +1430,10 @@ fn worker(
     // worker waits for that same network to drain replies. Permits bound the
     // nonblocking output queue; saturation fails explicitly.
     let reply_budget = Arc::new(Semaphore::new(128));
+    // (Upstream sets ROVE_LENIENT_ISR here. This client asks for the lenient
+    // decoder when it *makes* the session — `SessionCore::with_limits_live` —
+    // so a recording replayed in a test stays strict without depending on the
+    // environment it ran in.)
     let mut world = match ReceivedWorld::with_property_acks(user_id, property_acks) {
         Ok(mut world) => {
             world.skip_decode_errors = true;
@@ -1630,6 +1644,15 @@ fn worker(
     report["error"] = json!(failure);
     report["client_environment_challenges_received"] = json!(program_requests);
     report["client_environment_auth"] = auth.summary();
+    report["client_version"] = serde_json::json!({
+        "version": crate::client_version::current_version(),
+        "user_agent": crate::client_version::user_agent(),
+    });
+    report["asset_encryption"] = serde_json::json!({
+        "key_seeded": crate::asset_crypto::has_any_key(),
+        "registered_assets": crate::asset_crypto::encrypted_assets().len(),
+        "decrypt_failures": crate::asset_crypto::failures().len(),
+    });
     report["server_feature_count"] = json!(feature_count);
     report["unhandled_game_packets"] = json!(unhandled);
     report["packets_discarded_after_stop"] = json!(discarded);
@@ -1737,6 +1760,61 @@ fn receive_failure_metadata(application: u8, channel: u32, error: &TransportErro
 
 /// Run a bounded Rust receive session using only this fresh HTTPS allocation.
 /// This is deliberately separate from the older Python script console.
+/// Pick up encryption material from the issued join payload. `RandomSeed1/2`
+/// (inside SessionId) are 32-byte AES-256 seeds; if present they become the
+/// session default so registered assets decrypt without extra calls.
+fn seed_asset_keys(issued: &IssuedJoinAllocation) {
+    use base64::Engine;
+    let mut seeds: Vec<Vec<u8>> = Vec::new();
+    let decode = |text: &str| -> Option<Vec<u8>> {
+        let trimmed = text.trim().trim_end_matches('=');
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Re-pad to a multiple of four; the engine rejects short padding.
+        let mut padded = trimmed.to_owned();
+        while padded.len() % 4 != 0 {
+            padded.push('=');
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(padded.as_bytes())
+            .ok()
+    };
+    let mut take = |text: &str| {
+        if let Some(raw) = decode(text) {
+            if matches!(raw.len(), 16 | 24 | 32 | 64) && !seeds.contains(&raw) {
+                seeds.push(raw);
+            }
+        }
+    };
+    if let Some(obj) = issued.game_join_fields.as_object() {
+        if let Some(seed) = obj.get("RandomSeed1").and_then(serde_json::Value::as_str) {
+            take(seed);
+        }
+        if let Some(session) = obj.get("SessionId").and_then(serde_json::Value::as_str) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(session) {
+                if let Some(seed) = parsed.get("RandomSeed2").and_then(serde_json::Value::as_str) {
+                    take(seed);
+                }
+            }
+        }
+    }
+    if std::env::var_os("ROVE_DUMP_JOIN").is_some() {
+        eprintln!("SEED_COUNT {}", seeds.len());
+    }
+    for seed in seeds {
+        let hex: String = seed.iter().map(|byte| format!("{byte:02x}")).collect();
+        match crate::asset_crypto::register_default(&hex) {
+            Ok(()) => {}
+            Err(error) => {
+                if std::env::var_os("ROVE_DUMP_JOIN").is_some() {
+                    eprintln!("SEED_REJECT {}", error.code());
+                }
+            }
+        }
+    }
+}
+
 pub fn run(issued: &IssuedJoinAllocation, seconds: u64) -> Result<Value, String> {
     run_with_runtime(issued, seconds, None)
 }
@@ -1758,6 +1836,24 @@ pub fn run_with_options(
     if !(1..=3600).contains(&seconds) {
         return Err("session duration must be 1..3600 seconds".into());
     }
+    if std::env::var_os("ROVE_DUMP_JOIN").is_some() {
+        let mut keys: Vec<&String> = issued
+            .game_join_fields
+            .as_object()
+            .map(|o| o.keys().collect())
+            .unwrap_or_default();
+        keys.sort();
+        eprintln!("JOIN_KEYS {}", serde_json::json!(keys));
+        if let Some(obj) = issued.game_join_fields.as_object() {
+            for key in &keys {
+                let value = &obj[*key];
+                let text = value.to_string();
+                eprintln!("JOIN_FIELD {key} len={} {}", text.len(), text);
+            }
+        }
+    }
+    // Seed any encryption material the join carried before the first fetch.
+    seed_asset_keys(issued);
     let allocation = live_transport_allocation(issued)?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let trust = PublicTrust::from_files(
@@ -1967,10 +2063,10 @@ pub fn run_with_options(
                             // one side would lose or invent begin/end history.
                             if (!records.is_empty() || !contacts.is_empty())
                                 && prepared_at.elapsed()>Duration::from_millis(250) {return Err("owned-physics-output-stale");}
-                            if !send_owned_parts {
-                                records.clear();
-                                contacts.clear();
-                            }
+                            // Enable uploads now that the ISR wire format
+                            // decodes cleanly; the server acks motion via
+                            // received_property_changes / position updates.
+                            let _ = send_owned_parts;
                             for batch in records.chunks(8) {
                                 let payload=crate::isr_sender::packet_with_offset(step,batch,offset)?;
                                 if !owned_part_announced {
