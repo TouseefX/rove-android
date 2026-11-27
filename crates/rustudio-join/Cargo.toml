@@ -1,0 +1,47 @@
+[package]
+name = "rustudio-join"
+description = "A Roblox player join: the join-game allocation, the login packets, and the WebTransport session that feeds rove's decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.23"
+# The decoder this session feeds, and (behind `transport`) rove's own
+# WebTransport client: the same connect, pins and RUPP envelope a live session
+# uses, so this does not grow a second, subtly different one.
+rove-client-core = { path = "../../rove/client-core" }
+rustudio-core = { path = "../rustudio-core" }
+# The bridge the offline replay already proves: a join feeds the same `Live`.
+rustudio-live = { path = "../rustudio-live" }
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "time", "macros"]
+optional = true
+
+[features]
+default = []
+# The real session: rove's QUIC/WebTransport client (wtransport, quinn, rustls).
+transport = ["rove-client-core/transport", "dep:tokio"]
+# Signing in with a .ROBLOSECURITY cookie over HTTPS, and the join-game calls —
+# ureq's default TLS, the same trust rustudio-account already ships.
+# Kept behind a flag so the offline halves (parsing, packets, replay) build and
+# test without a TLS stack or a socket.
+live = ["transport", "dep:ureq"]
+
+[dependencies.ureq]
+# The same client rustudio-account uses, with default TLS.
+version = "3.5"
+features = ["json"]
+optional = true
+
+[dev-dependencies]
+# The world the replay builds is inspected through rustudio's own document,
+# whose nodes are rbx_dom_weak instances.
+rbx_dom_weak = "4"
+# rove's login encoder is the reference the ported one is checked against.
+headless-luau = { path = "../../rove/rust-client", default-features = false }

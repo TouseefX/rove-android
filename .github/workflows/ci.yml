@@ -111,6 +111,42 @@ jobs:
 
   # macOS: Apple Silicon and Intel. The tests run here too (the GPU tests
   # skip themselves when the runner has no Metal device).
+  # The join crate's evidence, which needs no display and no GPU: the
+  # allocation parser against recorded bodies, the login packets against rove's
+  # Python vectors and rove's own encoder, a session fed a recording through the
+  # same `Session` a live join uses, and the live feature (WebTransport + sign
+  # in) compiling on both runners. Ubuntu is enough for the tests; the second
+  # runner is there because a `#[cfg(target_os)]` in the login packet would
+  # otherwise only ever be compiled on macOS.
+  join:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    needs: lockfile
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Offline evidence (allocation, packets, session replay)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p rustudio-join --locked --message-format=short 2>&1 \
+            | tee "$RUNNER_TEMP/join.log"
+          grep -E "^(running|test result)" "$RUNNER_TEMP/join.log" || true
+      - name: The live feature compiles (WebTransport, sign in, join-game)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p rustudio-join --features live --locked \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/join-live.log"
+
   macos:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     needs: lockfile

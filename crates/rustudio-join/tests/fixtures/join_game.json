@@ -1,0 +1,204 @@
+{
+ "_comment": "Synthetic fixtures for the allocation parser. Every value is made up; the shapes are the current gamejoin ones. rove's own fixtures are synthetic the same way.",
+ "ready": {
+  "status": 2,
+  "joinScript": {
+   "PlaceId": 1818,
+   "UserId": 424242,
+   "UserName": "SyntheticTester",
+   "DisplayName": "Synthetic Tester",
+   "HasVerifiedBadge": false,
+   "SessionId": "synthetic-session-id",
+   "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+   "UdmuxEndpoints": [
+    {
+     "Address": "203.0.113.9"
+    }
+   ],
+   "MachineAddress": "198.51.100.7",
+   "NetStackPort": 443,
+   "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D%22%2C%20%22ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8%3D%22%5D%7D",
+   "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+   "AgeChecked": 1,
+   "CountryCode": "US",
+   "characterAppearanceId": 424242,
+   "RawJoinData": "synthetic-raw-join"
+  },
+  "joinTicket": {
+   "synthetic": true
+  }
+ },
+ "machine_only": {
+  "status": 2,
+  "joinScript": {
+   "PlaceId": 1818,
+   "UserId": 424242,
+   "UserName": "SyntheticTester",
+   "DisplayName": "Synthetic Tester",
+   "HasVerifiedBadge": false,
+   "SessionId": "synthetic-session-id",
+   "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+   "MachineAddress": "198.51.100.7",
+   "NetStackPort": 443,
+   "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D%22%2C%20%22ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8%3D%22%5D%7D",
+   "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+   "AgeChecked": 1,
+   "CountryCode": "US",
+   "characterAppearanceId": 424242,
+   "RawJoinData": "synthetic-raw-join"
+  }
+ },
+ "no_netstack": {
+  "status": 2,
+  "joinScript": {
+   "PlaceId": 1818,
+   "UserId": 424242,
+   "UserName": "SyntheticTester",
+   "DisplayName": "Synthetic Tester",
+   "HasVerifiedBadge": false,
+   "SessionId": "synthetic-session-id",
+   "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+   "UdmuxEndpoints": [
+    {
+     "Address": "203.0.113.9"
+    }
+   ],
+   "MachineAddress": "198.51.100.7",
+   "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+   "AgeChecked": 1,
+   "CountryCode": "US",
+   "characterAppearanceId": 424242,
+   "RawJoinData": "synthetic-raw-join"
+  }
+ },
+ "pending": {
+  "status": 1
+ },
+ "rejected": {
+  "loopback_endpoint": {
+   "status": 2,
+   "joinScript": {
+    "PlaceId": 1818,
+    "UserId": 424242,
+    "UserName": "SyntheticTester",
+    "DisplayName": "Synthetic Tester",
+    "HasVerifiedBadge": false,
+    "SessionId": "synthetic-session-id",
+    "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+    "UdmuxEndpoints": [
+     {
+      "Address": "127.0.0.1"
+     }
+    ],
+    "MachineAddress": "127.0.0.1",
+    "NetStackPort": 443,
+    "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D%22%2C%20%22ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8%3D%22%5D%7D",
+    "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+    "AgeChecked": 1,
+    "CountryCode": "US",
+    "characterAppearanceId": 424242,
+    "RawJoinData": "synthetic-raw-join"
+   }
+  },
+  "wrong_place": {
+   "status": 2,
+   "joinScript": {
+    "PlaceId": 920587237,
+    "UserId": 424242,
+    "UserName": "SyntheticTester",
+    "DisplayName": "Synthetic Tester",
+    "HasVerifiedBadge": false,
+    "SessionId": "synthetic-session-id",
+    "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+    "UdmuxEndpoints": [
+     {
+      "Address": "203.0.113.9"
+     }
+    ],
+    "MachineAddress": "198.51.100.7",
+    "NetStackPort": 443,
+    "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D%22%2C%20%22ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8%3D%22%5D%7D",
+    "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+    "AgeChecked": 1,
+    "CountryCode": "US",
+    "characterAppearanceId": 424242,
+    "RawJoinData": "synthetic-raw-join"
+   }
+  },
+  "wrong_user": {
+   "status": 2,
+   "joinScript": {
+    "PlaceId": 1818,
+    "UserId": 1,
+    "UserName": "SyntheticTester",
+    "DisplayName": "Synthetic Tester",
+    "HasVerifiedBadge": false,
+    "SessionId": "synthetic-session-id",
+    "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+    "UdmuxEndpoints": [
+     {
+      "Address": "203.0.113.9"
+     }
+    ],
+    "MachineAddress": "198.51.100.7",
+    "NetStackPort": 443,
+    "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D%22%2C%20%22ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8%3D%22%5D%7D",
+    "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+    "AgeChecked": 1,
+    "CountryCode": "US",
+    "characterAppearanceId": 424242,
+    "RawJoinData": "synthetic-raw-join"
+   }
+  },
+  "bad_pins": {
+   "status": 2,
+   "joinScript": {
+    "PlaceId": 1818,
+    "UserId": 424242,
+    "UserName": "SyntheticTester",
+    "DisplayName": "Synthetic Tester",
+    "HasVerifiedBadge": false,
+    "SessionId": "synthetic-session-id",
+    "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+    "UdmuxEndpoints": [
+     {
+      "Address": "203.0.113.9"
+     }
+    ],
+    "MachineAddress": "198.51.100.7",
+    "NetStackPort": 443,
+    "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22%2A%2A%2Anot-base64%2A%2A%2A%22%5D%7D",
+    "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+    "AgeChecked": 1,
+    "CountryCode": "US",
+    "characterAppearanceId": 424242,
+    "RawJoinData": "synthetic-raw-join"
+   }
+  },
+  "port_disagrees": {
+   "status": 2,
+   "joinScript": {
+    "PlaceId": 1818,
+    "UserId": 424242,
+    "UserName": "SyntheticTester",
+    "DisplayName": "Synthetic Tester",
+    "HasVerifiedBadge": false,
+    "SessionId": "synthetic-session-id",
+    "ClientTicket": "synthetic;unused;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g;AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB;17",
+    "UdmuxEndpoints": [
+     {
+      "Address": "203.0.113.9"
+     }
+    ],
+    "MachineAddress": "198.51.100.7",
+    "NetStackPort": 8443,
+    "NetStackConfig": "%7B%22port%22%3A%20443%2C%20%22certHashes%22%3A%20%5B%22AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D%22%2C%20%22ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8%3D%22%5D%7D",
+    "GameId": "a1b2c3d4-e5f6-4789-8abc-def012345678",
+    "AgeChecked": 1,
+    "CountryCode": "US",
+    "characterAppearanceId": 424242,
+    "RawJoinData": "synthetic-raw-join"
+   }
+  }
+ }
+}
