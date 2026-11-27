@@ -168,6 +168,15 @@ pub struct Session {
     pub markers: usize,
     /// Marker requests that could not be answered (an unreadable one).
     pub marker_refused: usize,
+    /// Ping packets that carried no request (a pure reply packet) and those
+    /// whose request this client cannot answer truthfully. Both counted so a
+    /// session with pings and no replies names the reason.
+    pub ping_unanswered: usize,
+    pub ping_refused: usize,
+    /// The integrity status word a ping reply carries. Zero until the session
+    /// has something to say about its own integrity, which is honest: rove's
+    /// responder refuses to invent it, and so does this.
+    pub integrity_status: u32,
     /// Replies the session wrote back (markers, handshakes) and those the
     /// transport refused. A session with a rising `replies_failed` is one the
     /// server will throttle.
@@ -243,6 +252,9 @@ impl Session {
             features: 0,
             markers: 0,
             marker_refused: 0,
+            ping_unanswered: 0,
+            ping_refused: 0,
+            integrity_status: 0,
             replies_sent: 0,
             replies_failed: 0,
             unhandled: 0,
@@ -419,10 +431,55 @@ impl Session {
     /// this reason). Until that measurement is ported, a fabricated reply would
     /// be a lie told to the server in its own protocol, so the count is what
     /// the report carries and the answer is left out.
+    /// A ping on `(4, 3)`, answered rather than counted.
+    ///
+    /// The reply echoes the request's own timestamp and word and adds the
+    /// session's statistics — there is no invented number in it. (rove's
+    /// encoding carries no clock word; the time-sync probe on the datagram
+    /// channel is what moves the replicator clock.) A ping that cannot be
+    /// answered truthfully leaves no reply and is counted, because a fabricated
+    /// reply is worse than a missing one: the server accepts it and trusts it.
     fn ping_requested(&mut self, payload: &[u8]) -> bool {
         self.pings += 1;
-        let _ = payload;
-        false
+        let telemetry = crate::ping::PingReplyTelemetry {
+            reply_words: self.ping_reply_words(),
+            integrity_status: self.integrity_status,
+        };
+        match crate::ping::reply_to_request(payload, &telemetry) {
+            Ok(Some(reply)) => {
+                self.outbound
+                    .push((crate::ping::PING_APPLICATION, crate::ping::PING_CHANNEL, reply));
+                true
+            }
+            Ok(None) => {
+                // A packet of replies, not a request: nothing to answer.
+                self.ping_unanswered += 1;
+                false
+            }
+            Err(error) => {
+                self.ping_refused += 1;
+                log::warn!("session: ping refused: {error}");
+                false
+            }
+        }
+    }
+
+    /// The six statistics words a ping reply carries.
+    ///
+    /// rove's order: packets received, replication committed, instances known,
+    /// rows applied, held-then-released, and the count refused. They are read
+    /// from the session's own counters rather than estimated, because the server
+    /// compares them against what it sent.
+    fn ping_reply_words(&self) -> [u32; 6] {
+        let word = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        [
+            word(self.ingested.packets),
+            word(self.ingested.replication),
+            word(self.document().dom.len()),
+            word(self.journal_rows()),
+            word(self.held),
+            word(self.ingested.refused),
+        ]
     }
 
     /// A compact instance-state packet (161), which upstream reads through
