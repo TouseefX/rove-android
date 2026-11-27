@@ -1731,8 +1731,21 @@ impl Editor {
             let run = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::F8));
             (stop, play, run)
         });
+        // **F5 and F8 are Studio's.** A joined game is a Roblox client: there is
+        // no editor around it to play-test from, and F5 over a live session
+        // would take the replicated world and start a *local* Play Solo server
+        // over it — the exact thing a live client must never do (F8 is worse:
+        // it runs the place's `Script`s here). The way out is the one a client
+        // has: Roblox's Esc menu, or Shift+F5 for a phone with a keyboard.
+        let live_client = self
+            .game
+            .play
+            .as_ref()
+            .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client);
         if stop {
             self.request_stop();
+        } else if live_client {
+            // (F5 / F8 consumed and dropped: nothing to play-test from a client)
         } else if play {
             self.start_run(crate::studio_ui::RunType::Test);
         } else if run {
@@ -3312,6 +3325,17 @@ impl RustudioApp {
 
     fn play_full_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame_start: Instant, dt: f32) {
         let ed = &mut self.ed;
+        // **A joined game keeps streaming while it is being played.** This
+        // function is the editor's frame for a game that fills the screen — the
+        // frame a join spends all of its time in — and it returns before the
+        // editor's own frame, which is where `live_join_frame` lives. So the
+        // session's deltas were applied only until the cover came down: the
+        // phone's log said `join: the world is here (9200 instances)`, then
+        // `entered the placed live`, and then nothing ever changed again. The
+        // server's world arrived once and stopped. Applied here, before the
+        // scene reads the document, exactly as in the editor's frame.
+        #[cfg(feature = "live")]
+        ed.live_join_frame();
         {
             let _p = rustudio_core::bench::scope("scene_sync");
             ed.game.scene.sync(&mut ed.game.doc);

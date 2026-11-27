@@ -974,18 +974,29 @@ impl Game {
         // this side knows about it is what arrived on the wire. Cloning the edit
         // DataModel here is how a live session ended up running a local copy of
         // a world that does not exist.
-        let take = network_client
-            || std::mem::take(&mut self.doc_is_play_copy) && edit_doc.is_none();
-        let mut server_doc = if take {
+        //
+        // **A live client's world stays in `self.doc`.** It used to be *moved*
+        // into `server_doc` here (the same take a Play Solo session makes), and
+        // then — because a live session has no second document to swap back —
+        // dropped when the function returned: `self.doc` was left as
+        // `Document::placeholder()`, CoreGui was installed into that empty
+        // document, and the 9,200 replicated instances were gone. The phone's
+        // logcat is exactly that: `join: the world is here (9200 instances)` →
+        // `DataModel 53359 instances; 0 meshes, 0 draw calls`, forever. The live
+        // world is edited **in place** — one document, on the thread the join
+        // writes to (see `start_play_threaded`'s note) — so `server_doc` is
+        // `None` here and every block below that touches the "server" copy is
+        // skipped by its own `network_client` guard.
+        let take = !network_client
+            && (std::mem::take(&mut self.doc_is_play_copy) && edit_doc.is_none());
+        let mut server_doc = if network_client {
+            None
+        } else if take {
             let mut d = std::mem::replace(&mut self.doc, Document::placeholder());
-            d.title = if network_client {
-                format!("{title} ({label})")
-            } else {
-                format!("{title} ({label}: Server)")
-            };
-            d
+            d.title = format!("{title} ({label}: Server)");
+            Some(d)
         } else {
-            self.doc.clone_for_play(format!("{title} ({label}: Server)"))
+            Some(self.doc.clone_for_play(format!("{title} ({label}: Server)")))
         };
         // Roblox's default PlayerModule, PlayerScriptsLoader and
         // RbxCharacterSounds join StarterPlayerScripts, as Studio does.
@@ -993,7 +1004,14 @@ impl Game {
         // doesn't list them (a place saved with only a Workspace).
         // Workspace (with Terrain and a CurrentCamera) and the other services
         // exist before any script runs, as in every Roblox DataModel.
-        server_doc.ensure_services();
+        //
+        // A live client's services are its own document's (the replicated one):
+        // `ensure_services` is a no-op on it — the server sent every service the
+        // place has — so it is not asked. The `server_doc` blocks below all run
+        // only when there is a server copy to run them on.
+        if let Some(doc) = server_doc.as_mut() {
+            doc.ensure_services();
+        }
         // Players starts empty, as in Studio's Play: a live Team Create
         // DataModel holds the collaborators' Player objects (a live Place A session:
         // Players.testuser1), and copied along they were a phantom first
@@ -1004,26 +1022,27 @@ impl Game {
         // are not players of *this* session. But a joined game's `Players` holds
         // the real ones, the server's, including ours — destroying them left a
         // client with no LocalPlayer to name and no `Player.Character` to bind.
-        if !network_client {
-            if let Some(players) = server_doc.find_child(server_doc.dom.root_ref(), "Players") {
-                let stale: Vec<_> = server_doc
+        if let Some(doc) = server_doc.as_mut() {
+            if let Some(players) = doc.find_child(doc.dom.root_ref(), "Players") {
+                let stale: Vec<_> = doc
                     .dom
                     .get_by_ref(players)
                     .map(|i| i.children().to_vec())
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|c| server_doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "Player"))
+                    .filter(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "Player"))
                     .collect();
                 for c in stale {
-                    server_doc.dom.destroy(c);
+                    doc.dom.destroy(c);
                 }
             }
         }
         // A place opened from Roblox plays with its real ids, as in Studio
         // (an unpublished one keeps 0: runtime_ext's DataModel defaults).
-        if let Some(o) = server_doc.cloud.clone() {
-            let root = server_doc.dom.root_ref();
-            if let Some(i) = server_doc.dom.get_by_ref_mut(root) {
+        let server_cloud = server_doc.as_ref().and_then(|d| d.cloud.clone());
+        if let (Some(o), Some(doc)) = (server_cloud, server_doc.as_mut()) {
+            let root = doc.dom.root_ref();
+            if let Some(i) = doc.dom.get_by_ref_mut(root) {
                 use rbx_dom_weak::{types::Enum, ustr};
                 i.properties.insert(ustr("PlaceId"), Variant::Int64(o.place_id as i64));
                 i.properties.insert(ustr("GameId"), Variant::Int64(o.universe_id as i64));
@@ -1038,15 +1057,24 @@ impl Game {
         // Direct live joins have no REST CloudOrigin. Their session still
         // supplies the published identity required by game initialization.
         if let Some((universe, place)) = live_ids {
-            let root = server_doc.dom.root_ref();
-            if let Some(i) = server_doc.dom.get_by_ref_mut(root) {
+            // The session's DataModel: the server copy in Play Solo (it becomes
+            // `self.doc` a few lines down), and the replicated document itself
+            // in a live session, where there is only one.
+            let doc = if let Some(doc) = server_doc.as_mut() {
+                doc
+            } else {
+                &mut self.doc
+            };
+            let root = doc.dom.root_ref();
+            if let Some(i) = doc.dom.get_by_ref_mut(root) {
                 i.properties.insert(ustr("PlaceId"), Variant::Int64(place as i64));
                 i.properties.insert(ustr("GameId"), Variant::Int64(universe as i64));
             }
         }
         rustudio_core::load_trace::mark("play: server DataModel copied");
         let defaults = if two {
-            match rustudio_core::default_scripts::insert_player_scripts(&mut server_doc) {
+            let doc = server_doc.as_mut().expect("Play Solo has a server DataModel");
+            match rustudio_core::default_scripts::insert_player_scripts(doc) {
                 Ok(added) => added,
                 Err(error) => {
                     self.error(format!("Could not load Studio PlayerModule for Play: {error}"));
@@ -1058,26 +1086,34 @@ impl Game {
         };
         // Tools saved in an NPC's hand: gripped as the session's DataModel loads (Handle
         // CanCollide false, tool_grip.rs), before the client's copy is made from it.
-        rustudio_engine::tool_grip::grip_at_load(&mut server_doc);
+        if let Some(doc) = server_doc.as_mut() {
+            rustudio_engine::tool_grip::grip_at_load(doc);
+        }
         // Ensure RobloxReplicatedStorage + version RemoteFunctions exist before
         // initial_client so SettingsHub's GetServerVersionBlocking() maps 1:1.
         // A **live client** needs them too, and it has no `client_doc` to put
         // them in: SettingsHub asks this DataModel for the server's version
         // when CoreGui starts, and with no `RobloxReplicatedStorage` the
         // Settings module fails to load and the Esc menu never appears.
-        if (two || (network_client && !two)) && rustudio_core::rustudio_settings::core_scripts() {
-            let root = server_doc.dom.root_ref();
-            let rrs = server_doc
+        // The document they go into is the one CoreGui binds to: the client copy
+        // in Play Solo, and in a live session the replicated document itself
+        // (`self.doc`) — there is no server copy there to speak of.
+        if (two || network_client) && rustudio_core::rustudio_settings::core_scripts() {
+            let doc = if let Some(doc) = server_doc.as_mut() {
+                doc
+            } else {
+                &mut self.doc
+            };
+            let root = doc.dom.root_ref();
+            let rrs = doc
                 .find_child(root, "RobloxReplicatedStorage")
                 .unwrap_or_else(|| {
-                    server_doc
-                        .dom
+                    doc.dom
                         .insert(root, InstanceBuilder::new("RobloxReplicatedStorage").with_name("RobloxReplicatedStorage"))
                 });
             for rf_name in ["GetServerVersion", "GetServerChannel"] {
-                if server_doc.find_child(rrs, rf_name).is_none() {
-                    server_doc
-                        .dom
+                if doc.find_child(rrs, rf_name).is_none() {
+                    doc.dom
                         .insert(rrs, InstanceBuilder::new("RemoteFunction").with_name(rf_name));
                 }
             }
@@ -1087,8 +1123,9 @@ impl Game {
         // *from*, so there is no second document and no `RepMap` — the server's
         // own `Ref`s mean what the wire says they mean.
         let (mut client_doc, map) = if two {
+            let server_doc = server_doc.as_ref().expect("Play Solo has a server DataModel");
             let (c, m) = replicate::initial_client(
-                &server_doc,
+                server_doc,
                 format!("{title} ({label}: Client)"),
             );
             (Some(c), m)
@@ -1118,8 +1155,24 @@ impl Game {
                 && (rustudio_core::core_scripts::patch_path().is_some()
                     || rustudio_core::rustudio_settings::core_scripts_forced())
             {
-                let cdoc = &mut self.doc;
-                Some(install_client_core(cdoc))
+                // The replicated document, in place: this is the install the
+                // join's report is read against (`CoreGui 1234`, `CorePackages
+                // …`), and it stays here for the whole session instead of being
+                // written into a placeholder that was then dropped.
+                let lines = install_client_core(&mut self.doc);
+                // Said out loud either way: "CoreGui is missing" and "CoreGui
+                // could not be decoded" are different faults, and the only
+                // place they can be told apart is the phone's log.
+                match &lines {
+                    Ok((got, line)) => self.info(format!(
+                        "Live: CoreGui installed into the replicated place ({} CoreScript(s), {} module(s)): {}",
+                        got.scripts.len(),
+                        got.modules.len(),
+                        line
+                    )),
+                    Err(why) => self.warn(format!("Live: CoreScripts could not be installed: {why}")),
+                }
+                Some(lines)
             } else {
                 // Said out loud, because the alternative reading of "a join has
                 // no menus and no chat" is that CoreGui is broken.
@@ -1151,16 +1204,18 @@ impl Game {
         } else {
             std::mem::take(&mut edit_doc.as_mut().unwrap_or(&mut self.doc).selection)
         };
-        let saved_doc = if network_client {
-            // The replicated place is already where the editor draws it. It is
-            // not an "edit document" and must not be saved as one, so the
-            // session has nothing to hand back on Stop. (A live client's
-            // `self.doc` is the document CoreGui was installed into a few lines
-            // up; moving `server_doc` back over it would throw that away.)
-            Document::empty()
-        } else {
+        let saved_doc = if let Some(server_doc) = server_doc {
             let previous = std::mem::replace(&mut self.doc, server_doc);
             edit_doc.take().unwrap_or(previous)
+        } else {
+            // **The replicated world stays exactly where it is.** It was never
+            // taken out of `self.doc` (see the top of this function), CoreGui was
+            // installed into it in place, and a live session hands the editor
+            // nothing back on Stop — it is not an edit document, it is somebody
+            // else's place. The old code moved `server_doc` back here; with the
+            // world left in `self.doc` that would now be moving a placeholder
+            // over the world, which is the same void by another route.
+            Document::empty()
         };
         let mut physics = Physics::new(&mut self.doc);
         rustudio_core::load_trace::mark("play: physics built");
@@ -1184,6 +1239,8 @@ impl Game {
             _scripts_running: Some(scripts_running),
             server,
             client,
+            // Play Solo's client document is the second side's; a live client
+            // has one document and it is `self.doc`.
             other_doc: client_doc,
             map,
             physics: PlayPhysics(Some(Box::new(physics))),

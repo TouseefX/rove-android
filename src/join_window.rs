@@ -435,6 +435,13 @@ impl Editor {
         let Some(counters) = self.join_win.live.clone() else {
             return;
         };
+        // Only while a join is in flight. A session that has ended leaves its
+        // last counters behind (the window keeps them for the report), and a
+        // line a second about a session that is over is noise in the log a
+        // person is asked to copy.
+        if !self.join_win.join.as_ref().is_some_and(|j| j.running()) {
+            return;
+        }
         let due = self
             .join_win
             .live_logged_at
@@ -503,12 +510,13 @@ impl Editor {
             return;
         };
         // The report window is drawn from the editor's frame (`join_window`),
-        // which runs *before* this and is an `egui::Window` at
-        // `Order::Middle`. A cover at `Order::Foreground` painted over it, so a
-        // person tapping Report got the numbers and then a cover on top of them
-        // — the button worked and looked broken. While the report is open the
-        // cover steps out of its way entirely: it is the same join underneath,
-        // and the window's own Close puts it back.
+        // which runs *before* this and is an `egui::Window`. A cover painted
+        // over it hid the numbers a person had just asked for, so while the
+        // report is open the cover steps out of its way entirely: it is the
+        // same join underneath, and the window's own Close puts the cover back
+        // (the window is *only* reachable from this cover — `start_join` closes
+        // it on the tap — so "the window is open" always means "the person is
+        // reading the report of the join the cover belongs to").
         if self.join_win.open {
             return;
         }
@@ -778,6 +786,30 @@ impl Editor {
                 // `start_play` and `play_when_loaded` use the engine's enum, and
                 // the two are separate types with the same variant names.)
                 self.start_play(rustudio_engine::runtime::RunMode::Client);
+                // **The check the reviewer asked for**: after Play has had the
+                // document, does the join's own id map still name this
+                // document's instances? If it does not, every later delta is
+                // written into refs that belong to nothing — the world arrives
+                // once and then stands still while packets keep coming. That is
+                // what `entered the placed live` followed by a frozen game was,
+                // so it is counted and said out loud rather than assumed.
+                let matched = self
+                    .join_win
+                    .live_local
+                    .as_ref()
+                    .map(|live| live.matches(&self.game.doc));
+                let mapped = self.join_win.live_local.as_ref().map_or(0, |l| l.len());
+                match matched {
+                    Some(true) => self.info(format!(
+                        "join: playing the replicated place — {} instance id(s) still bound to this document; streaming continues",
+                        mapped
+                    )),
+                    Some(false) => self.error(format!(
+                        "join: the live id map does not name this document ({} id(s)): later deltas would be lost. Stop and join again.",
+                        mapped
+                    )),
+                    None => {}
+                }
                 self.info("join: entered the placed live (Shift+F5 leaves)");
             }
         }
@@ -979,7 +1011,17 @@ impl Editor {
 
         // The field's text goes back, and the window's own ✕ is honoured.
         self.join_win.place_text = place_text;
-        self.join_win.open = open && (running || !close);
+        // Close goes back to the cover while the join is still loading — it
+        // opened the window from the cover, and the window closing must not put
+        // the editor back. Once nothing is loading it closes for good.
+        if close {
+            // The window steps aside; the cover (still up, because the join is
+            // still loading) takes the screen back on this same frame.
+            self.join_win.open = false;
+            self.join_win.show_text = false;
+        } else {
+            self.join_win.open = open && (running || !close);
+        }
         if start {
             match self.join_win.place() {
                 Some(place) => self.start_join(place),
@@ -1053,7 +1095,14 @@ impl Editor {
     /// Start the join the window's own **Join** button asks for.
     fn start_join(&mut self, place: u64) {
         self.join_win.place_text = place.to_string();
-        self.join_win.open = true;
+        // **The window closes on the tap, and the cover takes its place.** The
+        // window is the *editor's* chrome: leaving it up meant the tap on Join
+        // put a window over a Studio 3D view, which is the "it opened the
+        // editor's loading chrome" report. A person who joins a game gets a
+        // loading screen and then the game; the window with the numbers comes
+        // back only if they ask for it (the cover's Report button, below).
+        self.join_win.open = false;
+        self.join_win.show_text = false;
         // A live session: no deadline (`0`), and a world handover so the place
         // is drawn from the first instance the server sends rather than after a
         // session has ended. M2's bounded join — thirty seconds, then the world

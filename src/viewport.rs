@@ -1137,8 +1137,24 @@ impl Editor {
             self.toolbox_viewport_drop(ui, rect, &resp);
         }
         // A game put back here from a filled screen (app.rs play_full_button):
-        // the button that fills the screen with it again.
-        if self.game.is_playing() && self.ui.play_full && self.play_full_exit && !self.clean_view && self.play_full_button(ui, false) {
+        // the button that fills the screen with it again. **Not for a joined
+        // game**: `play_fills_screen` makes a live client fill the screen
+        // whatever the setting says, so this button could only ever appear over
+        // a joined game (a leftover `play_full_exit` from an earlier playtest)
+        // and there is nowhere for it to go — a Studio button in a Roblox
+        // client, which is the report this whole branch is fixing.
+        let live_client = self
+            .game
+            .play
+            .as_ref()
+            .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client);
+        if !live_client
+            && self.game.is_playing()
+            && self.ui.play_full
+            && self.play_full_exit
+            && !self.clean_view
+            && self.play_full_button(ui, false)
+        {
             self.play_full_exit = false;
             ctx.request_repaint();
         }

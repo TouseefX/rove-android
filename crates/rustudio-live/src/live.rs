@@ -219,6 +219,20 @@ impl Live {
         self.refs.get(&r).map(String::as_str)
     }
 
+    /// Whether every `Ref` this half holds still means an instance in `doc`.
+    ///
+    /// The check a session makes when it starts playing the world the join
+    /// built: the editor's half and the document it writes into are two things
+    /// that can come apart (a Play that swapped the document, a document
+    /// swapped back), and a map that points at another document's refs writes
+    /// every later delta into nothing — the world arrives once and the stream
+    /// stops meaning anything. Being wrong about this is a game that freezes
+    /// the moment it is entered, with every packet still arriving.
+    pub fn matches(&self, doc: &Document) -> bool {
+        self.ids.values().all(|r| doc.dom.get_by_ref(*r).is_some())
+            && self.refs.keys().all(|r| doc.dom.get_by_ref(*r).is_some())
+    }
+
     pub fn len(&self) -> usize {
         self.ids.len()
     }
@@ -1169,6 +1183,31 @@ mod tests {
         assert_eq!(stats.duplicate_creates, 1);
         assert_eq!(stats.created, 0);
         assert_eq!(live.len(), 1);
+    }
+
+    #[test]
+    fn the_id_map_still_means_this_document_after_the_session_starts() {
+        // The check a join makes when it enters the world it has been building:
+        // every `Ref` the editor's half holds has to be an instance in *this*
+        // document. A map that names another document's refs (a Play that
+        // swapped the document, a document swapped back) writes every later
+        // delta into nothing — the world arrives once and then stands still.
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        live.apply(
+            &mut doc,
+            &[action(serde_json::json!({"sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Part", "properties": {"Name": "Floor"}}}))],
+            &mut conv,
+        );
+        assert_eq!(live.len(), 1);
+        assert!(live.matches(&doc), "the id means an instance of this document");
+
+        // Another document, made the way a Play session makes one: new refs,
+        // nothing of the live world in it.
+        let other = Document::empty();
+        assert!(!live.matches(&other), "the same ref means nothing in another document");
+        assert!(other.dom.get_by_ref(live.referent("3:1").unwrap()).is_none());
     }
 
     #[test]
