@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use rbx_dom_weak::types::{Ref, Variant, Vector3};
-use rustudio_join::session::{Session, Stage};
+use rustudio_join::session::{Session, Stage, REPLICATION_APPLICATION, REPLICATION_CHANNEL};
 use serde_json::Value;
 
 const STREAM: &str = include_str!("fixtures/join_stream.json");
@@ -343,4 +343,56 @@ fn replication_that_arrives_before_globals_is_held_and_then_fed() {
     );
     assert_eq!(out_of_order.ingested.refused, in_order.ingested.refused);
     assert_eq!(out_of_order.ingested.replication, in_order.ingested.replication);
+}
+
+/// M3's receive-only fix, as a test: **a marker request is answered**.
+///
+/// The server sends `132` on `(4, 1)` and waits for `131, 4` before it streams.
+/// Before this the session counted the request and answered nothing, so the
+/// handshake stayed open and the world arrived slowly or not at all — while the
+/// report showed a healthy packet count.
+///
+/// Asserted at the level the network loop reads: the dispatch has to leave a
+/// reply in `Session::outbound`, on the same application and channel the request
+/// arrived on, and the bytes have to be rove's own encoding.
+#[test]
+fn a_marker_request_leaves_a_reply_for_the_network_loop() {
+    let mut session = Session::new();
+    // A well-formed marker request: kind 132, a four-byte marker, nothing else.
+    // rove's `marker_reply` refuses anything that is not exactly this.
+    let request = [132u8, 1, 2, 3, 4];
+    assert!(
+        session.feed_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, &request),
+        "a marker request is accepted"
+    );
+    assert_eq!(session.markers, 1, "and counted");
+    assert_eq!(
+        session.outbound.len(),
+        1,
+        "a request the server waits on leaves a reply to write"
+    );
+    let (application, channel, reply) = &session.outbound[0];
+    assert_eq!((*application, *channel), (4, 1), "answered on its own stream");
+    // rove's encoding: kind 131, sub 4, the marker echoed, a zero trailer.
+    assert_eq!(reply, &vec![131u8, 4, 1, 2, 3, 4, 0]);
+
+    // And it is rove's own answer, not a second implementation of it.
+    let reference = rove_client_core::replication_out::marker_reply(&request)
+        .expect("rove answers this request");
+    assert_eq!(reply, &reference);
+}
+
+/// A marker the client cannot read is counted and does not leave a reply or end
+/// the session: the server's mistake is not the client's reason to disconnect.
+#[test]
+fn a_malformed_marker_is_refused_without_a_reply() {
+    let mut session = Session::new();
+    // Three bytes, not the five rove requires.
+    assert!(!session.feed_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, &[132u8, 1, 2]));
+    assert_eq!(session.markers, 1, "it was still a marker arrival");
+    assert_eq!(session.marker_refused, 1, "and its refusal is named");
+    assert!(
+        session.outbound.is_empty(),
+        "an unreadable request gets no invented answer"
+    );
 }
