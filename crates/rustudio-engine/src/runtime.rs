@@ -7315,23 +7315,21 @@ impl Runtime {
         if let Ok(mut w) = world(&self.lua) {
             w.core_scripts = installed;
         }
-        // **The loading screen first, then the entry script.** `LoadingScript`
-        // is what draws `RobloxLoadingGui` and is what takes it down again
-        // (`ReplicatedFirst:RemoveDefaultLoadingScreen()`); a client that starts
-        // only `StarterScript` draws no loading screen and, on a place that
-        // expects one, sits under whatever the platform put there. Its absence
-        // is not an error — a patch without it is an older patch.
-        match start_core_script(&self.lua, "LoadingScript", Ref::none()) {
-            Ok(_) => {}
-            // This crate links no logger (there is no `log` macro here): a
-            // script that would not start is Output, the same as any other
-            // script error, which is where a person looks for it.
-            Err(e) => {
-                if let Ok(mut w) = world(&self.lua) {
-                    w.output.push((
-                        Level::Warn,
-                        format!("CoreScripts: LoadingScript did not start: {}", describe_error(&e)),
-                    ));
+        // A join that is still receiving its initial world needs the loading
+        // screen. Play Solo is already loaded, and starting LoadingScript there
+        // can leave its CoreGui overlay over an otherwise running playtest.
+        // Likewise, do not start a stale loading screen if the core patch arrives
+        // after the live world has finished loading.
+        if world(&self.lua).is_ok_and(|w| !w.loaded) {
+            match start_core_script(&self.lua, "LoadingScript", Ref::none()) {
+                Ok(_) => {}
+                Err(e) => {
+                    if let Ok(mut w) = world(&self.lua) {
+                        w.output.push((
+                            Level::Warn,
+                            format!("CoreScripts: LoadingScript did not start: {}", describe_error(&e)),
+                        ));
+                    }
                 }
             }
         }
@@ -8990,6 +8988,50 @@ pub fn check_syntax(source: &str, name: &str) -> Option<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_loading_fires_loaded_once_after_world_is_entered() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Client);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.begin_loading();
+        rt.lua.load(r#"
+            assert(not game:IsLoaded())
+            loaded_events = 0
+            game.Loaded:Connect(function() loaded_events += 1 end)
+        "#).exec().unwrap();
+        // Like the player, remove and re-enter the world between frames.
+        let world = rt.leave();
+        rt.enter(world);
+        rt.finish_loading();
+        rt.finish_loading();
+        rt.lua.load("assert(game:IsLoaded() and loaded_events == 1)").exec().unwrap();
+    }
+
+    #[test]
+    fn loading_core_script_only_starts_for_an_unloaded_world() {
+        for loaded in [true, false] {
+            let rt = Runtime::new().unwrap();
+            let mut w = World::new(Document::new_place(), RunMode::Play);
+            w.side = Side::Client;
+            w.loaded = loaded;
+            rt.enter(w);
+            rt.bind_globals().unwrap();
+            let mut installed = rustudio_core::core_scripts::Installed::default();
+            // A tiny compiled script makes the start observable without a
+            // Studio patch or any dependency on the real loading GUI.
+            let bytecode = crate::bytecode_cache::compiler().compile("return").unwrap();
+            installed.scripts.insert("LoadingScript".into(), std::sync::Arc::from(bytecode));
+            let _ = rt.start_core_scripts(installed);
+            let w = rt.leave();
+            let started = w.orphans.iter().any(|r| {
+                w.d().dom.get_by_ref(*r).is_some_and(|i| i.name == "LoadingScript")
+            });
+            assert_eq!(started, !loaded);
+        }
+    }
 
     fn run(src: &str) -> Vec<(Level, String)> {
         run_in_place(Document::new_place(), src)

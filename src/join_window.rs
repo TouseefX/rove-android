@@ -81,6 +81,38 @@ const LIVE_SETTLE_QUIET: Duration = Duration::from_millis(500);
 /// person watching a cover for eight seconds has already decided it is broken.
 const LIVE_SETTLE_BOUND: Duration = Duration::from_secs(8);
 
+/// Decide using elapsed time, including on a frame where no batch arrived.
+fn live_settled(
+    first_age: Option<Duration>,
+    last_age: Option<Duration>,
+    has_player: bool,
+    has_character: bool,
+    has_parts: bool,
+) -> bool {
+    let Some(first_age) = first_age else { return false };
+    first_age >= LIVE_SETTLE_BOUND
+        || (has_player
+            && (has_character || has_parts)
+            && last_age.is_some_and(|age| age >= LIVE_SETTLE_QUIET))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LiveHandover {
+    Wait,
+    StartPlay,
+    FinishLoading,
+}
+
+fn live_handover(settled: bool, playing: bool, loaded: bool) -> LiveHandover {
+    if !settled || loaded {
+        LiveHandover::Wait
+    } else if playing {
+        LiveHandover::FinishLoading
+    } else {
+        LiveHandover::StartPlay
+    }
+}
+
 /// What the cover draws this frame.
 struct CoverPhase {
     steps: Vec<(String, CoverStep)>,
@@ -322,6 +354,10 @@ impl Editor {
             // only ran on a frame that had a batch to apply. So a session whose
             // packets had stopped, or had not started, stopped saying anything
             // about itself: exactly when a person most needs the line.
+            // A quiet interval (or the timeout) can only elapse on a frame
+            // without new batches. Check the handoff here as well as after
+            // applying a batch, otherwise neither Play nor Loaded can advance.
+            self.advance_live_handover();
             self.live_join_overlay();
             return;
         }
@@ -424,6 +460,13 @@ impl Editor {
                 self.game.doc.dom.len()
             ));
         }
+        self.advance_live_handover();
+        self.live_join_overlay();
+    }
+
+    /// Advance even on frames with no incoming batches: the quiet period and
+    /// timeout are measured from the last batch, not from a subsequent one.
+    fn advance_live_handover(&mut self) {
         // **And enter it — once the world has stopped arriving in bursts.**
         // Installing the world is not playing it: the document sits in the
         // editor looking like an opened `.rbxl`, with the explorer, the tabs and
@@ -442,27 +485,19 @@ impl Editor {
         // The right moment is a gap: the initial patch arrives as bursts, and
         // the quiet between two of them is the cheapest place to do seconds of
         // synchronous work. See `live_world_settled`.
-        if self.game.play.is_none() && self.live_world_settled() {
-            self.join_win.play_next_tick = true;
-        }
-        // **Settling is `DataModel.Loaded`.** Once Play is up and the initial
-        // world has stopped changing, `IsLoaded()` answers true, `Loaded` fires
-        // on the client DataModel, and whatever was waiting on it — a place's
-        // own loading screen, `game.Loaded:Wait()`, CoreScripts' `LoadingScript`
-        // — runs. `finish_loading` is idempotent: only the first call after
-        // `begin_loading` fires the signal. A place that keeps streaming still
-        // settles — on `LIVE_SETTLE_BOUND`'s floor, or as soon as a part is
-        // there — so a join is not held unloaded by a world that never stops.
-        if !self.join_win.loaded && self.game.play.is_some() && self.live_world_settled() {
-            // The runtime needs its world and document entered while firing
-            // Loaded. Use the public live-client entry point rather than reaching
-            // into PlaySession's private client state.
-            if self.game.with_live_client(|rt| rt.finish_loading()).is_some() {
-                self.join_win.loaded = true;
-                self.info("join: the world is loaded (DataModel.Loaded fired)");
+        let settled = !self.join_win.loaded && self.live_world_settled();
+        match live_handover(settled, self.game.play.is_some(), self.join_win.loaded) {
+            LiveHandover::Wait => {}
+            LiveHandover::StartPlay => self.join_win.play_next_tick = true,
+            LiveHandover::FinishLoading => {
+                // Loaded must fire with the live runtime's document entered.
+                // A normal Play test is not a live client and returns None.
+                if self.game.with_live_client(|rt| rt.finish_loading()).is_some() {
+                    self.join_win.loaded = true;
+                    self.info("join: the world is loaded (DataModel.Loaded fired)");
+                }
             }
         }
-        self.live_join_overlay();
     }
 
     /// Whether the initial world has arrived well enough to start Play on it.
@@ -491,6 +526,14 @@ impl Editor {
         let Some(first) = self.join_win.live_first_batch else {
             return false;
         };
+        // While still busy, or after the bound, no document scan is needed.
+        let first_age = Some(first.elapsed());
+        let last_age = self.join_win.live_last_batch.map(|at| at.elapsed());
+        if first_age.is_some_and(|age| age >= LIVE_SETTLE_BOUND)
+            || !last_age.is_some_and(|age| age >= LIVE_SETTLE_QUIET)
+        {
+            return live_settled(first_age, last_age, false, false, false);
+        }
         let doc = &self.game.doc;
         let root = doc.dom.root_ref();
         let local_player = doc
@@ -520,16 +563,13 @@ impl Editor {
                     .count()
             })
             .unwrap_or(0);
-        let quiet = self
-            .join_win
-            .live_last_batch
-            .is_some_and(|at| at.elapsed() >= LIVE_SETTLE_QUIET);
-        let bounded = first.elapsed() >= LIVE_SETTLE_BOUND;
-        let ready = local_player.is_some() && ((character || parts > 0) && quiet);
-        if bounded && !ready {
-            return true;
-        }
-        ready
+        live_settled(
+            Some(first.elapsed()),
+            self.join_win.live_last_batch.map(|at| at.elapsed()),
+            local_player.is_some(),
+            character,
+            parts > 0,
+        )
     }
 
     /// What the world is made of, and what was refused building it (M3).
@@ -1306,6 +1346,8 @@ impl Editor {
         self.join_win.live = None;
         self.join_win.cover_until_played = false;
         self.join_win.installed = false;
+        self.join_win.play_next_tick = false;
+        self.join_win.loaded = false;
         self.join_win.live_reported = false;
         self.join_win.live_report_at = None;
         if self.game.play.is_some() {
@@ -1769,6 +1811,8 @@ impl Editor {
         // Play would start mid-patch — the thing the settle rule exists to stop.
         self.join_win.live_first_batch = None;
         self.join_win.live_last_batch = None;
+        self.join_win.loaded = false;
+        self.join_win.play_next_tick = false;
         // A joined place fills the screen, as it does on Roblox: the game is
         // the whole window, not the dock's 3D view with Studio around it. That
         // is also what makes the joining cover a cover — and it is what
@@ -2002,3 +2046,28 @@ fn local_character_in(doc: &rustudio_core::doc::Document) -> Option<rbx_dom_weak
 }
 
 
+
+#[cfg(test)]
+mod live_handover_tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_world_advances_without_another_batch() {
+        // The first and last batch remain the same; only time passes.
+        let busy = live_settled(Some(Duration::from_millis(100)), Some(Duration::from_millis(100)), true, true, false);
+        assert_eq!(live_handover(busy, false, false), LiveHandover::Wait);
+        let quiet = live_settled(Some(LIVE_SETTLE_QUIET), Some(LIVE_SETTLE_QUIET), true, true, false);
+        assert_eq!(live_handover(quiet, false, false), LiveHandover::StartPlay);
+        assert_eq!(live_handover(quiet, true, false), LiveHandover::FinishLoading);
+        assert_eq!(live_handover(quiet, true, true), LiveHandover::Wait);
+    }
+
+    #[test]
+    fn timeout_advances_a_busy_or_incomplete_world_but_not_an_empty_join() {
+        assert!(!live_settled(None, None, false, false, false));
+        assert!(!live_settled(Some(LIVE_SETTLE_QUIET), Some(LIVE_SETTLE_QUIET), false, false, false));
+        assert!(live_settled(Some(LIVE_SETTLE_BOUND), Some(Duration::ZERO), false, false, false));
+        assert_eq!(live_handover(true, false, false), LiveHandover::StartPlay);
+        assert_eq!(live_handover(true, true, false), LiveHandover::FinishLoading);
+    }
+}

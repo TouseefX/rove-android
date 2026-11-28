@@ -1489,9 +1489,10 @@ impl Game {
         // world that was still arriving. Play Solo and the edit DataModel are
         // complete the moment they exist, and stay loaded.
         if network_client {
-            if let Some(rt) = self.play.as_ref().and_then(|s| s.client.as_ref()) {
-                rt.runtime.begin_loading();
-            }
+            // The World is stored on the side between calls, not in Lua app
+            // data. Enter it before setting the loading state, just as when
+            // finishing loading and firing Loaded.
+            self.with_live_client(|rt| rt.begin_loading());
         }
         rustudio_core::load_trace::mark("play: globals bound");
         // Studio loads every plugin again in the Play server and client
