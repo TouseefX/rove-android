@@ -116,6 +116,17 @@ const DRAIN_BATCH: usize = 64;
 #[cfg(feature = "transport")]
 const WRITE_STALL_MS: u64 = 5_000;
 
+/// **How long a live session may go without a packet before it says so.**
+///
+/// A world arrives in bursts and a streamed place goes quiet between them, so
+/// this is not a failure threshold — nothing is closed at it. What it is: the
+/// line that names a stall while it is happening, with the numbers that tell a
+/// blocked loop from a silent server. Three seconds is long enough that a
+/// healthy join never prints it (the initial patch is continuous) and short
+/// enough that it appears inside the freeze a person is looking at.
+#[cfg(feature = "transport")]
+const STALL_REPORT_MS: u64 = 3_000;
+
 /// Where a session got to. A `stage` is what a diagnostics overlay shows when a
 /// join fails: the difference between "we never dialled" and "we dialled and the
 /// server hung up" is the whole diagnosis.
@@ -268,6 +279,21 @@ pub struct Session {
     /// retained count, which prunes to zero as the session keeps up.
     pub rows_applied: u64,
     pub acknowledged_errors: usize,
+    /// A region has arrived, so this place streams (`note_regions`). Until then
+    /// no focus is sent: the streamer does not exist to read one. See `refocus`.
+    pub streamer_seen: bool,
+    /// When a packet last arrived (reliable or datagram).
+    last_packet_at: Option<std::time::Instant>,
+    /// Times the physics uplink had no pose to send (see `PhysicsWriter::tick`):
+    /// `physics_frames_sent == 0, physics_skipped > 0` is a client that is
+    /// running and has nothing to say about its own character.
+    pub physics_skipped: u64,
+    /// Heartbeats the loop actually served. A session whose `stall_ticks` stops
+    /// rising while a stall is reported is a loop blocked inside a write.
+    pub stall_ticks: u64,
+    /// Stall lines printed, so a test can assert the report happened and the
+    /// end-of-session summary can say whether the session ever went quiet.
+    pub stalls_reported: u64,
     /// Reliable writes that took longer than [`WRITE_STALL_MS`] and were given
     /// up on. A non-zero value is the one explanation for a session whose
     /// counters froze: every write in this loop goes through one sender whose
@@ -485,6 +511,11 @@ impl Session {
             marker_replies: 0,
             started: std::time::Instant::now(),
             rows_applied: 0,
+            streamer_seen: false,
+            last_packet_at: None,
+            physics_skipped: 0,
+            stall_ticks: 0,
+            stalls_reported: 0,
             acknowledged_through: 0,
             acknowledged_errors: 0,
             writes_stalled: 0,
@@ -817,6 +848,7 @@ impl Session {
         clock: &SessionWireClock,
         sync: &mut TimeSyncProbe,
     ) -> bool {
+        self.last_packet_at = Some(std::time::Instant::now());
         let Some(&(application, channel)) = self.channels.get(&wire_id) else {
             self.unknown_datagrams += 1;
             if self.unknown_datagrams == 1 {
@@ -859,7 +891,14 @@ impl Session {
         // character, so this is the region the player is actually in. Before the
         // first frame that says, the spawn region's own focus (`note_regions`)
         // is the only one that can be honest — and it has already been sent.
+        // The editor asks every frame (`LiveWorld::focus`), and on a place with
+        // no streamer there is nobody to ask: the spawn region is the whole
+        // world and a focus packet every tenth of a second is traffic about
+        // nothing. Before the first region, `self.streamer_seen` is false.
         if let Some(position) = from_editor {
+            if !self.streamer_seen {
+                return false;
+            }
             return self.request_focus(position, false);
         }
         // Otherwise the timeout decides: a focus lapses (`FOCUS_TIMEOUT_MS`),
@@ -1097,6 +1136,14 @@ impl Session {
     /// Region coordinates arrive as 64-stud cell indices; a focus point is world
     /// studs, so the cell centre is what to ask for — rove's own conversion.
     /// Sent on `(4, 1)`, cycling the id the server echoes back.
+    /// `note_regions` for a test: the region arithmetic and the focus gate are
+    /// what the tests in `tests/focus_only_when_streaming.rs` are about, and
+    /// driving them through a whole recorded stream would test the recording
+    /// instead. The body is identical — this is not a second path.
+    pub fn note_regions_for_test(&mut self, regions: &[serde_json::Value]) {
+        self.note_regions(regions);
+    }
+
     fn note_regions(&mut self, regions: &[serde_json::Value]) {
         self.regions += regions.len();
         let Some(center) = regions
@@ -1110,8 +1157,16 @@ impl Session {
         let to_stud = |index: usize| {
             (center[index].as_f64().unwrap_or(0.0) * 64.0 + 32.0) as f32
         };
-        // The region centre in studs, sent as a focus: the streamer reads these
-        // and nothing else before a character exists to follow.
+        // **The region centre in studs, sent as a focus** — and only once a
+        // region has actually arrived. `note_regions` is the only place a
+        // region is seen, so the focus this sends is the answer to a stream the
+        // server has already started: a place that is *not* streaming sends no
+        // regions, and this then sends nothing, which is what a non-streaming
+        // place expects (a focus for it is a packet about a streamer that does
+        // not exist there). The keep-alive in `refocus` is deliberately *not*
+        // gated this way: a focus lapses (`FOCUS_TIMEOUT_MS`) and the region
+        // must not stop streaming while the character stands still.
+        self.streamer_seen = true;
         self.request_focus(
             [to_stud(0), to_stud(1), to_stud(2)],
             self.focus_last_sent.is_none(),
@@ -1402,6 +1457,7 @@ impl Session {
     }
 
     fn note_arrival(&mut self, application: u8, channel: u32, payload: &[u8]) {
+        self.last_packet_at = Some(std::time::Instant::now());
         let kind = payload.first().copied().unwrap_or(0);
         *self.arrivals.entry((application, channel, kind)).or_default() += 1;
     }
@@ -1847,6 +1903,72 @@ impl Session {
         (sent, pending)
     }
 
+    /// **Names a stall while it is happening.** See [`STALL_REPORT_MS`].
+    ///
+    /// Everything here is a counter or a map length — no document reads, no
+    /// allocation beyond the line itself — because it runs on the session's own
+    /// loop and the loop is the thing being measured.
+    fn report_stall(&mut self, silent_for: std::time::Duration, ticks: u64) {
+        self.stalls_reported += 1;
+        let (frames, ack_packets, ack_pending) = self.property_ack_counts();
+        let held = self.held_packets.len();
+        // The most recent arrivals, by `(application, channel, kind)`: the one
+        // line that says what a server is still sending when the world is not
+        // moving (a keep-alive only? pings only? the world, refused?).
+        let mut arrivals: Vec<_> = self.arrivals.iter().collect();
+        arrivals.sort_by_key(|(_, &n)| std::cmp::Reverse(n));
+        let top: String = arrivals
+            .iter()
+            .take(4)
+            .map(|((application, channel, kind), n)| format!("{application}/{channel}:{kind}x{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::warn!(
+            "session: quiet for {} ms after {} s — {} pkt ({} rep, {} refused, {} rows), \
+             held {}, frames {} (acks {} out, {} pending), physics {}/{} ({} skipped), focus {} ({} ready), \
+             datagrams {}/{}, writes {} stalled {} refused, {} tick(s) served since the last \
+             line, top arrivals: {}",
+            silent_for.as_millis(),
+            self.started.elapsed().as_secs(),
+            self.ingested.packets,
+            self.ingested.replication,
+            self.ingested.refused,
+            self.rows_applied,
+            held,
+            frames,
+            ack_packets,
+            ack_pending,
+            self.physics_frames_sent,
+            self.physics_frames_failed,
+            self.physics_skipped,
+            self.focus_sent,
+            self.streaming_ready_sent,
+            self.datagrams_fed,
+            self.unknown_datagrams,
+            self.writes_stalled,
+            self.writes_refused,
+            ticks,
+            if top.is_empty() { "(none)".to_string() } else { top },
+        );
+        // And the editor's own counters, so its overlay is not the last word:
+        if let Some(handover) = &self.handover {
+            handover.set_counters(self.overlay_counters());
+        }
+    }
+
+    /// **The `CFrame` ledger, for a stall's log line.** rove's queue counts what
+    /// it was *handed* — `received_cframe_changes` — separately from what it
+    /// could send, which is the difference that names the fault: changes
+    /// arriving with `packets_sent == 0` and `pending == 0` is a queue refusing
+    /// every one of them (an index or a schema mismatch), while zero changes at
+    /// all is a server that never sent a frame, and neither is the same bug as
+    /// an acknowledgment that went out and was not committed.
+    pub fn property_ack_counts(&self) -> (u64, u64, u64) {
+        let report = self.property_acks.report();
+        let n = |k: &str| report.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        (n("received_cframe_changes"), n("packets_sent"), n("pending"))
+    }
+
     /// Rows the journal holds. A counter, not a scan: this is polled by a
     /// progress callback while the session runs, and `read_after(.., 4096)`
     /// walks the whole journal every time it is asked.
@@ -2138,6 +2260,19 @@ pub async fn run(
     // datagrams, never on a reliable stream, which is why the loop reads them.
     let mut sync_tick = tokio::time::interval(std::time::Duration::from_millis(20));
     sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // **A stall is named while it is happening, not after the session ends.**
+    // A join that freezes is reported from a phone as a screenshot of an
+    // overlay reading `236 pkt / 216 rep / acks 0 / phys 0`, and every number
+    // in that line is consistent with three different faults: the loop is
+    // wedged on a write, the server has stopped sending, and the loop is
+    // turning but nothing is being fed. The heartbeat below fires only when
+    // nothing has arrived for [`STALL_REPORT`] — so a healthy session logs
+    // nothing at all — and it prints what tells them apart, including what the
+    // loop did during the silence.
+    let mut stall_tick = tokio::time::interval(std::time::Duration::from_millis(STALL_REPORT_MS));
+    stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_stall_report: Option<std::time::Instant> = None;
+    let mut ticks_since_report = 0u64;
     loop {
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             end = Some("the session's deadline passed");
@@ -2252,6 +2387,27 @@ pub async fn run(
             }
             // A time-sync request due now. Unreliable on purpose: it is a
             // probe, and a lost one is retried on the next interval.
+            _ = stall_tick.tick() => {
+                // A tick that keeps being served is a loop that is turning; one
+                // that is not served is a loop blocked in a write, and the
+                // difference is the whole diagnosis. (Only a *silent* session is
+                // reported, and only once per silence.)
+                ticks_since_report += 1;
+                session.stall_ticks += 1;
+                let silent_for = session
+                    .last_packet_at
+                    .map(|at| at.elapsed())
+                    .unwrap_or_else(|| session.started.elapsed());
+                if silent_for >= std::time::Duration::from_millis(STALL_REPORT_MS) {
+                    let repeat = last_stall_report
+                        .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(STALL_REPORT_MS));
+                    if repeat {
+                        last_stall_report = Some(std::time::Instant::now());
+                        session.report_stall(silent_for, ticks_since_report);
+                        ticks_since_report = 0;
+                    }
+                }
+            }
             _ = sync_tick.tick() => {
                 // **The replicator wire clock, not a local one.** A root frame's
                 // timestamp is read by the server against the same clock the
@@ -2411,6 +2567,16 @@ pub async fn run(
     // join ended because the server opened no further stream". The write
     // counters are here for the same reason: a loop that gave up on a write is
     // a session that looked alive and was not.
+    // A session that was quiet at any point says so in its last line too: the
+    // stall reports above are `warn`s a log may have rotated past, and the
+    // summary is what a phone's "copy the log" hands over.
+    if session.stalls_reported > 0 {
+        log::warn!(
+            "session: {} stall report(s) during this session; {} heartbeat(s) served",
+            session.stalls_reported,
+            session.stall_ticks,
+        );
+    }
     log::info!(
         "session: ended ({}) after {} s; {} stalled write(s), {} refused, {} \
          batch(es) still waiting for the editor",
@@ -2654,7 +2820,12 @@ impl PhysicsWriter {
             .and_then(|live| live.character_pose())
         else {
             // No character, or a pose too old to describe one: nothing to say,
-            // and an old record is worse than silence.
+            // and an old record is worse than silence. Counted, because `phys 0`
+            // in a stall report is this line and nothing else: whether the
+            // editor has a pose at all (`character_pose` is `None`) or nobody
+            // owns the character to publish one (`play_owned_root`) are two
+            // different answers, and the session cannot see which.
+            session.physics_skipped = session.physics_skipped.saturating_add(1);
             return false;
         };
         if !self.announced {

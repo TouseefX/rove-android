@@ -6233,7 +6233,12 @@ impl Game {
             self.read_client_input_state();
             // Shift lock / first person: the root turns to the camera RenderStepped
             // left, before the frame is drawn (play_humanoid.rs `hum_face_camera`).
-            if mode == RunMode::Play && studio_path() {
+            // **A live client runs it too.** `RunMode::Play` only left every
+            // joined session with a body that never turned with its camera:
+            // `client_camera_heading` reads the client's `Camera`, and on a live
+            // client that is `self.doc` (group 2). `camera_relative` is what
+            // decides whether the place asked for it; the mode does not.
+            if matches!(mode, RunMode::Play | RunMode::Client) && studio_path() {
                 self.hum_face_camera();
             }
             if !remotes_after_adopt {

@@ -7323,7 +7323,17 @@ impl Runtime {
         // is not an error — a patch without it is an older patch.
         match start_core_script(&self.lua, "LoadingScript", Ref::none()) {
             Ok(_) => {}
-            Err(e) => log::warn!("CoreScripts: LoadingScript did not start: {}", describe_error(&e)),
+            // This crate links no logger (there is no `log` macro here): a
+            // script that would not start is Output, the same as any other
+            // script error, which is where a person looks for it.
+            Err(e) => {
+                if let Ok(mut w) = world(&self.lua) {
+                    w.output.push((
+                        Level::Warn,
+                        format!("CoreScripts: LoadingScript did not start: {}", describe_error(&e)),
+                    ));
+                }
+            }
         }
         match start_core_script(&self.lua, "StarterScript", Ref::none()) {
             Ok(Some(_)) => Ok(()),
