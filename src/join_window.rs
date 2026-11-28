@@ -454,14 +454,10 @@ impl Editor {
         // settles — on `LIVE_SETTLE_BOUND`'s floor, or as soon as a part is
         // there — so a join is not held unloaded by a world that never stops.
         if !self.join_win.loaded && self.game.play.is_some() && self.live_world_settled() {
-            if let Some(rt) = self
-                .game
-                .play
-                .as_ref()
-                .and_then(|p| p.client.as_ref())
-                .map(|c| c.runtime.clone())
-            {
-                rt.finish_loading();
+            // The runtime needs its world and document entered while firing
+            // Loaded. Use the public live-client entry point rather than reaching
+            // into PlaySession's private client state.
+            if self.game.with_live_client(|rt| rt.finish_loading()).is_some() {
                 self.join_win.loaded = true;
                 self.info("join: the world is loaded (DataModel.Loaded fired)");
             }
