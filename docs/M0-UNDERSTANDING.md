@@ -522,6 +522,22 @@ needs for a screenshot. M1 therefore adds one job to `ci.yml` (or a new
 `cat` the result and list the screenshot before uploading it — printing numbers
 into the log is mandatory because artifacts cannot be downloaded back.
 
+**A correction to "tests on macOS only", from what that turned out to cost.**
+The macOS suite has failed on every run of this tree: `ui_literals_use_bundled_glyphs`
+reports a UI string no bundled font can draw, and because the test is where the
+suite runs, the failure appeared a queue-length after the push, on the slowest
+runner, in a job that also had to build and link everything. It never once
+acted as a gate — the same test was red while the string it named was still in
+the tree.
+
+The rule it enforces is a property of the *source*, so `check` applies it now,
+on ubuntu and windows, in three minutes: `tools/ci/ui_glyphs_preflight.py`
+(same scan, no toolchain — the only test-shaped check the Linux runner can run
+without a display) followed by `cargo test -p rustudio --test ui_glyphs`
+itself, so the cheap scan and the authority run side by side and a disagreement
+is visible in the fast job. The macOS suite keeps running the whole thing; it
+is no longer the only place this can be found.
+
 On the remote, workflow id `431220484` is `Android` at
 `.github/workflows/android.yml` and is *active*, although `main`'s tree at
 `70b24c3` has no such file: Git registers a workflow the first time it appears
