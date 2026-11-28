@@ -85,9 +85,8 @@ pub const MAX_DATAGRAM_CHANNELS: usize = 16;
 
 /// The radius a streaming server is asked to keep loaded, and how long the
 /// focus stands before it lapses. rove's own client sends exactly these
-/// (`live_session.rs:762`: `512.0`, `4000`) — generous on purpose: without a
-/// focus the streamer has no idea what to send, so the spawn region never
-/// materializes and the place is a character in an empty sky.
+/// (`live_session.rs`: `512.0`, `4000`). The effect of disabling focus on
+/// different streaming places remains to be measured.
 pub const FOCUS_RADIUS_STUDS: f32 = 512.0;
 pub const FOCUS_TIMEOUT_MS: u32 = 4000;
 
@@ -284,9 +283,11 @@ pub struct Session {
     /// Remote replication events seen; the live RPC runtime bridge is not yet wired.
     pub remote_events_seen: u64,
     pub acknowledged_errors: usize,
-    /// A region has arrived, so this place streams (`note_regions`). Until then
-    /// no focus is sent: the streamer does not exist to read one. See `refocus`.
+    /// A region has arrived (`note_regions`). Focus also requires explicit opt-in.
     pub streamer_seen: bool,
+    /// Diagnostic opt-in, captured once per session. Resume acknowledgments are
+    /// independent of this experiment.
+    focus_enabled: bool,
     /// When a packet last arrived (reliable or datagram).
     last_packet_at: Option<std::time::Instant>,
     /// Times the physics uplink had no pose to send (see `PhysicsWriter::tick`):
@@ -490,6 +491,13 @@ impl Session {
     /// A session over an empty place. The document is a bare DataModel, which
     /// is what a join's globals packet fills with the place's roots.
     pub fn new() -> Self {
+        // Match rove's experimental opt-in semantics: presence enables it.
+        Self::with_focus_enabled(std::env::var_os("ROVE_SEND_FOCUS").is_some())
+    }
+
+    /// Construct a session with an explicit focus policy. Useful for controlled
+    /// comparisons without mutating the process environment in parallel tests.
+    pub fn with_focus_enabled(focus_enabled: bool) -> Self {
         // `with_limits_live`: a join's packets come from a real server, and a
         // record this client cannot fully decode must cost that record, not
         // the packet (upstream's lenient ISR policy; see rove's session.rs).
@@ -520,6 +528,7 @@ impl Session {
             rows_applied: 0,
             remote_events_seen: 0,
             streamer_seen: false,
+            focus_enabled,
             last_packet_at: None,
             physics_skipped: 0,
             stall_ticks: 0,
@@ -888,9 +897,8 @@ impl Session {
     ///
     /// Called on the same tick as the clock probe, not by the renderer: the join
     /// is a thread of its own and the editor's camera is on the other side of
-    /// the handover. The position reused is the last one sent — a focus names a
-    /// *region*, and the server keeps it for `FOCUS_TIMEOUT_MS` — so an idle
-    /// character's region does not lapse and stop streaming.
+    /// the handover. When enabled, reuse the last position to refresh the focus
+    /// before `FOCUS_TIMEOUT_MS` expires.
     ///
     /// Returns whether a packet was queued (the caller flushes).
     ///
@@ -901,7 +909,7 @@ impl Session {
         // Where the view is, if the editor has said: the camera moves with the
         // character, so this is the region the player is actually in. Before the
         // first frame that says, the spawn region's own focus (`note_regions`)
-        // is the only one that can be honest — and it has already been sent.
+        // is the only candidate, if this experiment is enabled.
         // The editor asks every frame (`LiveWorld::focus`); on a place with no
         // streamer there is nobody to ask, and `request_focus` is where that is
         // decided.
@@ -937,25 +945,19 @@ impl Session {
             })
     }
 
-    /// **Where we are, for the server's streamer.** A streaming place sends the
-    /// parts around the client's `ReplicationFocus` and nothing else, so a
-    /// client that never sends one is a client that gets the spawn region and
-    /// then silence — which is a spawn, a skybox and no map.
+    /// **Where we are, for the server's streamer.** Focus is experimental and
+    /// requires `ROVE_SEND_FOCUS` and a received region. Disabling it may limit
+    /// streaming in some places.
     ///
     /// Sent when the position has moved meaningfully since the last one, not
     /// every frame: a focus packet names a radius, and re-sending the same
     /// region is asking for parts that already arrived. `force` sends once
     /// regardless, for the first frame after the character binds.
     pub fn request_focus(&mut self, position: [f32; 3], force: bool) -> bool {
-        // **No region has arrived, so there is no streamer to answer.** A place
-        // that streams sends its spawn region before any of its parts; a place
-        // that does not never sends one, and a focus for it is a packet about a
-        // streamer that does not exist there. The gate is here, in the one
-        // method that queues a focus, so no caller can get round it — the
-        // editor's per-frame position, the spawn region and the keep-alive all
-        // come through this door. (`note_regions` sets `streamer_seen` *before*
-        // it calls this for the region it just read.)
-        if !self.streamer_seen {
+        // Keep focus experimental while investigating server silence. This
+        // single queueing gate covers region, editor, and refresh requests; it
+        // does not gate the separately prepared streaming-ready acknowledgment.
+        if !self.focus_enabled || !self.streamer_seen {
             self.focus_position = Some(position);
             return false;
         }
@@ -1176,15 +1178,8 @@ impl Session {
         let to_stud = |index: usize| {
             (center[index].as_f64().unwrap_or(0.0) * 64.0 + 32.0) as f32
         };
-        // **The region centre in studs, sent as a focus** — and only once a
-        // region has actually arrived. `note_regions` is the only place a
-        // region is seen, so the focus this sends is the answer to a stream the
-        // server has already started: a place that is *not* streaming sends no
-        // regions, and this then sends nothing, which is what a non-streaming
-        // place expects (a focus for it is a packet about a streamer that does
-        // not exist there). The keep-alive in `refocus` is deliberately *not*
-        // gated this way: a focus lapses (`FOCUS_TIMEOUT_MS`) and the region
-        // must not stop streaming while the character stands still.
+        // All focus requests, including this region and later keep-alives,
+        // go through the same opt-in and region gate in request_focus.
         self.streamer_seen = true;
         self.request_focus(
             [to_stud(0), to_stud(1), to_stud(2)],
@@ -2218,7 +2213,7 @@ pub async fn run(
     };
     let mut sync = TimeSyncProbe::default();
     sync.start(&clock).map_err(|_| "the time-sync probe could not be started")?;
-    log::info!("session: wire clock initialized, clock channels 6/1, 6/2, 6/3 announced");
+    log::info!("session: wire clock initialized, clock channels 6/1, 6/2, 6/3 announced; experimental focus enabled={}", session.focus_enabled);
 
     // The five login packets, in the order the server reads them.
     let packets = login_packets(issued).map_err(|_| "login packets could not be encoded")?;

@@ -1,39 +1,61 @@
-//! **A focus is an answer to a streamer, not a heartbeat.**
-//!
-//! `ReplicationFocus` exists for places that stream: the server sends the parts
-//! around it and nothing else, so a client that never sends one gets a spawn and
-//! silence — and a client that sends one to a place that does not stream is
-//! sending a packet about a streamer that does not exist there, which is traffic
-//! on the one reliable stream whose stalls cost the most.
-//!
-//! The rule this file pins: *no region has arrived, so no focus is sent.*
-//! `note_regions` is the only place a region is ever seen, so the first focus is
-//! the answer to a stream the server has already started; before that, the
-//! editor's per-frame position — which `LiveWorld::focus` supplies from the very
-//! first frame of a join — is not sent at all.
+//! Focus is experimental: only opt-in sessions with a received region queue it.
+//! These tests use explicit policies rather than racing on process environment.
 
-use rustudio_join::session::Session;
+use rustudio_join::session::{Outbound, Session, REPLICATION_APPLICATION, REPLICATION_CHANNEL};
 
 #[test]
-fn no_focus_is_sent_before_a_region_arrives() {
-    let mut session = Session::new();
-    assert!(!session.streamer_seen, "nothing has streamed yet");
-    // The editor asks every frame. Before a region, the answer is no — and not
-    // even a forced one, which is what a keep-alive would pass.
-    assert!(!session.refocus(Some([0.0, 5.0, 0.0])), "a non-streaming place is not asked about");
-    // The gate is in `request_focus` — the one place a focus is queued — so no
-    // caller gets round it, including a forced one.
-    assert!(!session.request_focus([0.0, 5.0, 0.0], true), "nothing was queued for it");
-    assert_eq!(session.focus_sent, 0, "and nothing reached the wire");
+fn unset_environment_disables_focus_by_default() {
+    // Isolate the environment from the rest of the parallel test process.
+    const CHILD: &str = "ROVE_FOCUS_DEFAULT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(std::env::var_os("ROVE_SEND_FOCUS").is_none());
+        let mut session = Session::new();
+        session.note_regions_for_test(&[serde_json::json!({"coordinate": [0, 0, 0]})]);
+        assert_eq!(session.focus_sent, 0);
+        assert!(session.outbound.is_empty());
+    } else {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unset_environment_disables_focus_by_default"])
+            .env(CHILD, "1")
+            .env_remove("ROVE_SEND_FOCUS")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 }
 
 #[test]
-fn a_streamed_place_still_gets_its_focus() {
-    let mut session = Session::new();
-    // The spawn region as the record carries it: a cell coordinate, 64 studs a
-    // side with the centre at +32 (`note_regions`' own arithmetic).
-    let regions = vec![serde_json::json!({"coordinate": [0.0, 0.0, 0.0]})];
-    session.note_regions_for_test(&regions);
-    assert!(session.streamer_seen, "a region arrived: this place streams");
-    assert!(session.focus_sent > 0, "the spawn region is answered with a focus");
+fn focus_disabled_even_after_region_and_forced_requests() {
+    let mut session = Session::with_focus_enabled(false);
+    session.note_regions_for_test(&[serde_json::json!({"coordinate": [0, 0, 0]})]);
+    assert!(session.streamer_seen);
+    assert_eq!(session.regions, 1);
+    assert!(!session.refocus(Some([0.0, 5.0, 0.0])));
+    assert!(!session.request_focus([64.0, 5.0, 0.0], true));
+    assert!(!session.refocus(None));
+    assert_eq!(session.focus_sent, 0);
+    assert!(session.outbound.is_empty());
+}
+
+#[test]
+fn opt_in_still_requires_a_region() {
+    let mut session = Session::with_focus_enabled(true);
+    assert!(!session.refocus(Some([0.0, 5.0, 0.0])));
+    assert!(!session.request_focus([0.0, 5.0, 0.0], true));
+    assert_eq!(session.focus_sent, 0);
+    assert!(session.outbound.is_empty());
+}
+
+#[test]
+fn opt_in_region_queues_focus_and_editor_can_refocus() {
+    let mut session = Session::with_focus_enabled(true);
+    session.note_regions_for_test(&[serde_json::json!({"coordinate": [0, 0, 0]})]);
+    assert!(session.streamer_seen);
+    assert_eq!(session.focus_position, Some([32.0, 32.0, 32.0]));
+    assert_eq!(session.focus_sent, 1);
+    assert!(matches!(session.outbound.as_slice(), [Outbound::Reply(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload)] if !payload.is_empty()));
+    assert!(!session.refocus(Some([32.0, 32.0, 32.0])));
+    assert!(session.refocus(Some([160.0, 32.0, 32.0])));
+    assert_eq!(session.focus_sent, 2);
+    assert_eq!(session.outbound.len(), 2);
 }
