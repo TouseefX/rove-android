@@ -170,6 +170,9 @@ impl Game {
         // client — the replicated place, which is the document it draws.
         let live = mode == RunMode::Client;
         let crs = if live {
+            // (`root` is the server DataModel's, read above — a live client's
+            // own RunService is found in the document it draws.)
+            let root = self.doc.dom.root_ref();
             self.doc.find_child(root, "RunService")
         } else {
             self.play.as_ref().and_then(|s| s.other_doc.as_ref()).and_then(|cd| {

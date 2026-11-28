@@ -194,6 +194,8 @@ pub struct JoinWindow {
     /// document and the join window must not hold the editor mutably while it
     /// asks for it.
     pub play_next_tick: bool,
+    /// `DataModel.Loaded` has fired on the joined client (group 4).
+    pub loaded: bool,
     /// The last time a replication batch was applied, for the settle rule: Play
     /// must start *between* bursts of the initial world, not in the middle of
     /// them (`LIVE_SETTLE_QUIET`).
@@ -233,6 +235,7 @@ impl JoinWindow {
             live_applied: 0,
             core_gui_was: None,
             play_next_tick: false,
+            loaded: false,
             live_last_batch: None,
             live_first_batch: None,
         }
@@ -441,6 +444,27 @@ impl Editor {
         // synchronous work. See `live_world_settled`.
         if self.game.play.is_none() && self.live_world_settled() {
             self.join_win.play_next_tick = true;
+        }
+        // **Settling is `DataModel.Loaded`.** Once Play is up and the initial
+        // world has stopped changing, `IsLoaded()` answers true, `Loaded` fires
+        // on the client DataModel, and whatever was waiting on it — a place's
+        // own loading screen, `game.Loaded:Wait()`, CoreScripts' `LoadingScript`
+        // — runs. `finish_loading` is idempotent: only the first call after
+        // `begin_loading` fires the signal. A place that keeps streaming still
+        // settles — on `LIVE_SETTLE_BOUND`'s floor, or as soon as a part is
+        // there — so a join is not held unloaded by a world that never stops.
+        if !self.join_win.loaded && self.game.play.is_some() && self.live_world_settled() {
+            if let Some(rt) = self
+                .game
+                .play
+                .as_ref()
+                .and_then(|p| p.client.as_ref())
+                .map(|c| c.runtime.clone())
+            {
+                rt.finish_loading();
+                self.join_win.loaded = true;
+                self.info("join: the world is loaded (DataModel.Loaded fired)");
+            }
         }
         self.live_join_overlay();
     }

@@ -6232,7 +6232,21 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             world(lua)?.requests.sits.push((this, h));
             none()
         }
-        "HasAppearanceLoaded" | "IsLoaded" => one(Value::Boolean(true)),
+        "HasAppearanceLoaded" => one(Value::Boolean(true)),
+        // **`DataModel:IsLoaded()` is the world's, not a constant.** A loading
+        // screen waits on it, and a constant `true` dismissed that screen on the
+        // first frame of a join, before the map had arrived. Every other
+        // instance answers `true`, as before — asked inside the arm, because a
+        // `world(lua)` in a match *guard* keeps the document borrowed for the
+        // whole arm and the `loaded` read below would find it taken.
+        "IsLoaded" => {
+            let root = world(lua).map(|w| w.d().dom.root_ref()).unwrap_or_else(|_| Ref::none());
+            if this == root && root.is_some() {
+                one(Value::Boolean(world(lua)?.loaded))
+            } else {
+                one(Value::Boolean(true))
+            }
+        }
         "SetCoreGuiEnabled" | "GetCoreGuiEnabled" => {
             // StarterGui::setCoreGuiEnabled / getCoreGuiEnabled
             // client only; All (4) sets every type 0..9; one
@@ -6613,7 +6627,27 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             }
             one(Value::Nil)
         }
-        "RemoveDefaultLoadingScreen" => none(),
+        // Both names, one fact: the place has taken the loading screen down
+        // itself. A second call must not un-set it, and the event fires once.
+        "RemoveDefaultLoadingScreen" | "SetDefaultLoadingGuiRemoved" => {
+            let was = world(lua).is_ok_and(|mut w| !std::mem::replace(&mut w.loading_screen_removed, true));
+            if was {
+                if let Ok(mut w) = world(lua) {
+                    if w.d().exists(this) {
+                        w.fire(this, "DefaultLoadingGuiRemoved", vec![]);
+                    }
+                }
+            }
+            none()
+        }
+        "IsDefaultLoadingScreenRemoved" | "IsDefaultLoadingGuiRemoved" => one(Value::Boolean(
+            world(lua).map(|w| w.loading_screen_removed).unwrap_or(false),
+        )),
+        // The place's first world has arrived on this client (`DataModel.Loaded`
+        // is the same fact for the whole DataModel).
+        "IsFinishedReplicating" => one(Value::Boolean(
+            world(lua).map(|w| w.loading_screen_removed || w.loaded).unwrap_or(true),
+        )),
         "RegisterKeyframeSequence" | "RegisterActiveKeyframeSequence" => {
             // A temporary content id for the sequence (Studio hands out a hash id).
             let seq = opt_inst(&arg(args, 1))

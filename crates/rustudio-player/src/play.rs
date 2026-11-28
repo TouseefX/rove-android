@@ -904,10 +904,7 @@ impl Game {
         host.document_changed(&self.doc);
     }
 
-    /// Runs `f` with one side's runtime entered (its DataModel lent to Lua).
-    /// `peer` is the other side's DataModel. Must be called with the server
-    /// in front. Output is tagged with the side.
-    /// Replays a live batch's document changes through the client's runtime.
+    /// Runs `f` with the client's runtime entered, in a live session.
     ///
     /// A **client-side only** entry: nothing here may run on the server (a live
     /// session has none), and the caller is the join window's bridge
@@ -924,6 +921,9 @@ impl Game {
         self.with_side(Side::Client, |rt, _, _| f(rt))
     }
 
+    /// Runs `f` with one side's runtime entered (its DataModel lent to Lua).
+    /// `peer` is the other side's DataModel. Must be called with the server
+    /// in front. Output is tagged with the side.
     pub(crate) fn with_side<R>(
         &mut self,
         side: Side,
@@ -1481,6 +1481,17 @@ impl Game {
         self.with_side(Side::Server, bind);
         if two || network_client {
             self.with_side(Side::Client, bind);
+        }
+        // **A live client is not loaded yet.** `DataModel:IsLoaded()` and
+        // `DataModel.Loaded` were a constant `true`, so a join's own loading
+        // screen (CoreScripts' `LoadingScript`, or a place's own) dismissed
+        // itself on the first frame and `game.Loaded:Wait()` returned over a
+        // world that was still arriving. Play Solo and the edit DataModel are
+        // complete the moment they exist, and stay loaded.
+        if network_client {
+            if let Some(rt) = self.play.as_ref().and_then(|s| s.client.as_ref()) {
+                rt.runtime.begin_loading();
+            }
         }
         rustudio_core::load_trace::mark("play: globals bound");
         // Studio loads every plugin again in the Play server and client
@@ -5336,6 +5347,10 @@ impl Game {
         let mut seat_change: Option<SeatChange> = None;
         let mut move_event: Option<(&'static str, f32)> = None;
         let mut running_speed: Option<f32> = None;
+        // (a live client has no second document for `hum_post` to write a
+        // client `FloorMaterial` into, so nothing writes the variable below;
+        // it is still set for the Play Solo path)
+        #[allow(unused_assignments)]
         let mut floor_changed: Option<u32> = None;
         let mut humanoid_ref = Ref::none();
         {

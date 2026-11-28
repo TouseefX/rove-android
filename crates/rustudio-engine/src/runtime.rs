@@ -186,6 +186,19 @@ pub struct World {
     conn_seq: u64,
     /// Instances were reparented, created or destroyed.
     pub structure_changed: bool,
+    /// **Has the client finished receiving the place?** `DataModel:IsLoaded()`
+    /// and `DataModel.Loaded` are what a loading screen waits on, and both were
+    /// a constant `true`: a join under a `LoadingScript` therefore dismissed its
+    /// own loading screen on the first frame, before the map had arrived, and a
+    /// place's own `game.Loaded:Wait()` returned immediately for a world that was
+    /// still streaming. Set by the join when the initial patch has settled, and
+    /// for anything that is not a live client, loaded from the start (an edit
+    /// DataModel and Play Solo's copies are complete the instant they exist).
+    pub loaded: bool,
+    /// `ReplicatedFirst:RemoveDefaultLoadingScreen()` was called, and whether
+    /// the platform's own loading screen had been removed (Roblox keeps the two
+    /// facts apart: a second call does not change the second).
+    pub loading_screen_removed: bool,
     pub destroyed: HashSet<Ref>,
     pub output: Vec<(Level, String)>,
     /// Velocities read from physics (AssemblyLinearVelocity).
@@ -796,6 +809,11 @@ impl World {
             defer_depth: 0,
             conn_seq: 0,
             structure_changed: false,
+            // Loaded by default: only a live client is still arriving. The
+            // join clears this when it starts the session (`Runtime::begin_loading`)
+            // and sets it with `finish_loading` when the initial patch settles.
+            loaded: true,
+            loading_screen_removed: false,
             destroyed: HashSet::new(),
             output: Vec::new(),
             velocities: Default::default(),
@@ -7297,6 +7315,16 @@ impl Runtime {
         if let Ok(mut w) = world(&self.lua) {
             w.core_scripts = installed;
         }
+        // **The loading screen first, then the entry script.** `LoadingScript`
+        // is what draws `RobloxLoadingGui` and is what takes it down again
+        // (`ReplicatedFirst:RemoveDefaultLoadingScreen()`); a client that starts
+        // only `StarterScript` draws no loading screen and, on a place that
+        // expects one, sits under whatever the platform put there. Its absence
+        // is not an error — a patch without it is an older patch.
+        match start_core_script(&self.lua, "LoadingScript", Ref::none()) {
+            Ok(_) => {}
+            Err(e) => log::warn!("CoreScripts: LoadingScript did not start: {}", describe_error(&e)),
+        }
         match start_core_script(&self.lua, "StarterScript", Ref::none()) {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err("the data model patch has no StarterScript".into()),
@@ -7309,6 +7337,37 @@ impl Runtime {
     /// an earlier one can unparent or clone a later one's GUI in between
     /// (Place B' button scripts then ran with script.Parent nil).
     /// One left out stays unstarted, so moving it somewhere it runs starts it.
+    pub fn start_collected(&self, r: Ref) {
+        if world(&self.lua).is_ok_and(|w| w.runs_here(r)) {
+            self.run_script(r);
+        }
+    }
+
+    /// **The client has begun receiving a place.** `IsLoaded()` is false and
+    /// `Loaded` will fire when the joining session says the world has settled.
+    pub fn begin_loading(&self) {
+        if let Ok(mut w) = world(&self.lua) {
+            w.loaded = false;
+        }
+    }
+
+    /// The initial world has arrived: `DataModel.Loaded` fires and every
+    /// `IsLoaded()` / `game.Loaded:Wait()` in the place answers true.
+    pub fn finish_loading(&self) {
+        let was = world(&self.lua).is_ok_and(|mut w| !std::mem::replace(&mut w.loaded, true));
+        if !was {
+            return;
+        }
+        let root = world(&self.lua).map(|w| w.d().dom.root_ref()).ok();
+        if let Some(root) = root.filter(|r| r.is_some()) {
+            if let Ok(mut w) = world(&self.lua) {
+                // `Loaded` itself, then the handlers run (`dispatch` below).
+                w.fire(root, "Loaded", vec![]);
+            }
+            self.dispatch();
+        }
+    }
+
     /// Whether this runtime's document has `r`. For a caller replaying
     /// replication that wrote the document itself: an instance created and then
     /// destroyed in the same batch has no signals left to fire.
@@ -7331,12 +7390,6 @@ impl Runtime {
         let Ok(mut w) = world(&self.lua) else { return };
         let refs: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).collect();
         w.queue_subtree_scripts(&refs);
-    }
-
-    pub fn start_collected(&self, r: Ref) {
-        if world(&self.lua).is_ok_and(|w| w.runs_here(r)) {
-            self.run_script(r);
-        }
     }
 
     /// Starts a Script or LocalScript as a new coroutine.

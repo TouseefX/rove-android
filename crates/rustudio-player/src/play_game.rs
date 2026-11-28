@@ -1395,10 +1395,17 @@ impl Game {
         self.unequip_tool();
         self.unequip_client_tool(true);
         let Some(s) = self.play.as_mut() else { return };
-        // A live client's client document is the one it draws (`see
-        // `client_of`); `other_doc` is `None` there.
-        let live = s.mode == RunMode::Client;
-        let cd: &Document = if live { &self.doc } else { s.other_doc.as_ref()? };
+        // A live client's client document is the one it draws (see `client_of`);
+        // `other_doc` is `None` there. This method returns `()`, so the missing
+        // document is a `return`, not a `?`.
+        let cd: &Document = if s.mode == RunMode::Client {
+            &self.doc
+        } else {
+            match s.other_doc.as_ref() {
+                Some(d) => d,
+                None => return,
+            }
+        };
         if !cd.class_of(tool).is_some_and(|c| doc::is_a(&c, "BackpackItem")) {
             return;
         }
@@ -1474,10 +1481,10 @@ impl Game {
     fn follow_client_tool_welds(&mut self) {
         let Some(s) = self.play.as_mut() else { return };
         let live = s.mode == RunMode::Client;
-        let (Some(e), cd) = (
-            s.game.client_tool.as_mut(),
-            if live { Some(&self.doc) } else { s.other_doc.as_ref() },
-        ) else { return };
+        // (`?`/`let`-else on the pair would bind `Option<&Document>`: the live
+        // branch is already a `Some`, so it must be flattened before the else.)
+        let cd = if live { Some(&self.doc) } else { s.other_doc.as_ref() };
+        let (Some(e), Some(cd)) = (s.game.client_tool.as_mut(), cd) else { return };
         let Some(handle) = tool_handle(cd, e.tool) else { return };
         let Some(hx) = rustudio_render::scene::xform_of(cd, handle) else { return };
         let mut edges: Vec<(Ref, Ref)> = Vec::new();

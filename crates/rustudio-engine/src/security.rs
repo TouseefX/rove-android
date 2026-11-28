@@ -406,8 +406,14 @@ fn internal_chunk(src: &[u8]) -> bool {
     s.starts_with(b"rustudio.")
         || s.starts_with(b"gui_input.")
         || s.starts_with(b"CoreGui.RobloxGui.CoreScripts/")
-        // The data model patch's entry CoreScript (runtime start_core_script).
+        // The data model patch's entry CoreScripts (runtime
+        // `start_core_scripts`). `LoadingScript` is `CoreGui.RobloxLoadingGui`:
+        // it draws the loading screen and calls
+        // `ReplicatedFirst:RemoveDefaultLoadingScreen()`, and without it at core
+        // identity the screen it draws never comes down — a white sheet over a
+        // world that has arrived.
         || s == b"StarterScript"
+        || s == b"LoadingScript"
         || s == b"StudioTestService"
         || s == b"geometry_ops"
         || s == b"geometry_nav"

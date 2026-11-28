@@ -7,6 +7,9 @@ local R, API = ...
 local svc = setmetatable({}, { __index = function(_, k) return game:GetService(k) end })
 
 local ui_ready = false
+-- Which answer `ui_ready` was set on: whether our own top bar is the one built
+-- (the CoreScripts' is, when they run). See `step_ui`.
+local ui_core_active = false
 local root_gui = nil       -- CoreGui.ExperienceChat
 local topbar_gui = nil     -- CoreGui.RobloxChatTopBar
 local topbar_enabled = true
@@ -581,18 +584,13 @@ local function scroll_to_bottom(sf)
 	end)
 end
 
--- Build CoreGui.ExperienceChat + TopBar toggle + LegacyChat containers once.
-local function build_ui()
-	if ui_ready then return end
+-- Builds the top bar this client draws when the CoreScripts draw none.
+-- (Studio's Chrome/Unibar layout: a 44x44 Roblox logo circle at (16, 12)
+-- plus a 96x44 pill at (68, 12) holding the hamburger and the chat toggle.
+-- Called per decision, not once: see `step_ui` and the live-join case in it.)
+local function build_topbar()
 	local core = R.core_gui()
 	if not core then return end
-	ui_ready = true
-	core_active = R.core_scripts_active ~= nil and R.core_scripts_active() == true
-
-	-- 1. CoreGui.TopBarApp (matches Studio's Chrome/Unibar top-left layout:
-	--    44x44 Roblox logo circle at (16, 12) + 96x44 pill at (68, 12) holding hamburger + chat toggle)
-	--    — Roblox's own when the CoreScripts run.
-	if not core_active then
 	topbar_gui = Instance.new("ScreenGui")
 	topbar_gui.Name = "TopBarApp"
 	topbar_gui.ResetOnSpawn = false
@@ -808,7 +806,20 @@ local function build_ui()
 	topbar_btn.Activated:Connect(function()
 		set_chat_visible(not chat_visible)
 	end)
-	end -- (our top bar)
+end
+
+-- Build CoreGui.ExperienceChat + TopBar toggle + LegacyChat containers once.
+local function build_ui()
+	if ui_ready then return end
+	local core = R.core_gui()
+	if not core then return end
+	ui_ready = true
+	core_active = R.core_scripts_active ~= nil and R.core_scripts_active() == true
+	ui_core_active = core_active
+
+	-- 1. CoreGui.TopBarApp (our Chrome/Unibar-style one; Roblox's own when the
+	--    CoreScripts run — `step_ui` re-decides that once they are up).
+	if not core_active then build_topbar() end
 
 	-- 2. CoreGui.ExperienceChat (matches Studio's CoreGui hierarchy)
 	root_gui = Instance.new("ScreenGui")
@@ -1933,6 +1944,32 @@ end
 -- Per-frame UI sync: layout, configuration styling, fade timing, CoreGuiType.Chat.
 local function step_ui(dt)
 	build_ui()
+	-- **The top bar is decided again when the CoreScripts come up.**
+	-- `core_active` was read once, in `build_ui`, and `ui_ready` latched the
+	-- whole build on it. That is right for the edit DataModel and for Play Solo,
+	-- where the CoreScripts are started before the first frame and never change
+	-- answer — and wrong for a live client, where `start_core_scripts` runs when
+	-- the join enters Play, after the first frame has already built the fallback:
+	-- a joined place wore *our* fallback top bar and chat button next to Roblox's
+	-- own (`TopBarApp`), because the decision had been made before there was a
+	-- second answer. The rest of the build (the chat window, bubbles, the legacy
+	-- GUI) is the same either way and is not rebuilt.
+	if ui_ready then
+		local now_active = R.core_scripts_active ~= nil and R.core_scripts_active() == true
+		if now_active ~= ui_core_active then
+			ui_core_active = now_active
+			core_active = now_active
+			if topbar_gui then topbar_gui:Destroy() end
+			topbar_gui = nil
+			topbar_chat_slot = nil
+			topbar_unibar = nil
+			topbar_icon_body = nil
+			topbar_icon_tail = nil
+			topbar_badge = nil
+			topbar_btn = nil
+			build_topbar()
+		end
+	end
 	if not root_gui then return end
 	-- (NewChat registers the SetCore when the TopBar first requires it,
 	-- which can be long after the CoreScripts start: offered until taken)
