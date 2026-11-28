@@ -113,6 +113,7 @@ const DRAIN_BATCH: usize = 64;
 /// Five seconds is far longer than a healthy write (which is microseconds on a
 /// connection that is being read) and far shorter than a join is allowed to sit
 /// there. What a timeout means is counted and said out loud, not guessed at.
+#[cfg(feature = "transport")]
 const WRITE_STALL_MS: u64 = 5_000;
 
 /// Where a session got to. A `stage` is what a diagnostics overlay shows when a
@@ -2083,12 +2084,13 @@ pub async fn run(
             .await
             {
                 Ok(()) => break,
-                Err(()) if attempt >= 2 => {
+                Err(error) if attempt >= 2 => {
+                    log::warn!("session: login packet {} was refused: {error}", index + 1);
                     return Err("a login packet could not be sent");
                 }
                 // A torn-down stream from a cancelled write: the next attempt
                 // opens a new one. Anything else has already been logged.
-                Err(()) => attempt += 1,
+                Err(_) => attempt += 1,
             }
         }
         log::info!("session: login packet {} ({} bytes) sent", index + 1, packet.len());
@@ -2429,6 +2431,72 @@ pub async fn run(
     Ok(session.stage.clone())
 }
 
+/// One reliable write, bounded, so a peer that stops reading cannot stop the loop.
+///
+/// The reason this exists rather than `sender.send(..).await` inline: the
+/// sender's stream map is held across its await, so an unbounded write is not
+/// one stalled reply but a stalled `select!` — no tick, no counters, no flush,
+/// and a session that looks frozen while it is in fact waiting on somebody
+/// else. A timeout here leaves the stream alone (wtransport drops a stream whose
+/// write was cancelled, and the next write opens another), counts the stall,
+/// and lets the loop turn.
+///
+/// Takes `&mut Session` only for the counters; nothing else about the session is
+/// touched, so it is safe to call from every arm.
+/// Why a bounded write did not go out.
+#[cfg(feature = "transport")]
+#[derive(Debug)]
+enum WriteError {
+    /// The transport refused it (a closed or reset stream).
+    Refused(rove_client_core::transport::TransportError),
+    /// It did not return inside [`WRITE_STALL_MS`], and waiting longer would
+    /// have stopped the loop for a peer that is not reading.
+    Stalled,
+}
+
+#[cfg(feature = "transport")]
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Refused(error) => write!(f, "{error}"),
+            WriteError::Stalled => write!(f, "stalled for {WRITE_STALL_MS} ms"),
+        }
+    }
+}
+
+#[cfg(feature = "transport")]
+async fn send_bounded(
+    session: &mut Session,
+    sender: &ReliableSender,
+    application: u8,
+    channel: u32,
+    payload: &[u8],
+) -> Result<(), WriteError> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(WRITE_STALL_MS),
+        sender.send(application, channel, payload),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            session.writes_refused += 1;
+            log::warn!("session: a reliable write was refused: {error}");
+            Err(WriteError::Refused(error))
+        }
+        Err(_) => {
+            session.writes_stalled += 1;
+            log::warn!(
+                "session: a reliable write to {application}/{channel} did not return in {WRITE_STALL_MS} ms; \
+                 the loop went on without it ({} stalled so far)",
+                session.writes_stalled
+            );
+            Err(WriteError::Stalled)
+        }
+    }
+}
+
+
 /// One unreliable reply channel: announce it once, then send datagrams.
 ///
 /// `rove`'s `PingWriter`, reduced to what a join needs. An unreliable reply
@@ -2471,7 +2539,10 @@ impl UnreliableWriter {
                 &announcement,
             )
             .await
-            .map_err(|()| "the datagram channel announcement was not written")?;
+            .map_err(|error| {
+                log::warn!("session: a datagram channel was not announced: {error}");
+                "the datagram channel announcement was not written"
+            })?;
             self.announced = true;
         }
         self.sequence = self
@@ -2655,49 +2726,6 @@ impl PhysicsWriter {
 /// reading) and that a property acknowledgment the transport refused is
 /// reported to its queue, which must never retry an ambiguous receipt.
 #[cfg(feature = "transport")]
-/// One reliable write, bounded, so a peer that stops reading cannot stop the loop.
-///
-/// The reason this exists rather than `sender.send(..).await` inline: the
-/// sender's stream map is held across its await, so an unbounded write is not
-/// one stalled reply but a stalled `select!` — no tick, no counters, no flush,
-/// and a session that looks frozen while it is in fact waiting on somebody
-/// else. A timeout here leaves the stream alone (wtransport drops a stream whose
-/// write was cancelled, and the next write opens another), counts the stall,
-/// and lets the loop turn.
-///
-/// Takes `&mut Session` only for the counters; nothing else about the session is
-/// touched, so it is safe to call from every arm.
-async fn send_bounded(
-    session: &mut Session,
-    sender: &ReliableSender,
-    application: u8,
-    channel: u32,
-    payload: &[u8],
-) -> Result<(), ()> {
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(WRITE_STALL_MS),
-        sender.send(application, channel, payload),
-    )
-    .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            session.writes_refused += 1;
-            log::warn!("session: a reliable write was refused: {error}");
-            Err(())
-        }
-        Err(_) => {
-            session.writes_stalled += 1;
-            log::warn!(
-                "session: a reliable write to {application}/{channel} did not return in {WRITE_STALL_MS} ms; \
-                 the loop went on without it ({} stalled so far)",
-                session.writes_stalled
-            );
-            Err(())
-        }
-    }
-}
-
 async fn flush_outbound(session: &mut Session, sender: &ReliableSender) {
     if session.outbound.is_empty() {
         return;
