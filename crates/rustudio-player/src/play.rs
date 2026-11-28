@@ -2627,24 +2627,61 @@ impl Game {
             // Said once, not once a frame, and with the count that says what is
             // missing: `Players` with no Player in it yet, or a Player whose
             // UserId is not ours.
-            let (players, count) = {
+            //
+            // **Every `Players`, with its children**, not just the first. A
+            // document can hold two — the one `ensure_services` made and one a
+            // batch inserted beside it (the 9,200-instance report) — and the
+            // bind above searched for the first, which was the empty one.
+            // Reporting them all, with the name and UserId of each Player, is
+            // what says which of the two the server filled, and with which uid.
+            // (`live.rs` binds a service's create to the existing instance now,
+            // so a document that reaches here with two of them is the evidence
+            // that something else still can.)
+            let (players, count, dump) = {
                 let doc = &self.doc;
-                let players = doc.find_child(doc.dom.root_ref(), "Players");
-                let count = players
-                    .and_then(|p| doc.dom.get_by_ref(p))
-                    .map(|i| {
-                        i.children()
-                            .iter()
-                            .filter(|c| doc.class_of(**c).is_some_and(|k| k == "Player"))
-                            .count()
-                    })
-                    .unwrap_or(0);
-                (players.is_some(), count)
+                let root = doc.dom.root_ref();
+                let mut dump = Vec::new();
+                let mut count = 0;
+                let mut first = false;
+                for (index, service) in doc
+                    .dom
+                    .get_by_ref(root)
+                    .map(|i| i.children().to_vec())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, r)| doc.class_of(*r).is_some_and(|k| k == "Players"))
+                {
+                    first = true;
+                    let mut uids = Vec::new();
+                    for child in doc
+                        .dom
+                        .get_by_ref(service)
+                        .map(|i| i.children().to_vec())
+                        .unwrap_or_default()
+                    {
+                        let class = doc.class_of(child).unwrap_or("?");
+                        if class != "Player" {
+                            continue;
+                        }
+                        count += 1;
+                        let uid = doc.dom.get_by_ref(child).and_then(|i| {
+                            match i.properties.get(&ustr("UserId")) {
+                                Some(Variant::Int64(v)) => Some(*v as u64),
+                                Some(Variant::Int32(v)) => Some(*v as u64),
+                                _ => None,
+                            }
+                        });
+                        uids.push(format!("{:?}:{uid:?}", doc.dom.get_by_ref(child).map(|i| i.name.clone())));
+                    }
+                    dump.push(format!("[{index}] {} Player(s) {uids:?}", uids.len()));
+                }
+                (first, count, dump.join(" "))
             };
             if !live_wait_logged {
                 log::info!(
                     "Live: no LocalPlayer yet: account_uid={uid:?} players_service={players} \
-                     player_count={count}"
+                     player_count={count} services: {dump}"
                 );
                 self.info(format!(
                     "Live: our Player (by UserId {:?}) is not in the world yet ({} Player(s) there{}); \

@@ -69,6 +69,12 @@ pub struct ApplyStats {
     /// is still made; this is the count that explains a world of Models with
     /// no parts in them.
     pub unknown_classes: usize,
+    /// Creates for a singleton service the document already had (`Players`,
+    /// `Workspace`, `Lighting`…): the server's id was bound to the existing
+    /// instance rather than inserted beside it. A non-zero count is normal — a
+    /// join always re-states the services — but it was *9,200 instances* while
+    /// the server said 62 before this existed.
+    pub services_bound: usize,
     /// Events carried by the journal (the Lua dispatch is the engine's).
     pub events: usize,
     /// Values the converter refused, so the property kept its default.
@@ -93,6 +99,7 @@ impl ApplyStats {
         self.instances_removed += other.instances_removed;
         self.parents += other.parents;
         self.unknown_classes += other.unknown_classes;
+        self.services_bound += other.services_bound;
         self.events += other.events;
         self.refused_values += other.refused_values;
         self.kept_client_unreadable += other.kept_client_unreadable;
@@ -103,8 +110,9 @@ impl ApplyStats {
     pub fn line(&self) -> String {
         format!(
             "{} actions: {} created ({} repeat), {} sets ({} properties), \
-             {} removed ({} instances), {} parents, {} events; {} unknown classes, \
-             {} unknown ids, {} values kept their default, in {:.2} ms",
+             {} removed ({} instances), {} parents, {} events; {} services bound, \
+             {} unknown classes, {} unknown ids, {} values kept their default, \
+             in {:.2} ms",
             self.actions,
             self.created,
             self.duplicate_creates,
@@ -114,6 +122,7 @@ impl ApplyStats {
             self.instances_removed,
             self.parents,
             self.events,
+            self.services_bound,
             self.unknown_classes,
             self.unknown_ids,
             self.refused_values,
@@ -133,6 +142,7 @@ impl ApplyStats {
             "instances_removed": self.instances_removed,
             "parents": self.parents,
             "unknown_classes": self.unknown_classes,
+            "services_bound": self.services_bound,
             "events": self.events,
             "refused_values": self.refused_values,
             "duration_ms": self.duration_ms,
@@ -424,6 +434,33 @@ impl Live {
         if !rustudio_core::doc::class_known(class) {
             *self.refused_classes.entry(class.to_owned()).or_default() += 1;
             stats.unknown_classes += 1;
+        }
+        // **A service is a singleton, and the document already made one.** Every
+        // place document comes with `ALWAYS_SERVICES` (`Document::ensure_services`)
+        // — `Players`, `Workspace`, `Lighting` and the rest — so the server's
+        // create for one is a *duplicate*, not a new instance. Inserting it made
+        // the second `Players` in the tree: one the document made with no children
+        // and one the server filled, while `setup_live_client_player` searched
+        // the document for the first `Players` child and found the empty one, so
+        // our own Player was never bound even though it had arrived. That is the
+        // phone's report — "no LocalPlayer yet" over a world with 9,200
+        // instances — and a document with two of every service.
+        //
+        // The server's id is bound to the existing ref instead, which is what
+        // "the id and the instance are the same thing" means here: the `set`
+        // actions that follow name that id, and they must land on the service
+        // the rest of the client reads.
+        if parent_ref == root_ref && rustudio_core::doc::is_service(class) {
+            if let Some(existing) = doc.find_child(root_ref, class) {
+                self.ids.insert(id.to_string(), existing);
+                self.refs.insert(existing, id.to_string());
+                // It is still created by the server, for ownership: another
+                // client's `Players` is not ours to move. Not `stats.created`,
+                // which counts instances this client added to its document.
+                doc.replicated_peer.insert(existing, self.peer);
+                stats.services_bound += 1;
+                return;
+            }
         }
         let instance = InstanceBuilder::new(class);
         let instance = if name.is_empty() {
@@ -892,6 +929,60 @@ mod tests {
         assert_eq!(
             instance.properties.get(&ustr("Size")),
             Some(&Variant::Vector3(rbx_dom_weak::types::Vector3::new(4.0, 1.0, 2.0)))
+        );
+    }
+
+    #[test]
+    fn a_service_create_binds_to_the_service_the_document_already_has() {
+        // The phone's report: a joined world of 9,200 instances where the
+        // server's 62 included our Player, and `LocalPlayer` was never bound.
+        // The cause was here — `Players` already exists (every place document
+        // makes `ALWAYS_SERVICES`), so the server's create for it became a
+        // *second* `Players`, and the reader searching for the service by class
+        // found the empty one the document had made.
+        let (mut doc, mut live) = empty_world();
+        let root = doc.dom.root_ref();
+        // A document that came from a place file or from Play's copy of one —
+        // not from `world::build`, which makes no services at all.
+        doc.ensure_services();
+        let existing = doc.find_child(root, "Players").expect("a Players service");
+        let before = doc
+            .dom
+            .get_by_ref(root)
+            .map(|i| i.children().len())
+            .unwrap_or(0);
+        let mut conv = ValueConverter::default();
+        let actions = vec![action(serde_json::json!({
+            "sequence": 1, "kind": "create", "id": "7:9",
+            "node": {"id": "7:9", "class_name": "Players", "parent": null,
+                     "properties": {"Name": "Players"}}
+        }))];
+        let stats = live.apply(&mut doc, &actions, &mut conv);
+
+        assert_eq!(stats.services_bound, 1, "the service create is a bind");
+        assert_eq!(stats.created, 0, "and not a second instance");
+        assert_eq!(
+            live.referent("7:9"),
+            Some(existing),
+            "the server's id names the service the client reads"
+        );
+        assert_eq!(
+            doc.dom.get_by_ref(root).map(|i| i.children().len()),
+            Some(before),
+            "no duplicate was inserted at the root"
+        );
+        // And a *set* naming the server's id lands on that service, which is
+        // what makes the binding worth anything.
+        let sets = vec![action(serde_json::json!({
+            "sequence": 2, "kind": "set", "id": "7:9",
+            "fields": {"RespawnTime": 5.0}
+        }))];
+        live.apply(&mut doc, &sets, &mut conv);
+        assert!(
+            doc.dom
+                .get_by_ref(existing)
+                .is_some_and(|i| i.properties.contains_key(&ustr("RespawnTime"))),
+            "the set reached the service, not a copy of it"
         );
     }
 

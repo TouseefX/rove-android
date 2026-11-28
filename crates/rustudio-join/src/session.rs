@@ -102,6 +102,19 @@ pub const FOCUS_REFRESH: std::time::Duration = std::time::Duration::from_secs(1)
 /// drained fully, so this is a page size and not a limit.
 const DRAIN_BATCH: usize = 64;
 
+/// How long one reliable write may take before the loop stops waiting on it.
+///
+/// Every reliable write in this loop goes through `ReliableSender`, whose
+/// stream map is held across the `await` — so a write that never returns does
+/// not just delay its own reply, it stops the `select!`. The tick stops with it,
+/// and with the tick the counters, the flush and `progress`: the phone's report
+/// was an overlay frozen at its last value over a session that had *not* closed.
+///
+/// Five seconds is far longer than a healthy write (which is microseconds on a
+/// connection that is being read) and far shorter than a join is allowed to sit
+/// there. What a timeout means is counted and said out loud, not guessed at.
+const WRITE_STALL_MS: u64 = 5_000;
+
 /// Where a session got to. A `stage` is what a diagnostics overlay shows when a
 /// join fails: the difference between "we never dialled" and "we dialled and the
 /// server hung up" is the whole diagnosis.
@@ -254,6 +267,15 @@ pub struct Session {
     /// retained count, which prunes to zero as the session keeps up.
     pub rows_applied: u64,
     pub acknowledged_errors: usize,
+    /// Reliable writes that took longer than [`WRITE_STALL_MS`] and were given
+    /// up on. A non-zero value is the one explanation for a session whose
+    /// counters froze: every write in this loop goes through one sender whose
+    /// stream lock is held across the await, so a peer that stops reading
+    /// stalls the loop itself — and a stalled loop is the tick, the counters and
+    /// the flush together.
+    pub writes_stalled: usize,
+    /// Sends that failed outright (a closed or reset stream).
+    pub writes_refused: usize,
     /// Streaming: the regions the server has sent, where we last asked it to
     /// focus, whether the spawn acknowledgment went, and whether our own Player
     /// has appeared yet. A streaming place sends half a world until the client
@@ -464,6 +486,8 @@ impl Session {
             rows_applied: 0,
             acknowledged_through: 0,
             acknowledged_errors: 0,
+            writes_stalled: 0,
+            writes_refused: 0,
             regions: 0,
             focus_id: 0,
             focus_sent: 0,
@@ -1548,6 +1572,8 @@ impl Session {
                     + counts.telemetry_failed_requests
                     + self.ping_prepare_failures
             },
+            writes_stalled: self.writes_stalled,
+            writes_refused: self.writes_refused,
         }
     }
 
@@ -2041,10 +2067,30 @@ pub async fn run(
     // The five login packets, in the order the server reads them.
     let packets = login_packets(issued).map_err(|_| "login packets could not be encoded")?;
     for (index, packet) in packets.iter().enumerate() {
-        sender
-            .send(REPLICATION_APPLICATION, REPLICATION_CHANNEL, packet)
+        // **Bounded, and retried while the peer is merely slow.** Five packets
+        // in a row are the first writes of the connection, so a stall here is
+        // the whole join; a stall that repeats is the server not reading, and
+        // that is a connection failure to report rather than to wait out.
+        let mut attempt = 0;
+        loop {
+            match send_bounded(
+                &mut session,
+                &sender,
+                REPLICATION_APPLICATION,
+                REPLICATION_CHANNEL,
+                packet,
+            )
             .await
-            .map_err(|_| "a login packet could not be sent")?;
+            {
+                Ok(()) => break,
+                Err(()) if attempt >= 2 => {
+                    return Err("a login packet could not be sent");
+                }
+                // A torn-down stream from a cancelled write: the next attempt
+                // opens a new one. Anything else has already been logged.
+                Err(()) => attempt += 1,
+            }
+        }
         log::info!("session: login packet {} ({} bytes) sent", index + 1, packet.len());
     }
     session.stage = Stage::LoggedIn;
@@ -2258,6 +2304,16 @@ pub async fn run(
                 if let Some(now_ms) = physics_now_ms {
                     physics.tick(&mut session, &sender, &connection, now_ms).await;
                 }
+                // **The counters, every second, whatever else moved.** The
+                // handover's numbers were only refreshed by `drain` (a packet
+                // with world actions) and by the 16-packet beat, so a session
+                // whose remaining traffic was pings and datagrams published
+                // nothing: the overlay stood at its last value while the session
+                // was alive and the loop was turning. One assignment a second is
+                // the cheapest possible answer to "is this stuck?".
+                if let Some(handover) = session.handover.as_ref() {
+                    handover.set_counters(session.overlay_counters());
+                }
             }
             // **A datagram, routed by its announcement.** This used to keep
             // only the clock's and throw the rest away, which is exactly the
@@ -2347,6 +2403,25 @@ pub async fn run(
     if let Some(reason) = end {
         session.stage = Stage::Closed(reason);
     }
+    // **Why it ended, and what was waiting when it did.** The report a phone
+    // gets is this log, and a session that stops has one of a few reasons; a
+    // line that names it is the difference between "the join failed" and "the
+    // join ended because the server opened no further stream". The write
+    // counters are here for the same reason: a loop that gave up on a write is
+    // a session that looked alive and was not.
+    log::info!(
+        "session: ended ({}) after {} s; {} stalled write(s), {} refused, {} \
+         batch(es) still waiting for the editor",
+        end.unwrap_or("the caller stopped it"),
+        session.started.elapsed().as_secs(),
+        session.writes_stalled,
+        session.writes_refused,
+        session
+            .handover
+            .as_ref()
+            .map(|handover| handover.pending())
+            .unwrap_or(0)
+    );
     progress(session);
     // A join's own shutdown must not outlive its deadline either.
     connection.close(0u32.into(), b"done");
@@ -2373,6 +2448,7 @@ struct UnreliableWriter {
 impl UnreliableWriter {
     async fn send(
         &mut self,
+        session: &mut Session,
         sender: &ReliableSender,
         connection: &Connection,
         application: u8,
@@ -2387,14 +2463,15 @@ impl UnreliableWriter {
                 wire_id,
             )
             .map_err(|_| "the datagram channel could not be announced")?;
-            sender
-                .send(
-                    application,
-                    rove_client_core::channels::CONTROL_CHANNEL,
-                    &announcement,
-                )
-                .await
-                .map_err(|_| "the datagram channel announcement was not written")?;
+            send_bounded(
+                session,
+                sender,
+                application,
+                rove_client_core::channels::CONTROL_CHANNEL,
+                &announcement,
+            )
+            .await
+            .map_err(|()| "the datagram channel announcement was not written")?;
             self.announced = true;
         }
         self.sequence = self
@@ -2442,16 +2519,18 @@ async fn flush_pings(
         };
         let token = prepared.token();
         let written = match route {
-            crate::ping::DeliveryRoute::Reliable => sender
-                .send(
-                    crate::ping::PING_APPLICATION,
-                    crate::ping::PING_CHANNEL,
-                    prepared.payload(),
-                )
-                .await
-                .is_ok(),
+            crate::ping::DeliveryRoute::Reliable => send_bounded(
+                session,
+                sender,
+                crate::ping::PING_APPLICATION,
+                crate::ping::PING_CHANNEL,
+                prepared.payload(),
+            )
+            .await
+            .is_ok(),
             crate::ping::DeliveryRoute::Unreliable => unreliable
                 .send(
+                    session,
                     sender,
                     connection,
                     crate::ping::PING_APPLICATION,
@@ -2515,14 +2594,15 @@ impl PhysicsWriter {
             ) else {
                 return false;
             };
-            if sender
-                .send(
-                    crate::physics_sender::APPLICATION,
-                    rove_client_core::channels::CONTROL_CHANNEL,
-                    &announcement,
-                )
-                .await
-                .is_err()
+            if send_bounded(
+                session,
+                sender,
+                crate::physics_sender::APPLICATION,
+                rove_client_core::channels::CONTROL_CHANNEL,
+                &announcement,
+            )
+            .await
+            .is_err()
             {
                 return false;
             }
@@ -2575,6 +2655,49 @@ impl PhysicsWriter {
 /// reading) and that a property acknowledgment the transport refused is
 /// reported to its queue, which must never retry an ambiguous receipt.
 #[cfg(feature = "transport")]
+/// One reliable write, bounded, so a peer that stops reading cannot stop the loop.
+///
+/// The reason this exists rather than `sender.send(..).await` inline: the
+/// sender's stream map is held across its await, so an unbounded write is not
+/// one stalled reply but a stalled `select!` — no tick, no counters, no flush,
+/// and a session that looks frozen while it is in fact waiting on somebody
+/// else. A timeout here leaves the stream alone (wtransport drops a stream whose
+/// write was cancelled, and the next write opens another), counts the stall,
+/// and lets the loop turn.
+///
+/// Takes `&mut Session` only for the counters; nothing else about the session is
+/// touched, so it is safe to call from every arm.
+async fn send_bounded(
+    session: &mut Session,
+    sender: &ReliableSender,
+    application: u8,
+    channel: u32,
+    payload: &[u8],
+) -> Result<(), ()> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(WRITE_STALL_MS),
+        sender.send(application, channel, payload),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            session.writes_refused += 1;
+            log::warn!("session: a reliable write was refused: {error}");
+            Err(())
+        }
+        Err(_) => {
+            session.writes_stalled += 1;
+            log::warn!(
+                "session: a reliable write to {application}/{channel} did not return in {WRITE_STALL_MS} ms; \
+                 the loop went on without it ({} stalled so far)",
+                session.writes_stalled
+            );
+            Err(())
+        }
+    }
+}
+
 async fn flush_outbound(session: &mut Session, sender: &ReliableSender) {
     if session.outbound.is_empty() {
         return;
@@ -2589,7 +2712,7 @@ async fn flush_outbound(session: &mut Session, sender: &ReliableSender) {
         // has to record: its queue holds the next version until this one is
         // confirmed. (By kind, never by first byte — `[131, 26]` is a focus.)
         let is_ack = reply.is_property_ack();
-        match sender.send(application, channel, reply.payload()).await {
+        match send_bounded(session, sender, application, channel, reply.payload()).await {
             Ok(()) => {
                 session.replies_sent += 1;
                 if is_ack {

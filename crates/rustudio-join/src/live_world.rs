@@ -93,6 +93,13 @@ pub struct Counters {
     pub journal: usize,
     pub replies_sent: usize,
     pub replies_failed: usize,
+    /// Reliable writes that timed out (`session::WRITE_STALL_MS`). This is the
+    /// number that explains a session that stopped moving: every write in the
+    /// session's loop shares one sender, so a peer that stopped reading used to
+    /// stall the loop itself. Zero when nothing stalled; the line says so only
+    /// when it is not.
+    pub writes_stalled: usize,
+    pub writes_refused: usize,
     pub seconds: u64,
     /// **This client's own network scope** — rove's `self.core.scope()`.
     ///
@@ -215,6 +222,11 @@ impl Counters {
                     " · {} datagram(s) on unannounced wire ids",
                     self.unknown_datagrams
                 )
+            } else if self.writes_stalled > 0 {
+                // Ahead of the datagram note: a loop that could not write is
+                // the one fault that freezes every other number on this line,
+                // so it is named first when it has happened at all.
+                format!(" · {} write(s) stalled", self.writes_stalled)
             } else {
                 String::new()
             }
@@ -314,10 +326,26 @@ struct LiveWorldInner {
 pub const POSE_STALE_MS: u64 = 250;
 
 /// How many action batches may wait for the editor. Each is one journal read
-/// (`DRAIN_BATCH` rows), so this is a few thousand rows of margin — enough to
-/// ride out a stutter, small enough that a wedged renderer is noticed as a count
-/// rather than as memory.
-pub const BATCH_BACKLOG: usize = 64;
+/// (`DRAIN_BATCH` rows), so this is a quarter of a million rows of margin —
+/// enough to ride out a stutter, and small enough that a wedged renderer is
+/// noticed as a count rather than as memory.
+///
+/// **It was 64, and that lost world data on every join.** The session applies a
+/// batch on its own thread and the editor takes them on its frame thread, but a
+/// join does not start drawing at once: `JoinWindow::live_world_tick` is what
+/// drains the queue, and it runs from the cover, which the editor is busy
+/// leaving. The server sends the `DataModelPatch` for a place as hundreds of
+/// small batches straight after login, so 64 was a few hundred milliseconds of
+/// a stalled editor — and what it dropped was the *oldest* batch, a `Create`
+/// whose id never comes round again. The report in the reviewer's hands said
+/// `1 batch(es) dropped` over a world with instances missing from it, and that
+/// is exactly what this number was.
+///
+/// The queue is bounded rather than unbounded because the alternative is a
+/// renderer that has stopped growing it without limit. 4096 batches is the
+/// whole of a place's patch with room to spare, and the drop path still counts
+/// (see `dropped()`), so a wedged editor is still visible as a number.
+pub const BATCH_BACKLOG: usize = 4096;
 
 impl LiveWorld {
     pub fn new() -> Self {
@@ -363,9 +391,19 @@ impl LiveWorld {
 
     /// Take every batch waiting, oldest first, so the editor applies them in the
     /// order the journal gave them.
+    ///
+    /// **Never an empty vector because something was full.** The one caller
+    /// holds its resource for the length of one apply, and a second join started
+    /// from the Start Page while the cover of the first is still being torn down
+    /// would find this locked at the wrong moment — and would then draw a world
+    /// with no instances in it, because the batches it skipped are not sent
+    /// again. A contended lock means the other thread was mid-take; the queue is
+    /// still there and the next frame reads it, so waiting is right and an empty
+    /// answer is not.
     pub fn take(&self) -> Vec<Batch> {
-        let Ok(mut queue) = self.inner.pending.lock() else {
-            return Vec::new();
+        let mut queue = match self.inner.pending.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => poisoned.into_inner(),
         };
         queue.drain(..).collect()
     }
@@ -566,6 +604,28 @@ mod tests {
         assert!(!worker_side.stop_requested());
         live.request_stop();
         assert!(worker_side.stop_requested());
+    }
+
+    #[test]
+    fn a_stalled_write_is_named_on_the_line() {
+        // The freeze the reviewer saw was a loop waiting on one write, so this
+        // is that fault's only visible form: the overlay's own words. A healthy
+        // session must say nothing about it.
+        let mut counters = Counters {
+            stage: "receive".into(),
+            packets: 9,
+            instances: 3,
+            ..Default::default()
+        };
+        assert_eq!(counters.writes_stalled, 0);
+        assert!(!counters.line().contains("stalled"), "{}", counters.line());
+        counters.writes_stalled = 2;
+        let line = counters.line();
+        assert!(line.contains("2 write(s) stalled"), "{line}");
+        // And the argument count of the format string still matches: a lost
+        // placeholder prints the next value in the wrong place, which is how
+        // the seconds once went missing from this line.
+        assert!(line.contains(" · 0 s · "), "the seconds are still where they go: {line}");
     }
 
     #[test]
