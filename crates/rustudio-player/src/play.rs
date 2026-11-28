@@ -2164,7 +2164,10 @@ impl Game {
         };
         let mut parts = 0usize;
         let mut framed = 0usize;
-        for i in self.doc.dom.descendants_of(ws) {
+        // (`&self.doc` explicitly: the loop borrows the document immutably, and
+        // the claim below needs it mutably — one `&` is the difference between
+        // a borrow that ends at the loop and one that ends at the function.)
+        for i in (&self.doc).dom.descendants_of(ws) {
             if !doc::is_a(&i.class, "BasePart") || i.class == "Terrain" {
                 continue;
             }
