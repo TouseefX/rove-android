@@ -1603,7 +1603,11 @@ impl Session {
         // is also the record that creates the `DataModel`, the services and our
         // own `Player`. So an absent view means the empty one — not "skip
         // normalization", which is how the globals record would arrive raw.
-        let pre_view = Some(self.pre_view.clone().unwrap_or_else(empty_world_view));
+        //
+        // Captured before the drain, not inside it: this is one `WorldView`
+        // clone for the batch rather than one per record, and every record in
+        // the batch is entitled to the same "before the packet" answer.
+        let pre_view = self.pre_view.clone().unwrap_or_else(empty_world_view);
         for row in rows {
             // The world as it stood before this record. Each drain consumes the
             // one captured at ingest; a second record in the same batch reuses
@@ -1620,7 +1624,7 @@ impl Session {
             self.initial_tag |= row.value.tags.contains(&13);
             let normalized = match &mut self.normalizer {
                 Some(normalizer) => {
-                    match normalizer.normalize(pre_view, &row.value, self.initial_tag) {
+                    match normalizer.normalize(&pre_view, &row.value, self.initial_tag) {
                         Ok(normalized) => Some(normalized.worker_delta),
                         Err(error) => {
                             self.normalize_refused += 1;

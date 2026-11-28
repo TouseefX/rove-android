@@ -175,7 +175,7 @@ impl PublicTrust {
 
     fn from_pinned_bytes(raw: &[u8], provenance: &Value) -> Result<Self> {
         if raw.len() != COEFFICIENTS * 12
-            || format!("{:x}", blake3::hash(raw)) != TABLE_HASH
+            || blake3_hash_hex(raw) != TABLE_HASH
             || provenance["table_sha256"] != TABLE_HASH
             || provenance["source_binary_sha256"] != SOURCE_HASH
         {
@@ -313,14 +313,17 @@ impl ProgramAuth {
             Err(error) => return self.fail(error),
         };
         self.verified += 1;
-        let (number, format, integrity) =
-            match crate::program_vm::run_verified_program(&verified, &self.job_id) {
-                Ok(result) => result,
-                Err(error) => return self.fail(error),
-            };
+        let run = match crate::program_vm::run_verified_program(&verified, &self.job_id) {
+            Ok(run) => run,
+            Err(error) => return self.fail(error),
+        };
         self.executed += 1;
-        self.last_format = Some(format);
-        self.last_integrity = integrity;
+        // The answer is what the server reads; the format and the integrity
+        // report are kept for the diagnostics, which is where a program that
+        // ran and produced the wrong number has to be diagnosable.
+        let number = run.answer;
+        self.last_format = Some(run.format);
+        self.last_integrity = run.integrity;
         let mut response = vec![155];
         response.extend(check.second.to_le_bytes());
         response.extend(number.to_le_bytes());
@@ -433,6 +436,19 @@ fn unpack_container_observed(blob: &[u8], observer: Option<&SessionIntegrity>) -
 
 /// A 32-byte digest of a whole packet, for the duplicate cache.
 ///
+/// A blake3 digest as lowercase hex.
+///
+/// `blake3::Hash` has no `LowerHex` (and `to_hex()` returns another type whose
+/// `as_str` borrows it), so the pinned-hash comparisons spell the digest out
+/// here once rather than each doing it slightly differently.
+fn blake3_hash_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes)
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// `blake3` is already a dependency for the signature check; the cache only
 /// needs to recognise the same packet twice, so this is a cache key and not a
 /// security claim.

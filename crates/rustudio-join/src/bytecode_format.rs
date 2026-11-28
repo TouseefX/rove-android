@@ -8,6 +8,16 @@ const MAX_BYTES: usize = 128 * 1024;
 const MAX_ITEMS: usize = 1_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormatError(&'static str);
+impl FormatError {
+    /// The reason, as the string the error was made with.
+    ///
+    /// A `&'static str` and not a formatted message: every one of these is a
+    /// fixed statement about a body that did not have the shape bytecode has,
+    /// and the callers that pass one on (the VM, the report) want the words.
+    pub fn reason(&self) -> &'static str {
+        self.0
+    }
+}
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0)

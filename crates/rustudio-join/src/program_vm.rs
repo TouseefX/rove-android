@@ -146,10 +146,25 @@ fn challenge_environment(lua: &mlua::Lua, job_id: &str) -> mlua::Result<mlua::Ta
             }
             let lua = lua;
             let object = lua.create_table()?;
+            // The generator's state lives in a table rather than in the
+            // closure's captured variables: a `Fn` closure — which is what a
+            // Luau function bound through `mlua` must be — cannot advance a
+            // captured `state`, and a `FnMut` one is not what `create_function`
+            // takes. The table is the object's own, so two `Random.new` calls
+            // cannot share a sequence.
+            let state_table = lua.create_table()?;
+            for (index, word) in state.iter().enumerate() {
+                state_table.set(index + 1, *word as f64)?;
+            }
+            let words = state_table.clone();
             let next = lua.create_function(move |_, ()| {
                 // 64 bits from two 32-bit halves, as `Random:NextInteger`
                 // consumes them; the state advances in place.
-                let mut s = state;
+                let mut s = [0u64; 4];
+                for index in 0..4 {
+                    let word: f64 = words.get(index + 1)?;
+                    s[index] = word as u64;
+                }
                 let result = s[0]
                     .wrapping_add(s[3])
                     .rotate_left(23)
@@ -161,7 +176,9 @@ fn challenge_environment(lua: &mlua::Lua, job_id: &str) -> mlua::Result<mlua::Ta
                 s[0] ^= s[3];
                 s[2] ^= t;
                 s[3] = s[3].rotate_left(45);
-                state = s;
+                for (index, word) in s.iter().enumerate() {
+                    words.set(index + 1, *word as f64)?;
+                }
                 Ok((result >> 11) as f64 / (1u64 << 53) as f64)
             })?;
             object.set("NextNumber", next.clone())?;
