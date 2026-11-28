@@ -122,7 +122,10 @@ impl Editor {
         // join the 3D view alone. Set for the session, restored when it ends
         // (nothing else in an editor run should be re-enabled by side effect).
         if mode == RunMode::Client && !self.game.show_core_gui {
-            self.join_win.core_gui_was = Some(self.game.show_core_gui);
+            #[cfg(feature = "live")]
+            {
+                self.join_win.core_gui_was = Some(self.game.show_core_gui);
+            }
             self.ui.show_core_gui = true;
             self.game.show_core_gui = true;
         }
@@ -215,10 +218,14 @@ impl Editor {
         self.finish_stopped_plugin_playtest();
         self.restore_place_context();
         // A join turned Show Core UI on for the session (`start_play`): the
-        // editor's own setting comes back with the editor.
+        // editor's own setting comes back with the editor. (Only the build with
+        // the join in it has a window to remember it in.)
+        #[cfg(feature = "live")]
         if was_live {
             self.restore_core_gui();
         }
+        #[cfg(not(feature = "live"))]
+        let _ = was_live;
     }
 
     /// After a teleported session: asset delivery answers for the open place again.
