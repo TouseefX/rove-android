@@ -151,15 +151,19 @@ jobs:
       - name: Cache cargo registry and the per-target build dir
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-all-crates
           key: android-${{ matrix.arch }}-${{ matrix.profile }}
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
           # xbuild builds into target/x/<profile>/android/<arch>/cargo.
           workspaces: ". -> target/x/${{ matrix.profile }}/android/${{ matrix.arch }}/cargo"
           cache-directories: |
             ~/.cache/x
 
-      - name: Cache xbuild binary
+      - name: Restore xbuild binary
         id: xbuild-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cargo/bin/x
           key: xbuild-${{ runner.os }}-${{ env.XBUILD_REV }}
@@ -167,6 +171,15 @@ jobs:
       - name: Install xbuild
         if: steps.xbuild-cache.outputs.cache-hit != 'true'
         run: cargo install --git https://github.com/rust-mobile/xbuild --rev "$XBUILD_REV" xbuild
+
+      # Save immediately after a successful install, so a later APK failure
+      # does not discard the binary. Never cache a failed installation.
+      - name: Save xbuild binary
+        if: steps.xbuild-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/bin/x
+          key: xbuild-${{ runner.os }}-${{ env.XBUILD_REV }}
 
       - name: x doctor
         run: x doctor
@@ -332,7 +345,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-all-crates
           key: android-desktop-check
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       # (libudev-dev: gilrs, the gamepad crate, links libudev on Linux)
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev
       - run: cargo check --workspace --all-targets

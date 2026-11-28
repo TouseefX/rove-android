@@ -42,11 +42,14 @@ jobs:
         with:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      # Keep reusable dependency artifacts when a later test fails. An exact
+      # Keep reusable build artifacts when a later test fails. An exact
       # existing cache is immutable; rust-cache will restore rather than replace it.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust-all-crates
           cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       - name: Install system dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libudev-dev
@@ -175,6 +178,11 @@ jobs:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-all-crates
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       - name: Offline evidence (allocation, packets, session replay)
         shell: bash
         run: |
@@ -294,6 +302,11 @@ jobs:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-all-crates
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       - name: Check
         run: |
           set -o pipefail
@@ -360,6 +373,11 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-all-crates
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       - run: bash tools/macos/bundle.sh --universal
       - name: Check the bundle
         run: |
@@ -385,6 +403,11 @@ jobs:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-all-crates
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libudev-dev
       - run: cargo build --workspace --release --locked
       - name: Package
@@ -411,6 +434,11 @@ jobs:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-all-crates
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
       - run: cargo build --workspace --release --locked
       - name: Package
         shell: pwsh
