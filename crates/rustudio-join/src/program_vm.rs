@@ -301,13 +301,23 @@ impl mlua::UserData for ChallengeInstance {
         m.add_method("IsUserFeatureEnabled", |_, _, _: String| Ok(false));
         // `RunService`'s own questions, answered by role: a client that is not
         // Studio, is running, and is the client half.
-        let flag = |this: &ChallengeInstance, value: bool| -> Option<bool> {
-            (this.role == InstanceRole::RunService).then_some(value)
-        };
-        m.add_method("IsStudio", |_, this, ()| Ok(flag(this, false)));
-        m.add_method("IsClient", |_, this, ()| Ok(flag(this, true)));
-        m.add_method("IsServer", |_, this, ()| Ok(flag(this, false)));
-        m.add_method("IsRunning", |_, this, ()| Ok(flag(this, true)));
+        //
+        // Each is a closure of its own rather than one shared helper: an `mlua`
+        // callback must be `'static`, so a helper *function* (not a closure
+        // capturing anything) or the same three lines repeated. Repeated, so
+        // there is nothing for a future edit to capture by accident.
+        m.add_method("IsStudio", |_, this, ()| {
+            Ok((this.role == InstanceRole::RunService).then_some(false))
+        });
+        m.add_method("IsClient", |_, this, ()| {
+            Ok((this.role == InstanceRole::RunService).then_some(true))
+        });
+        m.add_method("IsServer", |_, this, ()| {
+            Ok((this.role == InstanceRole::RunService).then_some(false))
+        });
+        m.add_method("IsRunning", |_, this, ()| {
+            Ok((this.role == InstanceRole::RunService).then_some(true))
+        });
         m.add_meta_method(mlua::MetaMethod::ToString, |_, this, ()| Ok(this.name));
     }
 }
