@@ -56,6 +56,11 @@ pub mod program_check;
 // Luau bytecode normalization, and the isolated VM a verified challenge runs in.
 pub mod bytecode_format;
 pub mod program_vm;
+// The character-root physics uplink: `(4, 6)` on wire id 8, the records that
+// tell the server where this client's own character actually is.
+pub mod physics_codec;
+pub mod physics_rotation;
+pub mod physics_sender;
 // The handover that makes a join *stay* joined (M3): the document moves between
 // the session's thread and the renderer's instead of being copied or diffed.
 pub mod live_world;

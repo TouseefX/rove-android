@@ -115,6 +115,11 @@ pub struct Counters {
     pub unknown_datagrams: u64,
     /// `CFrame` acknowledgments written back on `(4, 1)`.
     pub property_acks_sent: u64,
+    /// **Character-root physics frames written**, and refused. A joined world
+    /// that renders while the character stands still on the server has a zero
+    /// here, and that is the number that names the disagreement.
+    pub physics_frames_sent: u64,
+    pub physics_frames_failed: u64,
     /// Signed-program challenges (`155`) received, and answered. The pair is
     /// the single most important number in a live report: a server that asks and
     /// is not answered holds the character and the map back, and a report with
@@ -149,7 +154,8 @@ impl Counters {
         let line = format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
              acked {}/{} held · markers {}/{} · stream {}/{} {} · \
-             dgram {}/{} on {} ch · acks {} · ping {}/{} ({} blocked) · focus {} · {} s · {}",
+             dgram {}/{} on {} ch · acks {} · ping {}/{} ({} blocked) · phys {} · \
+             focus {} · {} s · {}",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -178,6 +184,8 @@ impl Counters {
             self.pings_answered,
             self.pings,
             self.pings_blocked,
+            self.physics_frames_sent,
+            self.focus_sent,
             self.seconds,
             // The first diagnosis, and only when there is one: a challenge the
             // server asked and this client did not answer is the reason a join
@@ -215,11 +223,32 @@ impl Counters {
         self.normalize_refused > 0
     }
 
+    /// The character-root uplink, for a report: frames written and refused.
+    pub fn physics_sent(&self) -> u64 {
+        self.physics_frames_sent
+    }
+
     /// Packets arrived but built no instance: a session that is reading and not
     /// joining, which must never look like a working one.
     pub fn stalled(&self) -> bool {
         self.packets > 0 && self.instances == 0
     }
+}
+
+/// One character root, as the editor last saw it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharacterPose {
+    /// `(scope << 32) | index`, the wire's instance key for the root.
+    pub root: u64,
+    pub position: [f32; 3],
+    /// Row-major 3×3, rove's convention.
+    pub rotation: [f64; 9],
+    /// Studs per second, the solver's. A root frame's velocity is what the
+    /// server propagates to everyone else's interpolation, so a zero here is a
+    /// character everybody else sees standing still and then jumping to the next
+    /// position — the reason this is carried and not omitted.
+    pub velocity: [f64; 3],
+    pub grounded: bool,
 }
 
 /// The channel between the join's worker thread and the editor.
@@ -256,7 +285,29 @@ struct LiveWorldInner {
     /// whether any of them is real (zero is a legitimate coordinate).
     focus: [AtomicU32; 3],
     focus_set: AtomicBool,
+    /// **Where our character root is**, for the physics uplink.
+    ///
+    /// The editor owns the character — it is the one stepping it — and the
+    /// session owns the socket. This is where the two meet without either
+    /// borrowing the other. It is a lock and not the atomics `focus` uses
+    /// because a pose is a *whole* thing (a root, nine rotation components, a
+    /// floor state and the moment they were true) and half of one is a frame
+    /// that describes nothing; the focus is a point, where any three numbers
+    /// that were once real are still a usable answer. Written once a frame and
+    /// read once per 20 ms tick, so the lock is not contended.
+    ///
+    /// The age is kept as an [`Instant`] rather than a number so that the
+    /// staleness rule does not depend on two clocks with different origins
+    /// agreeing about what "now" is.
+    pose: Mutex<Option<(std::time::Instant, CharacterPose)>>,
 }
+
+/// How old a character pose may be before the session stops sending it.
+///
+/// 250 ms, which is `rove`'s own bound (`live_session.rs`): a frame older than a
+/// quarter second describes a character that has already moved, and sending it
+/// makes the server's reconciliation fight the client's own simulation.
+pub const POSE_STALE_MS: u64 = 250;
 
 /// How many action batches may wait for the editor. Each is one journal read
 /// (`DRAIN_BATCH` rows), so this is a few thousand rows of margin — enough to
@@ -364,6 +415,60 @@ impl LiveWorld {
             *o = f32::from_bits(slot.load(Ordering::Relaxed));
         }
         out.iter().all(|v| v.is_finite()).then_some(out)
+    }
+
+    /// **Tell the session where our character root is.**
+    ///
+    /// Written by the editor every frame the local character exists; read by the
+    /// session's 20 ms tick and encoded into a `(4, 6)` root frame.
+    ///
+    /// `rotation` is rove's row-major 3×3, the same convention `Xform::from_cframe`
+    /// reads. `root` is `(scope << 32) | index` because that is how the wire names
+    /// an instance. A pose with a zero root or a non-finite number is refused
+    /// here and never reaches the encoder: a frame the server cannot place is
+    /// worse than no frame, because it moves a character to a nonsense position
+    /// instead of leaving it where it was.
+    pub fn set_character_pose(
+        &self,
+        root: u64,
+        position: [f32; 3],
+        rotation: [f64; 9],
+        velocity: [f64; 3],
+        grounded: bool,
+    ) -> bool {
+        if root == 0
+            || !position.iter().all(|v| v.is_finite())
+            || !rotation.iter().all(|v| v.is_finite())
+            || !velocity.iter().all(|v| v.is_finite())
+        {
+            return false;
+        }
+        let pose = CharacterPose {
+            root,
+            position,
+            rotation,
+            velocity,
+            grounded,
+        };
+        match self.inner.pose.lock() {
+            Ok(mut slot) => {
+                *slot = Some((std::time::Instant::now(), pose));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The last pose, if one is younger than [`POSE_STALE_MS`].
+    ///
+    /// `None` before the editor has written one, and after it stops writing:
+    /// a session that kept sending an old pose would be telling the server about
+    /// a character that is no longer where the frame says it is, which is the
+    /// one thing a client's own root frame must not do.
+    pub fn character_pose(&self) -> Option<CharacterPose> {
+        let slot = self.inner.pose.lock().ok()?;
+        let (at, pose) = (*slot)?;
+        (at.elapsed() <= std::time::Duration::from_millis(POSE_STALE_MS)).then_some(pose)
     }
 
     pub fn request_stop(&self) {

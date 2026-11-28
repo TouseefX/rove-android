@@ -280,6 +280,11 @@ impl Editor {
         if let Some(peer) = staged {
             self.game.doc.self_peer = Some(peer);
         }
+        // **Every frame, not once a second.** The character's pose is read here
+        // because this is the function a joined session runs every frame, and
+        // the uplink's staleness rule is a quarter of a second: a pose published
+        // on the overlay's one-second beat would be stale before it was read.
+        self.publish_character_pose(&live);
         // Nothing waiting: the common case, and the reason this is cheap enough
         // to ask every frame.
         if live.pending() == 0 {
@@ -525,7 +530,7 @@ impl Editor {
             if let Some(counters) = counters.as_ref() {
                 lines.push(format!(
                     "join live: 155 {}/{} answered · ping {}/{} ({} blocked) · \
-                     markers {} · acks {} · regions {} · focus {}",
+                     markers {} · acks {} · regions {} · focus {} · physics {} sent/{} refused",
                     counters.program_answered,
                     counters.program_challenges,
                     counters.pings_answered,
@@ -535,7 +540,21 @@ impl Editor {
                     counters.property_acks_sent,
                     counters.regions,
                     counters.focus_sent,
+                    counters.physics_frames_sent,
+                    counters.physics_frames_failed,
                 ));
+                if counters.physics_frames_sent == 0 && self.game.play.is_some() {
+                    // A joined game whose character is not being reported is a
+                    // session where everybody else watches the avatar stand at
+                    // spawn, and nothing else in the report says so: the world
+                    // arrives, the pings are answered, the counters all move.
+                    lines.push(
+                        "join live: no character root frame has been sent — the server is \
+                         not being told where this client's character is (the character is \
+                         not bound, or the server has not handed it over)"
+                            .to_string(),
+                    );
+                }
                 if counters.program_challenges > counters.program_answered {
                     lines.push(format!(
                         "join live: the server asked {} signed-program challenge(s) this \
@@ -567,6 +586,93 @@ impl Editor {
         for line in lines {
             self.info(line);
         }
+    }
+
+    /// **Tell the session's thread where our character root is.**
+    ///
+    /// The editor owns the character — it is the side that steps it and the side
+    /// that holds the document the deltas are written into — and the session owns
+    /// the socket. [`LiveWorld::set_character_pose`] is where the two meet, and
+    /// this is the only caller: it publishes the root's `CFrame` and the
+    /// `Humanoid`'s floor state, both read from the world the server is being
+    /// reconciled against.
+    ///
+    /// The root's `Ref` is translated back to the wire's `scope:index` through
+    /// the editor's own half of the world ([`rustudio_live::live::Live::id_of`]),
+    /// because that map is the one thing that knows what the server calls each
+    /// instance. A root with no id yet is a root the server has not admitted,
+    /// and publishing a made-up id would be a physics frame about nothing.
+    fn publish_character_pose(&self, live: &rustudio_join::live_world::LiveWorld) {
+        // **The solver's frame when a live client owns the character**, because
+        // that is the pose on screen and the one the server has to agree with; a
+        // character the server simulates gets no frame at all (`None`), rather
+        // than one built from the last delta it sent us. The document's root is
+        // the fallback for the frames before Play has bound a character — a
+        // joining client that has a `Character` model but no solver yet still
+        // has a position worth reporting.
+        let solved = self.game.play_owned_root();
+        let (root, position, rotation, velocity, grounded) = match solved {
+            Some(owned) => {
+                (
+                    owned.root,
+                    owned.position.map(|v| v as f32),
+                    owned.rotation,
+                    owned.velocity,
+                    owned.grounded,
+                )
+            }
+            None => {
+                if self.game.play.is_some() {
+                    // A session is running and does not own the character: the
+                    // server is moving it, and a root frame from us would be a
+                    // claim about an assembly that is not ours to move.
+                    return;
+                }
+                let Some((root, frame)) = character_root_frame(&self.game.doc) else {
+                    return;
+                };
+                let Some(applied) = self.join_win.live_local.as_ref() else {
+                    return;
+                };
+                if applied.id_of(root).is_none() {
+                    // The world has the model but the id map has not been given
+                    // it: the server has not admitted this instance, so a frame
+                    // naming it names nothing.
+                    return;
+                }
+                let p = frame.position;
+                // `rbx_dom_weak` stores the orientation as rows, which is the
+                // order `physics_rotation` takes: a copy, not a transpose.
+                let m = &frame.orientation;
+                (
+                    root,
+                    [p.x as f32, p.y as f32, p.z as f32],
+                    [
+                        m.x.x as f64, m.x.y as f64, m.x.z as f64,
+                        m.y.x as f64, m.y.y as f64, m.y.z as f64,
+                        m.z.x as f64, m.z.y as f64, m.z.z as f64,
+                    ],
+                    [0.0; 3],
+                    character_grounded_in(&self.game.doc),
+                )
+            }
+        };
+        let Some(applied) = self.join_win.live_local.as_ref() else {
+            return;
+        };
+        let Some(id) = applied.id_of(root) else {
+            return;
+        };
+        let Ok((scope, index)) = parse_wire_id(id) else {
+            return;
+        };
+        live.set_character_pose(
+            (u64::from(scope) << 32) | u64::from(index),
+            position,
+            rotation,
+            velocity,
+            grounded,
+        );
     }
 
     /// The overlay's line while a session runs: packets, instances, rows.
@@ -1533,6 +1639,21 @@ impl Editor {
 /// editor around it: the lookup is four properties and a geometry read, and the
 /// only thing that can go wrong is doing it against the wrong player.
 fn character_focus_in(doc: &rustudio_core::doc::Document) -> Option<glam::Vec3> {
+    let (_, frame) = character_root_frame(doc)?;
+    let p = frame.position;
+    (p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
+        .then(|| glam::Vec3::new(p.x, p.y, p.z))
+}
+
+/// The local character's root part and its `CFrame`, in one document.
+///
+/// The `Ref` is what the physics uplink needs (the wire names an instance by
+/// `scope:index`, not by position) and the frame is what the camera and the
+/// streamer need. Both sides must resolve the root the *same* way, or a client
+/// would stand in one place and tell the server it is in another.
+fn character_root_frame(
+    doc: &rustudio_core::doc::Document,
+) -> Option<(rbx_dom_weak::types::Ref, rbx_dom_weak::types::CFrame)> {
     // `Players.LocalPlayer` names our Player, and `Player.Character` names
     // the model: the same pair `run`'s character binding uses, so this can
     // never point at somebody else's character.
@@ -1586,9 +1707,68 @@ fn character_focus_in(doc: &rustudio_core::doc::Document) -> Option<glam::Vec3> 
             frame_of(child)?
         }
     };
-    let p = frame.position;
-    (p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
-        .then(|| glam::Vec3::new(p.x, p.y, p.z))
+    Some((target, frame))
+}
+
+/// `"scope:index"` as the wire's two-number instance key.
+///
+/// The same split the session makes of the ids it sends (`parse_instance_guid`
+/// there), and the same refusal: scope zero is not a scope, and a frame that
+/// names one cannot be placed.
+fn parse_wire_id(id: &str) -> Result<(u32, u32), ()> {
+    let (scope, index) = id.split_once(':').ok_or(())?;
+    let scope: u32 = scope.parse().map_err(|_| ())?;
+    let index: u32 = index.parse().map_err(|_| ())?;
+    if scope == 0 {
+        return Err(());
     }
+    Ok((scope, index))
+}
+
+/// Whether the local character is standing on something, from the document.
+///
+/// The physics record carries a `Humanoid` state byte, and `Air` on the floor is
+/// what "in the air" means in the same terms the server's own solver uses —
+/// `Humanoid.FloorMaterial` is written by the humanoid simulation every frame
+/// precisely so that the answer is in the world and not only in the solver.
+fn character_grounded_in(doc: &rustudio_core::doc::Document) -> bool {
+    let Some(character) = local_character_in(doc) else {
+        return false;
+    };
+    let humanoid = doc.dom.get_by_ref(character).and_then(|i| {
+        i.children().iter().copied().find(|c| {
+            doc.dom
+                .get_by_ref(*c)
+                .is_some_and(|n| n.class.as_str() == "Humanoid")
+        })
+    });
+    let Some(humanoid) = humanoid else {
+        return false;
+    };
+    rustudio_core::doc::enum_u32(doc.prop(humanoid, "FloorMaterial"))
+        .is_some_and(|material| material != rustudio_core::mech::MATERIAL_AIR)
+}
+
+/// The local player's `Character` model, or `None` before one exists.
+fn local_character_in(doc: &rustudio_core::doc::Document) -> Option<rbx_dom_weak::types::Ref> {
+    let players = doc.dom.get_by_ref(doc.dom.root_ref()).and_then(|root| {
+        root.children()
+            .iter()
+            .find(|r| {
+                doc.dom
+                    .get_by_ref(**r)
+                    .is_some_and(|i| i.class.as_str() == "Players")
+            })
+            .copied()
+    })?;
+    let local = match doc.prop(players, "LocalPlayer") {
+        Some(Variant::Ref(r)) if !r.is_none() => r,
+        _ => return None,
+    };
+    match doc.prop(local, "Character") {
+        Some(Variant::Ref(r)) if !r.is_none() => Some(r),
+        _ => None,
+    }
+}
 
 

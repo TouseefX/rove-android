@@ -425,6 +425,11 @@ pub struct Session {
     /// unsupported request). Counted so "requests with no replies" has a reason
     /// next to it on the overlay.
     pub ping_prepare_failures: u64,
+    /// Character-root physics records written and refused. A session whose world
+    /// renders and whose character is frozen on the server has a zero here, and
+    /// that is the number that says why the two disagree.
+    pub physics_frames_sent: u64,
+    pub physics_frames_failed: u64,
 }
 
 impl Session {
@@ -511,6 +516,8 @@ impl Session {
             extended_family_seen: false,
             negotiated: 0,
             ping_prepare_failures: 0,
+            physics_frames_sent: 0,
+            physics_frames_failed: 0,
         }
     }
 
@@ -1532,6 +1539,8 @@ impl Session {
             program_challenges: self.program_challenges,
             program_answered: self.program_answered,
             normalize_refused: self.normalize_refused,
+            physics_frames_sent: self.physics_frames_sent,
+            physics_frames_failed: self.physics_frames_failed,
             pings_answered: self.ping_counts().replies_sent,
             pings_pending: self.ping_pending(),
             pings_blocked: {
@@ -2016,6 +2025,13 @@ pub async fn run(
     // their own announced wire id, `rove`'s `PING_WIRE_ID = 6`. One writer for
     // the session: the announcement is once, and the sequence is per connection.
     let mut unreliable_writer = UnreliableWriter::default();
+    // The physics uplink's own writer and clock: the timestamp a root frame
+    // carries is this session's monotonic milliseconds, the same clock a ping
+    // reply's words are read from.
+    let mut physics = PhysicsWriter {
+        announced: false,
+        sequence: 0,
+    };
     let mut sync = TimeSyncProbe::default();
     sync.start(&clock).map_err(|_| "the time-sync probe could not be started")?;
     log::info!("session: wire clock initialized, clock channels 6/1, 6/2, 6/3 announced");
@@ -2177,6 +2193,19 @@ pub async fn run(
             // A time-sync request due now. Unreliable on purpose: it is a
             // probe, and a lost one is retried on the next interval.
             _ = sync_tick.tick() => {
+                // **The replicator wire clock, not a local one.** A root frame's
+                // timestamp is read by the server against the same clock the
+                // time-sync probe measures, so it has to come from that clock and
+                // not from "milliseconds since this process started". No reading
+                // means no frame: a zero timestamp is a claim about an instant in
+                // 1970 and the server would place the character by it.
+                let physics_now_ms = match clock.physics_milliseconds() {
+                    Ok(ms) => Some(ms),
+                    Err(error) => {
+                        log::warn!("session: the physics clock has no reading: {error}");
+                        None
+                    }
+                };
                 match sync.due(&clock) {
                     Ok(Some(packet)) => {
                         session.sync_requests += 1;
@@ -2210,6 +2239,13 @@ pub async fn run(
                 // queued by a record is answered here when the read loop is
                 // quiet, which is most of a joined session.
                 flush_pings(&mut session, &sender, &connection, &mut unreliable_writer).await;
+                // And the character's own motion, at the same rate the tick
+                // runs: the server reconciles a client by the root frames it
+                // receives, and a client that sends none is one whose character
+                // stands still for everyone but itself.
+                if let Some(now_ms) = physics_now_ms {
+                    physics.tick(&mut session, &sender, &connection, now_ms).await;
+                }
             }
             // **A datagram, routed by its announcement.** This used to keep
             // only the clock's and throw the rest away, which is exactly the
@@ -2421,6 +2457,100 @@ async fn flush_pings(
             log::warn!("session: a ping reply could not be written");
         }
         session.ping_reply_written(token, written);
+    }
+}
+
+/// **The character-root physics uplink** (`(4, 6)` on wire id 8).
+///
+/// Ported from `rove`'s `live_session.rs` tick: the editor's latest character
+/// pose, if it is still fresh, encoded as one own-root client-current record and
+/// sent as a datagram. The channel is announced once (`control_open(4, 6, 8)`),
+/// because a bare wire id is a datagram the server cannot attribute.
+///
+/// What this is not: a claim of authority. The record says "my root is here" for
+/// the one assembly the server already granted this client; every other assembly
+/// in the place stays the server's, and this encoder cannot express one.
+#[cfg(feature = "transport")]
+struct PhysicsWriter {
+    announced: bool,
+    sequence: u64,
+}
+
+#[cfg(feature = "transport")]
+impl PhysicsWriter {
+    /// Send the pose, if there is a fresh one. Returns whether a datagram went.
+    async fn tick(
+        &mut self,
+        session: &mut Session,
+        sender: &ReliableSender,
+        connection: &Connection,
+        now_ms: u64,
+    ) -> bool {
+        let Some(pose) = session
+            .handover
+            .as_ref()
+            .and_then(|live| live.character_pose())
+        else {
+            // No character, or a pose too old to describe one: nothing to say,
+            // and an old record is worse than silence.
+            return false;
+        };
+        if !self.announced {
+            let Ok(announcement) = rove_client_core::channels::control_open(
+                crate::physics_sender::APPLICATION,
+                crate::physics_sender::CHANNEL,
+                crate::physics_sender::WIRE_ID,
+            ) else {
+                return false;
+            };
+            if sender
+                .send(
+                    crate::physics_sender::APPLICATION,
+                    rove_client_core::channels::CONTROL_CHANNEL,
+                    &announcement,
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            self.announced = true;
+        }
+        let Some(next) = self.sequence.checked_add(1) else {
+            return false;
+        };
+        self.sequence = next;
+        let payload = match crate::physics_sender::encode_root_frame_with_rotation(
+            pose.root,
+            now_ms,
+            self.sequence,
+            pose.position.map(f64::from),
+            pose.rotation,
+            pose.velocity,
+            pose.grounded,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                log::debug!("session: a physics frame was not encodable: {error}");
+                return false;
+            }
+        };
+        match rove_client_core::transport::session::send_unreliable(
+            connection,
+            crate::physics_sender::WIRE_ID,
+            self.sequence,
+            &payload,
+        ) {
+            Ok(()) => {
+                session.physics_frames_sent += 1;
+                true
+            }
+            Err(error) => {
+                session.physics_frames_failed += 1;
+                log::debug!("session: a physics frame was not written: {error}");
+                false
+            }
+        }
     }
 }
 

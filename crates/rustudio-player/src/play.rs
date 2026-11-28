@@ -177,6 +177,38 @@ impl std::ops::DerefMut for PlayPhysics {
 }
 
 impl PlaySession {
+    /// The same frame, without the ownership question: the solver's own answer
+    /// about the character this session holds, or `None` when it has none.
+    ///
+    /// Split from [`Game::play_owned_root`] because ownership is a *document*
+    /// question (it reads `NetworkOwnerV3` from the replicated world, which this
+    /// struct does not hold) and the pose is a *solver* question.
+    pub(super) fn owned_root_pose(&self) -> Option<OwnedRoot> {
+        let ch = self.character.as_ref().filter(|c| !c.dead)?;
+        let (root_xf, velocity, _) = self.physics.humanoid_root(ch.model)?;
+        Some(OwnedRoot {
+            root: ch.rig.root,
+            model: ch.model,
+            position: [root_xf.pos.x, root_xf.pos.y, root_xf.pos.z],
+            // Row-major, the order `physics_rotation` takes and the order
+            // `rbx_dom_weak` stores a `CFrame`'s orientation in: no transposition
+            // here. (glam's matrix is column-major axes, one layer further out.)
+            rotation: [
+                root_xf.rot.x_axis.x as f64,
+                root_xf.rot.y_axis.x as f64,
+                root_xf.rot.z_axis.x as f64,
+                root_xf.rot.x_axis.y as f64,
+                root_xf.rot.y_axis.y as f64,
+                root_xf.rot.z_axis.y as f64,
+                root_xf.rot.x_axis.z as f64,
+                root_xf.rot.y_axis.z as f64,
+                root_xf.rot.z_axis.z as f64,
+            ],
+            velocity: [velocity.x as f64, velocity.y as f64, velocity.z as f64],
+            grounded: ch.body.grounded,
+        })
+    }
+
     /// Character/tool exclusions used by the mouse query during presentation.
     pub(super) fn physics_skip(&self) -> &rustc_hash::FxHashSet<Ref> {
         match &self.pending_frame {
@@ -396,6 +428,24 @@ impl ServerPhase {
 
 /// The Enum.CloseReason a Studio Stop gives BindToClose callbacks.
 const CLOSE_REASON: &str = "DeveloperShutdown";
+
+/// One frame of the local character's root, as the solver stepped it.
+///
+/// What the physics uplink carries, in the units the wire wants: studs and
+/// studs per second, a row-major 3×3, and the `Humanoid`'s floor state. It is
+/// `Copy` and small deliberately — it is produced every frame and read once per
+/// 20 ms tick, and either side may drop it without either side noticing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OwnedRoot {
+    /// The character's root part in the document.
+    pub root: rbx_dom_weak::types::Ref,
+    /// The character model, for the caller that needs to say whose it is.
+    pub model: rbx_dom_weak::types::Ref,
+    pub position: [f64; 3],
+    pub rotation: [f64; 9],
+    pub velocity: [f64; 3],
+    pub grounded: bool,
+}
 
 pub struct PlaySession {
     pub mode: RunMode,
@@ -757,6 +807,38 @@ impl Game {
                 _ => p.mode == RunMode::Play && p.showing == Side::Client,
             }
         })
+    }
+
+    /// **This client's own character root, while a live session owns it.**
+    ///
+    /// The physics uplink (`(4, 6)`, wire id 8) needs four things about the root
+    /// and this is the one place that has all of them: the root's `Ref` (the
+    /// wire names an instance by `scope:index`, so the editor needs the ref to
+    /// ask its own half of the world what the server calls it), the stepped pose
+    /// and velocity from the solver, and whether the body is on the floor.
+    ///
+    /// `None` for everything that must not send one: a session that is not a
+    /// joined client (Play Solo's character is replicated by this machine, so a
+    /// root frame about it would be a claim about somebody else's world), a
+    /// client with no character yet, and — the case that matters — a character
+    /// the server did **not** hand this client. A root frame for a character the
+    /// server simulates is a client telling the server where its own character
+    /// is; at best it is ignored, and at worst it fights the server's motion.
+    ///
+    /// The pose is the solver's, not the last replicated one: `humanoid_root`
+    /// answers with the frame's shown root, which is the body this client
+    /// stepped. It is the same frame `hum_post` reads, so the number sent is the
+    /// number on screen.
+    pub fn play_owned_root(&self) -> Option<OwnedRoot> {
+        let s = self.play.as_ref()?;
+        if s.mode != RunMode::Client {
+            return None;
+        }
+        let ch = s.character.as_ref()?;
+        if ch.dead || !self.live_character_owned() {
+            return None;
+        }
+        s.owned_root_pose()
     }
 
     /// True while a Play session drives a character.
