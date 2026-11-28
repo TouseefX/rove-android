@@ -188,21 +188,6 @@ impl Default for JoinWindow {
 }
 
 impl JoinWindow {
-    /// **Where this client stands**, for `ReplicationFocus`.
-    ///
-    /// The local character's root part, if a character has resolved: a
-    /// streaming server sends the parts around this point, so following the
-    /// character is what keeps a walked-away client from being streamed the
-    /// region it left. `None` before there is one, and the camera answers then.
-    ///
-    /// Read from the live document rather than the gameplay state because this
-    /// is the same `Document` the session's deltas are applied to: the root's
-    /// `CFrame` is exactly what the server last said, or what the local
-    /// simulation last wrote.
-    fn character_focus(&self) -> Option<glam::Vec3> {
-        character_focus_in(&self.game.doc)
-    }
-
     pub fn new() -> Self {
         Self {
             open: false,
@@ -240,6 +225,21 @@ impl JoinWindow {
 }
 
 impl Editor {
+    /// **Where this client stands**, for `ReplicationFocus`.
+    ///
+    /// The local character's root part, if a character has resolved: a
+    /// streaming server sends the parts around this point, so following the
+    /// character is what keeps a walked-away client from being streamed the
+    /// region it left. `None` before there is one, and the camera answers then.
+    ///
+    /// Read from the live document rather than the gameplay state because this
+    /// is the same `Document` the session's deltas are applied to: the root's
+    /// `CFrame` is exactly what the server last said, or what the local
+    /// simulation last wrote.
+    fn character_focus(&self) -> Option<glam::Vec3> {
+        character_focus_in(&self.game.doc)
+    }
+
     /// Keep a live session's world in front of the person who joined (M3).
     ///
     /// Called every frame from the editor's own frame, whether or not the join
@@ -714,10 +714,8 @@ impl Editor {
             // around a camera that is still in its default place — and the
             // camera is what there is until then.
             let at = self
-                .join_win
                 .character_focus()
-                .or_else(|| self.game.cam.focus)
-                .unwrap_or(self.game.cam.pos);
+                .unwrap_or(self.game.cam.focus);
             live.set_focus([at.x, at.y, at.z]);
         }
         let dropped = self
