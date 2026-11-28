@@ -139,6 +139,16 @@ impl Editor {
             rustudio_account::session::set_place_context(place);
         }
         let live_ids = self.live_team_create_ids();
+        #[cfg(feature = "live")]
+        let live_ids = if mode == RunMode::Client && self.join_win.running() {
+            self.join_win.direct_join_ids().or(live_ids)
+        } else {
+            live_ids
+        };
+        #[cfg(feature = "live")]
+        if mode == RunMode::Client {
+            self.apply_direct_join_creator();
+        }
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         // The view's size before the game's scripts run (Camera.ViewportSize,
         // GuiService:GetHardwareSafeViewport: Roblox's CoreScripts decide the

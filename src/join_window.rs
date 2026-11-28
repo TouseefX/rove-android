@@ -57,6 +57,84 @@ fn cookie_source() -> impl FnOnce() -> Option<String> + Send + 'static {
     }
 }
 
+/// Public experience information is fetched off the frame thread. A receiver
+/// belongs to exactly one join, so a late response cannot decorate a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JoinCreator {
+    id: i64,
+    kind: rustudio_account::cloud::CreatorKind,
+}
+
+enum JoinMetadataReply {
+    Universe(u64),
+    Details { name: String, creator: String, identity: Option<JoinCreator> },
+    Icon(egui::ColorImage),
+    Error(String),
+}
+
+fn public_json(url: &str) -> Result<serde_json::Value, String> {
+    let mut response = rustudio_account::api::agent().get(url).call().map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("metadata HTTP {}", response.status().as_u16()));
+    }
+    let bytes = response.body_mut().with_config().limit(1024 * 1024).read_to_vec().map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn parse_join_details(data: &serde_json::Value, universe: u64) -> Option<(String, String, Option<JoinCreator>)> {
+    let game = data.get("data")?.as_array()?.iter()
+        .find(|v| v.get("id").and_then(|id| id.as_u64()) == Some(universe))?;
+    let name = game.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let creator = game.pointer("/creator/name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let identity = (|| {
+        let creator = game.get("creator")?;
+        let id = creator.get("id")?.as_u64().and_then(|v| i64::try_from(v).ok()).filter(|v| *v > 0)?;
+        let kind = match creator.get("type")?.as_str()? {
+            "User" => rustudio_account::cloud::CreatorKind::User,
+            "Group" => rustudio_account::cloud::CreatorKind::Group,
+            _ => return None,
+        };
+        Some(JoinCreator { id, kind })
+    })();
+    Some((name, creator, identity))
+}
+
+fn join_metadata_worker(place: u64, tx: std::sync::mpsc::Sender<JoinMetadataReply>) {
+    let result = (|| -> Result<(), String> {
+        let mapping = public_json(&format!("https://apis.roblox.com/universes/v1/places/{place}/universe"))?;
+        let universe = mapping.get("universeId").and_then(|v| v.as_u64()).filter(|n| *n > 0 && *n <= i64::MAX as u64)
+            .ok_or_else(|| "no universe for place".to_string())?;
+        if tx.send(JoinMetadataReply::Universe(universe)).is_err() { return Ok(()); }
+        // Fetch the icon independently of game details: one failure must not
+        // prevent the other result, and no authentication is sent to the CDN.
+        let icon_tx = tx.clone();
+        std::thread::spawn(move || {
+            let icon = (|| -> Result<egui::ColorImage, String> {
+                let url = rustudio_account::thumbs::url(&("GameIcon".into(), universe, 150))?;
+                let mut response = rustudio_account::api::agent().get(&url).call().map_err(|e| e.to_string())?;
+                if !response.status().is_success() { return Err(format!("icon HTTP {}", response.status().as_u16())); }
+                let bytes = response.body_mut().with_config().limit(2 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())?;
+                let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format().map_err(|e| e.to_string())?;
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(2048);
+                limits.max_image_height = Some(2048);
+                limits.max_alloc = Some(16 * 1024 * 1024);
+                reader.limits(limits);
+                let img = reader.decode().map_err(|e| e.to_string())?.thumbnail(150, 150).to_rgba8();
+                Ok(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
+            })();
+            if let Ok(icon) = icon { let _ = icon_tx.send(JoinMetadataReply::Icon(icon)); }
+        });
+        let data = public_json(&format!("https://games.roblox.com/v1/games?universeIds={universe}"))?;
+        let (name, creator, identity) = parse_join_details(&data, universe)
+            .ok_or_else(|| "experience details unavailable".to_string())?;
+        let _ = tx.send(JoinMetadataReply::Details { name, creator, identity });
+        Ok(())
+    })();
+    if let Err(error) = result { let _ = tx.send(JoinMetadataReply::Error(error)); }
+}
+
 /// A join the person started, and how it is going.
 /// One line of the joining cover, and whether it is done, happening, or waiting.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,6 +278,13 @@ pub struct JoinWindow {
     join: Option<rustudio_join::join::Join>,
     /// When the join was started.
     started: Option<Instant>,
+    direct_place: Option<u64>,
+    metadata_rx: Option<std::sync::mpsc::Receiver<JoinMetadataReply>>,
+    metadata_universe: Option<u64>,
+    metadata_name: String,
+    metadata_creator: String,
+    creator_identity: Option<JoinCreator>,
+    metadata_icon: Option<egui::TextureHandle>,
     /// A world already installed: the overlay then only shows the report, and
     /// closing it leaves the place open.
     pub installed: bool,
@@ -283,6 +368,13 @@ impl JoinWindow {
             place_text: DEFAULT_PLACE.to_string(),
             join: None,
             started: None,
+            direct_place: None,
+            metadata_rx: None,
+            metadata_universe: None,
+            metadata_name: String::new(),
+            metadata_creator: String::new(),
+            creator_identity: None,
+            metadata_icon: None,
             installed: false,
             show_text: false,
             cover_until_played: false,
@@ -312,6 +404,12 @@ impl JoinWindow {
         self.join.as_ref().is_some_and(|join| join.running())
     }
 
+    /// Direct joins must not inherit a Team Create identity. The place is
+    /// known immediately; universe resolution is asynchronous.
+    pub(crate) fn direct_join_ids(&self) -> Option<(u64, u64)> {
+        Some((self.metadata_universe.unwrap_or(0), self.direct_place?))
+    }
+
     /// The place id typed into the window.
     fn place(&self) -> Option<u64> {
         self.place_text.trim().parse().ok()
@@ -319,6 +417,25 @@ impl JoinWindow {
 }
 
 impl Editor {
+    /// Populate the real experience owner's identity, not the joining user.
+    /// Before client startup write the replicated document; afterwards go
+    /// through the runtime so property-change listeners are notified.
+    pub(crate) fn apply_direct_join_creator(&mut self) {
+        if self.join_win.direct_place.is_none() || !self.join_win.running() { return; }
+        let Some(creator) = self.join_win.creator_identity else { return };
+        let root = self.game.doc.dom.root_ref();
+        let kind = Variant::Enum(rbx_dom_weak::types::Enum::from_u32(creator.kind.enum_value()));
+        if self.game.play.is_some() {
+            self.game.with_live_client(|rt| {
+                rt.apply_prop(root, "CreatorId", Variant::Int64(creator.id));
+                rt.apply_prop(root, "CreatorType", kind);
+            });
+        } else if let Some(instance) = self.game.doc.dom.get_by_ref_mut(root) {
+            instance.properties.insert(rbx_dom_weak::ustr("CreatorId"), Variant::Int64(creator.id));
+            instance.properties.insert(rbx_dom_weak::ustr("CreatorType"), kind);
+        }
+    }
+
     /// **Where this client stands**, for `ReplicationFocus`.
     ///
     /// The local character's root part, if a character has resolved: a
@@ -1069,7 +1186,28 @@ impl Editor {
                 // The three steps, as a list with the current one lit. Drawn
                 // rather than laid out with widgets so it cannot scroll.
                 let centre = rect.center();
-                let mut y = centre.y - 46.0;
+                let has_identity = !self.join_win.metadata_name.is_empty() || self.join_win.metadata_icon.is_some();
+                let compact = rect.height() < 420.0;
+                let columns = has_identity && compact && rect.width() > 480.0;
+                let identity_x = if columns { rect.min.x + rect.width() * 0.25 } else { centre.x };
+                let steps_x = if columns { rect.min.x + rect.width() * 0.68 } else { centre.x };
+                if has_identity {
+                    let icon_size = if compact { 62.0 } else { 100.0 };
+                    let top = if columns { (centre.y - 94.0).max(rect.min.y + 8.0) } else { rect.min.y + if compact { 16.0 } else { 32.0 } };
+                    if let Some(icon) = &self.join_win.metadata_icon {
+                        let image_rect = egui::Rect::from_center_size(egui::pos2(identity_x, top + icon_size / 2.0), egui::vec2(icon_size, icon_size));
+                        painter.image(icon.id(), image_rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    }
+                    let text_y = top + icon_size + 14.0;
+                    let max_width = if columns { rect.width() * 0.43 } else { rect.width() - 32.0 };
+                    let title = painter.layout(self.join_win.metadata_name.clone(), egui::FontId::proportional(if compact { 18.0 } else { 22.0 }), egui::Color32::WHITE, max_width.max(1.0));
+                    let title_height = title.size().y;
+                    painter.galley(egui::pos2(identity_x - title.size().x / 2.0, text_y), title, egui::Color32::WHITE);
+                    if !self.join_win.metadata_creator.is_empty() {
+                        painter.text(egui::pos2(identity_x, text_y + title_height + 10.0), egui::Align2::CENTER_CENTER, format!("By {}", self.join_win.metadata_creator), egui::FontId::proportional(14.0), egui::Color32::from_rgb(180, 185, 195));
+                    }
+                }
+                let mut y = if has_identity && !columns { rect.max.y - if compact { 185.0 } else { 205.0 } } else { centre.y - 46.0 };
                 for (label, state) in phase.steps.iter() {
                     let colour = match state {
                         CoverStep::Done => egui::Color32::from_rgb(120, 190, 140),
@@ -1105,7 +1243,7 @@ impl Editor {
                     // than one `format!`.
                     let gap = 8.0;
                     let mark_size = galley.size();
-                    let left = centre.x - (mark_size.x + gap) / 2.0;
+                    let left = steps_x - (mark_size.x + gap) / 2.0;
                     painter.galley(egui::Pos2::new(left, y - mark_size.y / 2.0), galley, colour);
                     painter.text(
                         egui::Pos2::new(left + mark_size.x + gap, y),
@@ -1118,7 +1256,7 @@ impl Editor {
                 }
                 if let Some(note) = &phase.note {
                     painter.text(
-                        egui::Pos2::new(centre.x, y + 12.0),
+                        egui::Pos2::new(steps_x, y + 12.0),
                         egui::Align2::CENTER_CENTER,
                         note,
                         egui::FontId::proportional(13.0),
@@ -1350,6 +1488,9 @@ impl Editor {
     /// session, and Stop taken so the world it had started building is gone.
     pub fn abandon_join(&mut self) {
         self.join_win.join = None;
+        self.join_win.metadata_rx = None;
+        self.join_win.direct_place = None;
+        self.join_win.creator_identity = None;
         self.join_win.live_world = None;
         self.join_win.live = None;
         self.join_win.cover_until_played = false;
@@ -1438,6 +1579,31 @@ impl Editor {
 
     /// The join window, drawn over the editor while it is open.
     pub fn join_window(&mut self, ctx: &egui::Context) {
+        while let Some(reply) = self.join_win.metadata_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            match reply {
+                JoinMetadataReply::Universe(universe) => {
+                    self.join_win.metadata_universe = Some(universe);
+                    // If Play started before the HTTP response, publish the
+                    // identity through the runtime so property waiters wake.
+                    let root = self.game.doc.dom.root_ref();
+                    if !matches!(self.game.doc.prop(root, "GameId"), Some(Variant::Int64(n)) if n != 0) {
+                        self.game.with_live_client(|rt| rt.apply_prop(root, "GameId", Variant::Int64(universe as i64)));
+                    }
+                }
+                JoinMetadataReply::Details { name, creator, identity } => {
+                    self.join_win.metadata_name = name;
+                    self.join_win.metadata_creator = creator;
+                    self.join_win.creator_identity = identity;
+                    if self.game.play.is_some() {
+                        self.apply_direct_join_creator();
+                    }
+                }
+                JoinMetadataReply::Icon(image) => {
+                    self.join_win.metadata_icon = Some(ctx.load_texture("join_experience_icon", image, egui::TextureOptions::LINEAR));
+                }
+                JoinMetadataReply::Error(error) => self.info(format!("join: experience details unavailable: {error}")),
+            }
+        }
         // A joined world is installed on one frame and played on the next: F5
         // reads the document, and `set_document` has to have finished with it
         // before Play copies it as its server DataModel.
@@ -1796,6 +1962,15 @@ impl Editor {
     /// Start the join the window's own **Join** button asks for.
     fn start_join(&mut self, place: u64) {
         self.join_win.place_text = place.to_string();
+        self.join_win.direct_place = Some(place);
+        self.join_win.metadata_universe = None;
+        self.join_win.metadata_name.clear();
+        self.join_win.metadata_creator.clear();
+        self.join_win.creator_identity = None;
+        self.join_win.metadata_icon = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.join_win.metadata_rx = Some(rx);
+        std::thread::spawn(move || join_metadata_worker(place, tx));
         // **The window closes on the tap, and the cover takes its place.** The
         // window is the *editor's* chrome: leaving it up meant the tap on Join
         // put a window over a Studio 3D view, which is the "it opened the
@@ -2064,6 +2239,31 @@ fn local_character_in(doc: &rustudio_core::doc::Document) -> Option<rbx_dom_weak
 
 #[cfg(test)]
 mod live_handover_tests {
+    #[test]
+    fn direct_join_identity_does_not_follow_edited_text() {
+        let mut join = super::JoinWindow::new();
+        assert_eq!(join.direct_join_ids(), None);
+        join.direct_place = Some(123);
+        join.place_text = "456".into();
+        assert_eq!(join.direct_join_ids(), Some((0, 123)));
+        join.metadata_universe = Some(789);
+        assert_eq!(join.direct_join_ids(), Some((789, 123)));
+    }
+
+    #[test]
+    fn details_match_universe_and_accept_group_or_user_creator() {
+        let data = serde_json::json!({"data": [
+            {"id": 1, "name": "Wrong", "creator": {"name": "Other"}},
+            {"id": 2, "name": "Experience", "creator": {"id": 33, "name": "Group Name", "type": "Group"}},
+            {"id": 3, "name": "Another", "creator": {"id": 44, "name": "Username", "type": "User"}},
+            {"id": 5, "name": "Unknown", "creator": {"id": 55, "name": "Someone", "type": "Other"}}
+        ]});
+        use rustudio_account::cloud::CreatorKind;
+        assert_eq!(super::parse_join_details(&data, 2), Some(("Experience".into(), "Group Name".into(), Some(super::JoinCreator { id: 33, kind: CreatorKind::Group }))));
+        assert_eq!(super::parse_join_details(&data, 3), Some(("Another".into(), "Username".into(), Some(super::JoinCreator { id: 44, kind: CreatorKind::User }))));
+        assert_eq!(super::parse_join_details(&data, 5), Some(("Unknown".into(), "Someone".into(), None)));
+        assert_eq!(super::parse_join_details(&data, 4), None);
+    }
     use super::*;
 
     #[test]

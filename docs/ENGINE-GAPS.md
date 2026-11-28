@@ -430,3 +430,15 @@ camera 75 → 100 with the 2° tolerance unchanged.
    coordinates and `TextBox.ReturnPressedFromOnScreenKeyboard`
    (src/viewport.rs `keyboard_pan`, crates/rustudio-engine/src/runtime_ext.rs `device_prop`;
    zero and never on a desktop, as in Studio).
+
+### Live join identity and loading UI
+
+Direct joins now initialise the client with the joined `PlaceId`, and pass it
+as LoadingScript's first argument. Public universe details are fetched in the
+background to supply `GameId`, `CreatorId` and `CreatorType` when available;
+the native join cover separately displays the experience name, creator and
+GameIcon thumbnail. Missing or refused metadata is not fabricated and must not
+hold up a join. The CoreScripts loading lifecycle, metadata requests and GUI
+appearance still need verification on an Android device; a silent or stalled
+replication stream can prevent the world from loading regardless of these UI
+changes. Capture the join report and CoreScript errors when that happens.

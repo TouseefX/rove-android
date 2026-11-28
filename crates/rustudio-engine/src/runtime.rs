@@ -8372,9 +8372,21 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
 /// reports (`StarterScript`, `CoreGui.RobloxGui.CoreScripts/<Name>`) and
 /// security::internal_chunk knows. None when the patch has no such script.
 pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref) -> mlua::Result<Option<Ref>> {
-    let (r, code, full) = {
+    let (r, code, full, args) = {
         let mut w = world(lua)?;
         let Some(code) = w.core_scripts.scripts.get(name).cloned() else { return Ok(None) };
+        // Roblox supplies the place ID to LoadingScript as its first vararg.
+        // Other entry CoreScripts and AddCoreScriptLocal keep their old args.
+        let args = if name == "LoadingScript" {
+            let root = w.d().dom.root_ref();
+            match w.d().prop(root, "PlaceId") {
+                Some(Variant::Int64(id)) if id > 0 => vec![Value::Number(id as f64)],
+                Some(Variant::Int32(id)) if id > 0 => vec![Value::Number(id as f64)],
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let r = w.dm().dom.insert(parent, InstanceBuilder::new("CoreScript").with_name(name));
         if parent.is_none() {
             w.orphans.insert(r);
@@ -8384,13 +8396,13 @@ pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref) -> mlua::Res
         w.structure_changed = true;
         w.started.insert(r);
         let full = w.full_name(r);
-        (r, code, full)
+        (r, code, full, args)
     };
     let env = crate::globals_parity::new_privileged_env(lua, Some(inst_value(lua, r)?))?;
     let f = lua.load(&code[..]).set_mode(mlua::chunk::ChunkMode::Binary).set_name(format!("={full}")).set_environment(env).into_function()?;
     let th = domains::assets_cloud::scene::create_thread(lua, f)?;
     security::set(&th, security::CORE);
-    resume(lua, &th, vec![]);
+    resume(lua, &th, args);
     Ok(Some(r))
 }
 
@@ -9119,6 +9131,24 @@ mod tests {
             });
             assert_eq!(started, !loaded);
         }
+    }
+
+    #[test]
+    fn loading_core_script_receives_the_joined_place_id() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        doc.dom.get_by_ref_mut(root).unwrap().properties.insert(ustr("PlaceId"), Variant::Int64(12345));
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(doc, RunMode::Client);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let mut installed = rustudio_core::core_scripts::Installed::default();
+        let bytecode = crate::bytecode_cache::compiler().compile("print('loading place', select(1, ...), game.PlaceId)").unwrap();
+        installed.scripts.insert("LoadingScript".into(), std::sync::Arc::from(bytecode));
+        let _ = rt.start_core_scripts(installed);
+        let w = rt.leave();
+        assert!(w.output.iter().any(|(_, text)| text.contains("loading place") && text.matches("12345").count() == 2), "{:?}", w.output);
     }
 
     fn run(src: &str) -> Vec<(Level, String)> {
