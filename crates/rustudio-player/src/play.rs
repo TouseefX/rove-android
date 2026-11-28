@@ -2660,8 +2660,9 @@ impl Game {
                         .map(|i| i.children().to_vec())
                         .unwrap_or_default()
                     {
-                        let class = doc.class_of(child).unwrap_or("?");
-                        if class != "Player" {
+                        // `class_of` is a `Ustr`, and `!= "Player"` does not
+                        // compare a `Ustr` with a `&str` (E0308 at the `?`).
+                        if !doc.class_of(child).is_some_and(|k| k == "Player") {
                             continue;
                         }
                         count += 1;
