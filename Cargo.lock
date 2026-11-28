@@ -4763,7 +4763,9 @@ name = "rustudio-join"
 version = "0.5.2"
 dependencies = [
  "base64 0.23.1",
+ "blake3",
  "log",
+ "mlua",
  "rbx_dom_weak",
  "rove-client-core",
  "rustudio-core",
