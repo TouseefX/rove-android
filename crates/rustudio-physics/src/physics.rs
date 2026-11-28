@@ -1686,7 +1686,7 @@ impl Physics {
             // `external` is exactly this in the client world
             // (physics_client.rs: `anchored = true` at build, `teleport` on a
             // replicated `CFrame`), so it is what a server-owned part becomes.
-            let mine = owner.owns(doc, *r, *root);
+            let mine = owner.owns(doc, *r, root);
             let following = self.external.contains(r);
             if mine && following {
                 self.external.remove(r);

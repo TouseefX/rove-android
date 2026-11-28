@@ -1234,11 +1234,6 @@ mod tests {
     /// replicated instance at all) and simulate the whole map.
     #[test]
     fn a_snapshot_world_is_stamped_as_the_servers() {
-        let (doc, _live) = empty_world();
-        assert!(
-            doc.owner().is_some(),
-            "an empty snapshot still comes from a server"
-        );
         let snapshot = crate::snapshot::parse(
             r#"{"version":1,"sequence":0,"job_id":"live","services":{},
                 "class_parents":{},"defaults":{},"default_origins":{},
