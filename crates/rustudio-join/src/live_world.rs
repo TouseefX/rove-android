@@ -123,7 +123,7 @@ impl Counters {
     /// The one line the overlay shows. Deliberately short: it is read over a 3D
     /// view on a phone, and a wide line is an unreadable one.
     pub fn line(&self) -> String {
-        let mut line = format!(
+        let line = format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
              acked {}/{} held · markers {}/{} · stream {}/{} {} · \
              dgram {}/{} on {} ch · acks {} · focus {} · {} s · {}",

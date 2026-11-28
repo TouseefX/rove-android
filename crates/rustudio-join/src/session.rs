@@ -1433,7 +1433,10 @@ const READER_QUEUE: usize = 8192;
 #[cfg(feature = "transport")]
 pub async fn run(
     issued: &IssuedJoinAllocation,
-    session: &mut Session,
+    // `mut` on the *binding*, not only on the type: a `&mut Session` that is not
+    // a mutable binding cannot be re-borrowed, so `feed_on(&mut session)` —
+    // which `flush_outbound` takes — is E0596.
+    mut session: &mut Session,
     seconds: u64,
     mut progress: impl FnMut(&Session),
 ) -> Result<Stage, &'static str> {
