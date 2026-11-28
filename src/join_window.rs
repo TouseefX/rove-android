@@ -615,7 +615,7 @@ impl Editor {
             Some(owned) => {
                 (
                     owned.root,
-                    owned.position.map(|v| v as f32),
+                    owned.position,
                     owned.rotation,
                     owned.velocity,
                     owned.grounded,

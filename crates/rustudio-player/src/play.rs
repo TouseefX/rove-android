@@ -441,7 +441,9 @@ pub struct OwnedRoot {
     pub root: rbx_dom_weak::types::Ref,
     /// The character model, for the caller that needs to say whose it is.
     pub model: rbx_dom_weak::types::Ref,
-    pub position: [f64; 3],
+    /// The solver's own precision: glam is `f32`, which is what the wire's
+    /// compact position codec quantizes to anyway (10/16/21 bits).
+    pub position: [f32; 3],
     pub rotation: [f64; 9],
     pub velocity: [f64; 3],
     pub grounded: bool,
