@@ -7385,10 +7385,14 @@ impl Runtime {
         let loading_gui = world(&self.lua).ok().and_then(|w| {
             let root = w.d().dom.root_ref();
             let core_gui = w.d().find_child(root, "CoreGui")?;
-            let gui = w.d().find_child(core_gui, "RobloxLoadingGui")?;
-            (w.d().class_of(gui).as_deref() == Some("ScreenGui")
-                && !matches!(w.d().prop(gui, "Enabled"), Some(Variant::Bool(false))))
-                .then_some(gui)
+            // Document::find_child searches by *class*, not name. Match both
+            // on direct children so an unrelated or nested GUI is never hidden.
+            let gui = w.d().dom.get_by_ref(core_gui)?.children().iter().copied().find(|&r| {
+                w.d().dom.get_by_ref(r).is_some_and(|i| {
+                    i.name == "RobloxLoadingGui" && i.class == "ScreenGui"
+                })
+            })?;
+            (!matches!(w.d().prop(gui, "Enabled"), Some(Variant::Bool(false)))).then_some(gui)
         });
         let Some(gui) = loading_gui else { return false };
         self.set(gui, "Enabled", Value::Boolean(false));
@@ -9057,6 +9061,9 @@ mod tests {
         // new_place does not preinstall CoreGui; the live player normally does.
         let root = doc.dom.root_ref();
         let core_gui = doc.dom.insert(root, InstanceBuilder::new("CoreGui"));
+        let folder = doc.dom.insert(core_gui, InstanceBuilder::new("Folder").with_name("RobloxLoadingGui"));
+        let nested = doc.dom.insert(folder, InstanceBuilder::new("ScreenGui")
+            .with_name("RobloxLoadingGui").with_property("Enabled", true));
         let loading = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
             .with_name("RobloxLoadingGui").with_property("Enabled", true));
         let other = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
@@ -9069,6 +9076,26 @@ mod tests {
         let w = rt.leave();
         assert_eq!(w.d().prop(loading, "Enabled"), Some(Variant::Bool(false)));
         assert_eq!(w.d().prop(other, "Enabled"), Some(Variant::Bool(true)));
+        assert_eq!(w.d().prop(nested, "Enabled"), Some(Variant::Bool(true)));
+    }
+
+    #[test]
+    fn stuck_loading_fallback_ignores_nested_and_disabled_screens() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let core_gui = doc.dom.insert(root, InstanceBuilder::new("CoreGui"));
+        let folder = doc.dom.insert(core_gui, InstanceBuilder::new("Folder").with_name("RobloxLoadingGui"));
+        let nested = doc.dom.insert(folder, InstanceBuilder::new("ScreenGui")
+            .with_name("RobloxLoadingGui").with_property("Enabled", true));
+        let disabled = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
+            .with_name("RobloxLoadingGui").with_property("Enabled", false));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(doc, RunMode::Client));
+        rt.bind_globals().unwrap();
+        assert!(!rt.dismiss_stuck_loading_screen());
+        let w = rt.leave();
+        assert_eq!(w.d().prop(nested, "Enabled"), Some(Variant::Bool(true)));
+        assert_eq!(w.d().prop(disabled, "Enabled"), Some(Variant::Bool(false)));
     }
 
     #[test]
