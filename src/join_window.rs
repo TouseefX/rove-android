@@ -1102,46 +1102,29 @@ impl Editor {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Place");
-                    ui.add(
-                        // **Not focused unless asked for.** A single-line field
-                        // added to a window takes focus on the frame the window
-                        // appears, and on Android that *opens the soft keyboard*
-                        // — a Report opened from the join cover put a phone's
-                        // keyboard over the report it was opened to read, and
-                        // the keyboard took the taps meant for the buttons
-                        // under it. The desk keeps the convenience (type a place
-                        // id as soon as the window is open); a touch device gets
-                        // the field only on the frame it was tapped.
-                        {
-                            // **Focus is given, not taken.** On Android a
-                            // focused text field *is* the soft keyboard:
-                            // opening the report from the join cover put a
-                            // keyboard over the report, and the taps meant for
-                            // its buttons went to the keyboard. So the field
-                            // holds the focus only after a tap on it
-                            // (`place_focus`, cleared when the window closes),
-                            // and a focus it acquired without one is released
-                            // here on the frame it appeared. A desk keeps the
-                            // old behaviour: the field is ready to type into as
-                            // soon as the window opens.
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut place_text)
-                                    .id(egui::Id::new(PLACE_FIELD_ID))
-                                    .desired_width(120.0)
-                                    .hint_text("1818"),
-                            );
-                            if response.clicked() {
-                                place_focus = true;
-                            }
-                            if !place_focus
-                                && ui.memory(|m| m.has_focus(egui::Id::new(PLACE_FIELD_ID)))
-                            {
-                                ui.memory_mut(|m| {
-                                    m.surrender_focus(egui::Id::new(PLACE_FIELD_ID))
-                                });
-                            }
-                        }
+                    // **Focus is given, not taken.** On Android a focused text
+                    // field *is* the soft keyboard: opening the report from the
+                    // join cover put a keyboard over the report, and the taps
+                    // meant for its buttons went to the keyboard. So the field
+                    // holds the focus only after a tap on it (`place_focus`,
+                    // which the window clears when it closes), and a focus it
+                    // acquired without one is released here on the frame it
+                    // appeared. A desk keeps the old behaviour: the field is
+                    // ready to type into as soon as the window opens.
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut place_text)
+                            .id(egui::Id::new(PLACE_FIELD_ID))
+                            .desired_width(120.0)
+                            .hint_text("1818"),
                     );
+                    if response.clicked() {
+                        place_focus = true;
+                    }
+                    if !place_focus
+                        && ui.memory(|m| m.has_focus(egui::Id::new(PLACE_FIELD_ID)))
+                    {
+                        ui.memory_mut(|m| m.surrender_focus(egui::Id::new(PLACE_FIELD_ID)));
+                    }
                     if ui
                         .add_enabled(!running, egui::Button::new("Join"))
                         .on_hover_text("Sign in, allocate a server, dial it and play")
