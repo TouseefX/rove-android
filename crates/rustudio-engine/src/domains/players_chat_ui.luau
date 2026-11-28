@@ -718,6 +718,16 @@ local function build_ui()
 	menu_hit.Parent = menu_slot
 	menu_hit.MouseEnter:Connect(function() menu_hl.Visible = true end)
 	menu_hit.MouseLeave:Connect(function() menu_hl.Visible = false end)
+	-- The hamburger opens the in-game menu. Roblox's own CoreScripts put a
+	-- SettingsHub here; without them (this top bar is the fallback for exactly
+	-- that case) R.request_menu asks the client for its native menu, which is
+	-- where Reset and Leave are. Without this the button was a picture of a
+	-- button: it hovered, and tapping it did nothing, which is the report
+	-- "I can't click in CoreGui buttons" — the only way out of a game on a
+	-- phone that has no Esc key.
+	if R.request_menu then
+		menu_hit.Activated:Connect(function() R.request_menu() end)
+	end
 
 	-- Chat toggle button inside Unibar (chat at x=48, size 44x44)
 	topbar_chat_slot = Instance.new("Frame")

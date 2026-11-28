@@ -997,6 +997,9 @@ impl Game {
             sh.fullscreen_req = None;
             sh.microprofiler_req = None;
             sh.saved_quality = None;
+            // A menu request from the last session's TopBar is not this one's
+            // (players_chat_ui.luau `request_menu`).
+            sh.menu_req = false;
         }
         rustudio_core::load_trace::mark("play: start asked");
         // A play-testing teleport plays its destination instead of the edit
@@ -1838,6 +1841,9 @@ impl Game {
             sh.fullscreen_req = None;
             sh.microprofiler_req = None;
             sh.saved_quality = None;
+            // A menu request from the last session's TopBar is not this one's
+            // (players_chat_ui.luau `request_menu`).
+            sh.menu_req = false;
         }
         self.cam.basis = None;
         let Some(mut s) = self.play.take() else {

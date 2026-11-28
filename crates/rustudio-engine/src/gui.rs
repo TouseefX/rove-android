@@ -166,6 +166,13 @@ pub struct GuiShare {
     pub adorn_handles: bool,
     /// A CoreGui menu is open (`GuiService:SetMenuIsOpen` / inspect menu).
     pub core_menu_open: bool,
+    /// The fallback TopBar's hamburger asked for the in-game menu this frame
+    /// (players_chat_ui.luau `request_menu`, taken by `game_menu.rs`). A
+    /// request rather than the menu's own state because the menu is egui's,
+    /// on the frame thread, and the button is a CoreGui `TextButton` in the
+    /// client's Luau: with no CoreScripts there is no SettingsHub for it to
+    /// open, so it asks the client to open the native one.
+    pub menu_req: bool,
     /// Keyboard / gamepad selection cursor is visible (hidden on mouse input).
     pub selection_visible: bool,
     /// `UserGameSettings.UiNavigationKeyBindEnabled == false` disables `\` toggle.

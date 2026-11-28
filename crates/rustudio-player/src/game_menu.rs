@@ -212,7 +212,17 @@ impl Game {
             }
         }
         let now = self.menu_clock();
-        if let Some(s) = self.play.as_mut().filter(|s| s.mode == RunMode::Play && !s.game.chat_open) {
+        // **A joined client's menu is its own too.** This used to require
+        // `RunMode::Play`, so on a live session (`RunMode::Client`) the menu
+        // could not open even where the client draws the native one — the
+        // fallback that exists precisely because CoreScripts may not have
+        // started. With no Roblox CoreScripts there is no SettingsHub to open
+        // the menu, so this *is* the menu, and a joined game has to be able to
+        // reach it: it holds Reset and Leave, the only way out of a game on a
+        // phone that has no keyboard.
+        if let Some(s) = self.play.as_mut().filter(|s| {
+            matches!(s.mode, RunMode::Play | RunMode::Client) && !s.game.chat_open
+        }) {
             let g = &mut s.game;
             if g.menu_open {
                 if let Some(back) = g.menu.back.take() {
@@ -228,6 +238,23 @@ impl Game {
                 g.menu.page = MenuPage::People;
                 g.menu.back = None;
             }
+        }
+    }
+
+    /// **The TopBar's hamburger asks for this menu.** A phone has no Escape
+    /// key, and with no CoreScripts there is no SettingsHub for that button to
+    /// open: the fallback CoreGui TopBar (`players_chat_ui.luau`) calls
+    /// `R.request_menu()` when it is tapped, which sets one flag, and the menu
+    /// holding Reset and Leave is this one. Without this the hamburger hovered
+    /// and did nothing — the report "I can't click in CoreGui buttons": the
+    /// only way out of a game on a phone was to close the app.
+    ///
+    /// Taken once per request, on the frame thread, which is where the menu
+    /// lives. `game_viewport` calls it every frame the game is drawn.
+    pub(crate) fn take_menu_request(&mut self) {
+        let requested = std::mem::take(&mut rustudio_engine::gui::share().menu_req);
+        if requested {
+            self.toggle_game_menu();
         }
     }
 
@@ -1243,5 +1270,81 @@ impl Game {
             bottom = bottom.max(ry - top.y);
         }
         bottom
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    use crate::play::PlaySession;
+    use rustudio_core::doc::Document;
+    use rustudio_engine::runtime::RunMode;
+
+    /// A session in `mode` with the state the menu reads, and the session's
+    /// `game` half ready for `toggle_game_menu`.
+    fn game_in(mode: RunMode, chat_open: bool) -> Game {
+        // (the share is one per process: another test's inspect menu would
+        // take the toggle first, which is what it is for)
+        rustudio_engine::gui::share().inspect = None;
+        let mut game = Game::new(None);
+        let mut session = PlaySession::new(mode, Document::new_place(), game.cam.clone(), Vec::new());
+        session.game.chat_open = chat_open;
+        game.play = Some(session);
+        game
+    }
+
+    /// **A joined client can open the menu.** This used to require
+    /// `RunMode::Play`, so `Esc` (and, since there is no SettingsHub without
+    /// CoreScripts, the TopBar's hamburger) did nothing in a live session: the
+    /// menu holding Reset and Leave was unreachable, and on a phone with no
+    /// keyboard there was no way out of the game at all.
+    #[test]
+    fn a_joined_client_can_open_and_close_the_menu() {
+        for mode in [RunMode::Play, RunMode::Client] {
+            let mut game = game_in(mode, false);
+            game.toggle_game_menu();
+            let open = |g: &Game| g.play.as_ref().map(|s| s.game.menu_open);
+            assert_eq!(open(&game), Some(true), "{mode:?}: the menu did not open");
+            // It opens on SettingsHub's first tab (People).
+            let session = game.play.as_ref().unwrap();
+            assert_eq!(session.game.menu.page, MenuPage::People, "{mode:?}");
+            assert_eq!(session.game.menu_events, vec![true], "{mode:?}: the client's scripts hear MenuOpened");
+            game.toggle_game_menu();
+            assert_eq!(open(&game), Some(false), "{mode:?}: the menu did not close");
+        }
+    }
+
+    /// A focused TextBox keeps Esc (it blurs the box, as in Studio), so a
+    /// client in the middle of typing does not lose the game's menu over it.
+    #[test]
+    fn a_focused_textbox_takes_the_toggle_first() {
+        let mut game = game_in(RunMode::Client, false);
+        game.gui.focus = Some(rbx_dom_weak::types::Ref::none()); // (this file's `use super::*` has no `Ref`)
+        game.toggle_game_menu();
+        assert_eq!(
+            game.play.as_ref().map(|s| s.game.menu_open),
+            Some(false),
+            "the toggle ran with a TextBox focused"
+        );
+    }
+
+    /// The TopBar's hamburger, in the client's Luau, asks for the menu instead
+    /// of opening it (the menu is egui's, on the frame thread). `game_viewport`
+    /// takes the request every frame: this is that path, end to end.
+    #[test]
+    fn the_top_bar_requests_the_native_menu() {
+        let mut game = game_in(RunMode::Client, false);
+        // What `players_chat_ui.luau`'s `R.request_menu()` does.
+        rustudio_engine::gui::share().menu_req = true;
+        game.take_menu_request();
+        assert_eq!(
+            game.play.as_ref().map(|s| s.game.menu_open),
+            Some(true),
+            "the TopBar's hamburger did not open the menu"
+        );
+        assert!(
+            !rustudio_engine::gui::share().menu_req,
+            "the request is taken once, not left set for every frame"
+        );
     }
 }

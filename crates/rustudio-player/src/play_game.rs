@@ -2410,11 +2410,20 @@ impl Game {
         resp: &egui::Response,
         gui_took: bool,
     ) -> bool {
+        // **A joined client draws the game too.** This used to require
+        // `RunMode::Play`, and a live session is `RunMode::Client` (`Play` is
+        // Play Solo, which a join deliberately is not) — so a joined game drew
+        // its world from elsewhere and got none of this: no clicks, no taps, no
+        // hotbar, no menu. It is the client side of a live session by
+        // definition, since the server is a machine somewhere else.
         let Some(side) = self
             .play
             .as_ref()
-            .filter(|p| p.mode == RunMode::Play)
-            .map(|p| p.showing)
+            .filter(|p| matches!(p.mode, RunMode::Play | RunMode::Client))
+            .map(|p| match p.mode {
+                RunMode::Client => Side::Client,
+                _ => p.showing,
+            })
         else {
             return false;
         };
@@ -2589,6 +2598,7 @@ impl Game {
         if !backpack_on {
             slots.clear();
         }
+        self.take_menu_request();
         // The open menu has the mouse and keys: none of it reaches the game
         // (SettingsHub's Modal shield and RbxSettingsHubStopCharacter).
         let menu = self.show_core_gui && self.play.as_ref().is_some_and(|s| s.game.menu_open);

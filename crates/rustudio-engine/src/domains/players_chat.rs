@@ -1348,6 +1348,20 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "core_scripts_active",
         lua.create_function(|lua, ()| Ok(world(lua).is_ok_and(|w| !w.core_scripts.scripts.is_empty())))?,
     )?;
+    // The fallback TopBar's hamburger asks the client to open its menu. With no
+    // CoreScripts there is no SettingsHub to draw one, so the request goes to
+    // the native menu (`game_menu.rs`, `toggle_game_menu`): Reset and Leave
+    // live there, and on a phone they are the only way out of a game.
+    //
+    // It is a *request*, not a flag flipped here: the menu is the client's
+    // (egui, on the frame thread), and this runs inside the client's Luau.
+    r.set(
+        "request_menu",
+        lua.create_function(|_, ()| {
+            crate::gui::share().menu_req = true;
+            Ok(())
+        })?,
+    )?;
     let r_ui = r.clone();
     r.set(
         "load_ui",
