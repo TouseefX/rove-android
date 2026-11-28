@@ -684,11 +684,12 @@ impl Session {
         self.request_focus(position, true)
     }
 
-    /// `(6, 3)`'s time-sync, for a datagram whose announcement never arrived:
-    /// the wire id is only a name, and the application and channel are what
-    /// decide the reader. Kept for the case a recording carries the clock's
-    /// datagrams without its announcements (the harness's fixtures do).
-    #[cfg(feature = "transport")]
+    /// Whether a wire id is the clock's `(6, 3)`, by the map and nothing else.
+    ///
+    /// Deliberately *not* behind `transport`: it is a map lookup, it is what
+    /// decides which channel's bytes a reader sees, and a test that cannot ask
+    /// the question without a socket is a test that does not ask it. (The
+    /// `datagram` that uses it needs the probe and the clock, and stays gated.)
     pub fn datagram_is_clock(&self, wire_id: u32) -> bool {
         self.channels
             .get(&wire_id)
