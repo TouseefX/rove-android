@@ -185,7 +185,6 @@ impl Counters {
             self.pings,
             self.pings_blocked,
             self.physics_frames_sent,
-            self.focus_sent,
             self.seconds,
             // The first diagnosis, and only when there is one: a challenge the
             // server asked and this client did not answer is the reason a join
