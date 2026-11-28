@@ -765,11 +765,14 @@ impl Editor {
                 frame: self.game.frame_no,
             };
         }
-        // (No hover outline while playing the game, as in Studio.)
-        let in_play = self.game
-            .play
-            .as_ref()
-            .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Play);
+        // (No hover outline while playing the game, as in Studio.) A joined
+        // client counts: it is a live session's client side, the document it
+        // shows belongs to another machine, and outlining a part under the
+        // cursor as though it were about to be picked is the editor showing
+        // through a game. `game_viewport` took the same pair of modes.
+        let in_play = self.game.play.as_ref().is_some_and(|p| {
+            matches!(p.mode, rustudio_engine::runtime::RunMode::Play | rustudio_engine::runtime::RunMode::Client)
+        });
         let roblox_dragger_idle = self
             .builtin_tools
             .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
