@@ -91,6 +91,227 @@ pub(crate) fn evaluate(
     }
 }
 
+/// PCG32 (`XSH-RR`), increment 105 — Roblox's `Random`, the same arithmetic
+/// `rustudio_engine::ltypes::LRandom` uses and the same increment
+/// (`rustudio_core::mech::RANDOM_PCG_INC`).
+///
+/// **This is not a `math.random` stand-in.** A `155` program seeds `Random.new`
+/// with its two arguments as one 64-bit value and reads `NextInteger`, so the
+/// sequence *is* part of the answer: a different generator, or one that keeps
+/// its state in an `f64` and loses eleven bits, returns a number the server
+/// refuses. It is written out here rather than imported from
+/// `rustudio-engine`'s `LRandom` because this crate must not depend on the
+/// engine (the engine depends on the world; a join does not); the state is a
+/// `u64` in Rust, where it belongs, and never a Lua number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pcg32 {
+    state: u64,
+    inc: u64,
+}
+
+impl Pcg32 {
+    /// `pcg32_srandom(seed, inc)`, which is how Studio's `Random.new` seeds.
+    pub fn new(seed: u64) -> Self {
+        let mut r = Pcg32 {
+            state: 0,
+            inc: rustudio_core::mech::RANDOM_PCG_INC,
+        };
+        r.next_u32();
+        r.state = r.state.wrapping_add(seed);
+        r.next_u32();
+        r
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        let old = self.state;
+        self.state = old
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(self.inc);
+        let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+        xorshifted.rotate_right((old >> 59) as u32)
+    }
+
+    /// Two draws, the second in the high half.
+    pub fn next_u64(&mut self) -> u64 {
+        let lo = self.next_u32() as u64;
+        ((self.next_u32() as u64) << 32) | lo
+    }
+
+    /// `NextNumber()`: the 64 bits × 2⁻⁶⁴.
+    pub fn next_unit(&mut self) -> f64 {
+        self.next_u64() as f64 * (-64f64).exp2()
+    }
+
+    /// `NextInteger(min, max)`, both inclusive: one 32-bit draw scaled by the
+    /// span, exactly as the engine's `LRandom::next_int` does it.
+    pub fn next_int(&mut self, min: i64, max: i64) -> i64 {
+        let span = (max.wrapping_sub(min) as u64).wrapping_add(1);
+        if span == 0 {
+            return self.next_u64() as i64;
+        }
+        if span <= 1 << 32 {
+            return min.wrapping_add(((self.next_u32() as u64 * span) >> 32) as i64);
+        }
+        min.wrapping_add(((self.next_u64() as u128 * span as u128) >> 64) as i64)
+    }
+}
+
+/// The `Random` a program gets: an object with `Random`'s type name, its
+/// `tostring`, and its three methods, backed by [`Pcg32`].
+struct ChallengeRandom {
+    rng: Pcg32,
+}
+
+impl mlua::UserData for ChallengeRandom {
+    fn add_fields<F: mlua::UserDataFields<Self>>(f: &mut F) {
+        // `typeof(v) == "Random"`, and `tostring(v) == "Random"`: a program
+        // that names its own types with `newproxy` compares these.
+        f.add_meta_field("__type", "Random");
+    }
+
+    fn add_methods<M: mlua::UserDataMethods<Self>>(m: &mut M) {
+        m.add_method_mut("NextNumber", |_, this, (a, b): (Option<f64>, Option<f64>)| {
+            match (a, b) {
+                (None, None) => Ok(this.rng.next_unit()),
+                (Some(lo), Some(hi)) => {
+                    // `NextNumber(a, b)`: the ends in order, `min·(1 − t) +
+                    // max·t` kept inside the interval.
+                    let (lo, hi) = if lo > hi { (hi, lo) } else { (lo, hi) };
+                    let t = this.rng.next_unit();
+                    let r = lo * (1.0 - t) + hi * t;
+                    Ok(if r < lo { lo } else { hi.min(r) })
+                }
+                // One end without the other is not a range, and answering it
+                // as a unit number would be inventing an argument.
+                _ => Err(mlua::Error::RuntimeError(
+                    "Random:NextNumber requires 0 or 2 arguments".into(),
+                )),
+            }
+        });
+        m.add_method_mut("NextInteger", |_, this, (a, b): (f64, f64)| {
+            let (lo, hi) = (a.floor() as i64, b.floor() as i64);
+            if hi < lo {
+                return Err(mlua::Error::RuntimeError(
+                    "invalid argument #2 to 'NextInteger' (interval is empty)".into(),
+                ));
+            }
+            Ok(this.rng.next_int(lo, hi) as f64)
+        });
+        m.add_meta_method(mlua::MetaMethod::ToString, |_, _, ()| Ok("Random"));
+    }
+}
+
+/// What an instance a program is handed stands for.
+///
+/// mlua's `UserData` methods are one set per *type*, so the three instances
+/// share one struct and answer by role: `game` has a job id and services,
+/// `RunService` answers the runtime questions, `UserSettings` has its own
+/// settings service. Anything a role does not have answers `nil`, which is what
+/// the property not existing looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstanceRole {
+    Game,
+    RunService,
+    UserSettings,
+}
+
+/// One instance a program may touch, by the properties a program reads about
+/// it: `ClassName`, `Name`, `IsA`, and the service lookup.
+///
+/// **`UserSettings` is not a table.** The bytecode checks
+/// `tostring(UserSettings())` byte by byte against `"GlobalBasicSettings"`, and
+/// a table prints `table: 0x…`; `typeof(x)` answers `"Instance"` only for
+/// something whose metatable says so. `game` is not a table for the same
+/// reason: a program that type-checks its environment is checking exactly this.
+struct ChallengeInstance {
+    class: &'static str,
+    name: &'static str,
+    role: InstanceRole,
+    /// `game`'s issued job id.
+    job_id: Option<String>,
+    /// The one service `game:GetService` answers (`RunService`).
+    run_service: Option<mlua::AnyUserData>,
+    /// `UserSettings:GetService("UserGameSettings")`.
+    settings: Option<mlua::AnyUserData>,
+}
+
+impl mlua::UserData for ChallengeInstance {
+    fn add_fields<F: mlua::UserDataFields<Self>>(f: &mut F) {
+        f.add_meta_field("__type", "Instance");
+        f.add_field_method_get("ClassName", |_, this| Ok(this.class));
+        f.add_field_method_get("Name", |_, this| Ok(this.name));
+        f.add_field_method_get("JobId", |_, this| Ok(this.job_id.clone()));
+        // A real client's DataModel reports these; `0` is what a place that has
+        // no ids of its own reports, and no program checks them for equality
+        // with anything but itself.
+        f.add_field_method_get("PlaceId", |_, this| {
+            Ok(match this.role {
+                InstanceRole::Game => Some(0.0),
+                _ => None,
+            })
+        });
+        f.add_field_method_get("GameId", |_, this| {
+            Ok(match this.role {
+                InstanceRole::Game => Some(0.0),
+                _ => None,
+            })
+        });
+    }
+
+    fn add_methods<M: mlua::UserDataMethods<Self>>(m: &mut M) {
+        m.add_method("IsA", |_, this, class: String| {
+            // The one hierarchy a program asks about: `Instance`, plus the
+            // object's own class. Nothing is claimed to be a `BasePart`.
+            Ok(class == "Instance" || class == this.class)
+        });
+        m.add_method("IsDescendantOf", |_, _, _: mlua::Value| Ok(true));
+        m.add_method("GetService", |_, this, name: String| {
+            Ok(match (this.role, name.as_str()) {
+                (InstanceRole::Game, "RunService") => this
+                    .run_service
+                    .clone()
+                    .map(mlua::Value::UserData)
+                    .unwrap_or(mlua::Value::Nil),
+                (InstanceRole::UserSettings, "UserGameSettings") => this
+                    .settings
+                    .clone()
+                    .map(mlua::Value::UserData)
+                    .unwrap_or(mlua::Value::Nil),
+                // Anything else is a service this client does not have, and a
+                // service invented on demand would be a program reading a world
+                // that is not here.
+                _ => mlua::Value::Nil,
+            })
+        });
+        m.add_method("FindService", |_, this, name: String| {
+            Ok(match (this.role, name.as_str()) {
+                (InstanceRole::Game, "RunService") => this
+                    .run_service
+                    .clone()
+                    .map(mlua::Value::UserData)
+                    .unwrap_or(mlua::Value::Nil),
+                (InstanceRole::UserSettings, "UserGameSettings") => this
+                    .settings
+                    .clone()
+                    .map(mlua::Value::UserData)
+                    .unwrap_or(mlua::Value::Nil),
+                _ => mlua::Value::Nil,
+            })
+        });
+        m.add_method("IsUserFeatureEnabled", |_, _, _: String| Ok(false));
+        // `RunService`'s own questions, answered by role: a client that is not
+        // Studio, is running, and is the client half.
+        let flag = |this: &ChallengeInstance, value: bool| -> Option<bool> {
+            (this.role == InstanceRole::RunService).then_some(value)
+        };
+        m.add_method("IsStudio", |_, this, ()| Ok(flag(this, false)));
+        m.add_method("IsClient", |_, this, ()| Ok(flag(this, true)));
+        m.add_method("IsServer", |_, this, ()| Ok(flag(this, false)));
+        m.add_method("IsRunning", |_, this, ()| Ok(flag(this, true)));
+        m.add_meta_method(mlua::MetaMethod::ToString, |_, this, ()| Ok(this.name));
+    }
+}
+
 /// The globals a signed challenge program expects, and no others.
 ///
 /// Every one of these is something the program reads: the job id it checks
@@ -99,110 +320,79 @@ pub(crate) fn evaluate(
 /// wrapper, a `RunService` that says "not Studio", `UserSettings`, and an `os`
 /// table with no `exit`. `os.exit` specifically: upstream's check is that a
 /// client which cannot exit is one the program's own guard accepts.
+///
+/// **What is deliberately absent**: `print`, `require`, `loadstring`,
+/// `dofile`, `collectgarbage`, and the host's own `Random`. A signed program is
+/// Roblox's, not a place's, and it gets the globals such a program reads and no
+/// way into this process.
 fn challenge_environment(lua: &mlua::Lua, job_id: &str) -> mlua::Result<mlua::Table> {
     let env = lua.create_table()?;
 
-    // `game`, with the one field the program reads.
-    let game = lua.create_table()?;
-    game.set("JobId", job_id)?;
-    game.set("PlaceId", 0)?;
-    // `game:GetService` answers the two services a challenge program names;
-    // anything else is refused rather than invented, as on a real client the
-    // service would exist and here it does not.
-    let run_service = lua.create_table()?;
-    run_service.set(
-        "IsStudio",
-        lua.create_function(|_, ()| Ok(false))?,
-    )?;
-    let user_settings = lua.create_function(|lua, ()| {
-        let settings = lua.create_table()?;
-        settings.set("GetService", lua.create_function(|_, _: mlua::Value| Ok(false))?)?;
-        Ok(settings)
+    let run_service = lua.create_userdata(ChallengeInstance {
+        class: "RunService",
+        name: "Run Service",
+        role: InstanceRole::RunService,
+        job_id: None,
+        run_service: None,
+        settings: None,
     })?;
-    let services = lua.create_table()?;
-    services.set("RunService", run_service)?;
-    game.set(
-        "GetService",
-        lua.create_function(move |_, (_this, name): (mlua::Value, String)| match name.as_str() {
-            "RunService" => Ok(services.get::<mlua::Value>("RunService")?),
-            _ => Ok(mlua::Value::Nil),
-        })?,
+
+    let settings_service = lua.create_userdata(ChallengeInstance {
+        class: "UserGameSettings",
+        name: "UserGameSettings",
+        role: InstanceRole::UserSettings,
+        job_id: None,
+        run_service: None,
+        settings: None,
+    })?;
+    let user_settings = lua.create_userdata(ChallengeInstance {
+        class: "UserSettings",
+        name: "GlobalBasicSettings",
+        role: InstanceRole::UserSettings,
+        job_id: None,
+        run_service: None,
+        settings: Some(settings_service),
+    })?;
+    let user_settings_fn = user_settings.clone();
+    env.set(
+        "UserSettings",
+        lua.create_function(move |_, ()| Ok(user_settings_fn.clone()))?,
     )?;
+
+    let game = lua.create_userdata(ChallengeInstance {
+        class: "DataModel",
+        name: "Game",
+        role: InstanceRole::Game,
+        job_id: Some(job_id.to_owned()),
+        run_service: Some(run_service),
+        settings: None,
+    })?;
     env.set("game", game)?;
 
-    // `Random.new(seed)` with a 64-bit seed built from the two 32-bit words —
-    // the native host's own seeding, so the program's sequence matches.
+    // `Random.new(seed)`.
     let random = lua.create_table()?;
     random.set(
         "new",
         lua.create_function(|lua, seed: Option<mlua::Value>| {
+            // The native host converts the two 32-bit words to one number and
+            // seeds with it. `as i64 as u64` and not `as u64`: a value at or
+            // above 2^63 is a negative `i64` in the program, and Rust's float
+            // to-integer conversion saturates rather than wrapping, so the two
+            // spellings differ exactly where a seeded sequence would.
             let seed = match seed {
-                Some(mlua::Value::Number(n)) => n as u64,
+                Some(mlua::Value::Number(n)) => n.trunc() as i64 as u64,
                 Some(mlua::Value::Integer(i)) => i as u64,
-                _ => 0u64,
+                Some(other) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "invalid argument #1 to 'new' (number expected, got {})",
+                        other.type_name()
+                    )))
+                }
+                None => 0,
             };
-            // Luau's own generator: xoshiro256**, seeded through splitmix64.
-            // Written here rather than wrapped because this must be the same
-            // arithmetic the program expects from `Random.new`.
-            let mut state = [0u64; 4];
-            let mut z = seed;
-            for slot in &mut state {
-                z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                let mut x = z;
-                x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                *slot = x ^ (x >> 31);
-            }
-            let lua = lua;
-            let object = lua.create_table()?;
-            // The generator's state lives in a table rather than in the
-            // closure's captured variables: a `Fn` closure — which is what a
-            // Luau function bound through `mlua` must be — cannot advance a
-            // captured `state`, and a `FnMut` one is not what `create_function`
-            // takes. The table is the object's own, so two `Random.new` calls
-            // cannot share a sequence.
-            let state_table = lua.create_table()?;
-            for (index, word) in state.iter().enumerate() {
-                state_table.set(index + 1, *word as f64)?;
-            }
-            let words = state_table.clone();
-            let next = lua.create_function(move |_, ()| {
-                // 64 bits from two 32-bit halves, as `Random:NextInteger`
-                // consumes them; the state advances in place.
-                let mut s = [0u64; 4];
-                for index in 0..4 {
-                    let word: f64 = words.get(index + 1)?;
-                    s[index] = word as u64;
-                }
-                let result = s[0]
-                    .wrapping_add(s[3])
-                    .rotate_left(23)
-                    .wrapping_add(s[0]);
-                let t = s[1] << 17;
-                s[2] ^= s[0];
-                s[3] ^= s[1];
-                s[1] ^= s[2];
-                s[0] ^= s[3];
-                s[2] ^= t;
-                s[3] = s[3].rotate_left(45);
-                for (index, word) in s.iter().enumerate() {
-                    words.set(index + 1, *word as f64)?;
-                }
-                Ok((result >> 11) as f64 / (1u64 << 53) as f64)
-            })?;
-            object.set("NextNumber", next.clone())?;
-            object.set(
-                "NextInteger",
-                lua.create_function(|_, (this, lo, hi): (mlua::Table, f64, f64)| {
-                    let next: mlua::Function = this.get("NextNumber")?;
-                    let unit: f64 = next.call(())?;
-                    let lo = lo.trunc();
-                    let hi = hi.trunc();
-                    let span = (hi - lo + 1.0).max(1.0);
-                    Ok((lo + (unit * span).floor()).clamp(lo, hi))
-                })?,
-            )?;
-            Ok(object)
+            lua.create_userdata(ChallengeRandom {
+                rng: Pcg32::new(seed),
+            })
         })?,
     )?;
     env.set("Random", random)?;
@@ -211,11 +401,14 @@ fn challenge_environment(lua: &mlua::Lua, job_id: &str) -> mlua::Result<mlua::Ta
     env.set("bit32", lua.globals().get::<mlua::Value>("bit32")?)?;
     // `math`, `string`, `table`, `tostring`, `type`, `select`, `assert`,
     // `error`, `pcall`, `xpcall` — the plain library a program may use.
+    //
+    // `typeof` is in this list: over a `__type`-carrying userdata it answers
+    // the Roblox type (`"Random"`, `"Instance"`), and a program that tells a
+    // service from a table uses it.
     for name in [
         "math", "string", "table", "utf8", "coroutine", "tostring", "tonumber", "type",
-        "assert", "error", "pcall", "xpcall", "select", "next", "ipairs", "pairs",
-        "rawget", "rawset", "rawequal", "setmetatable", "getmetatable", "unpack",
-        "newproxy",
+        "typeof", "assert", "error", "pcall", "xpcall", "select", "next", "ipairs", "pairs",
+        "rawget", "rawset", "rawequal", "setmetatable", "getmetatable", "unpack", "newproxy",
     ] {
         let value: mlua::Value = lua.globals().get(name)?;
         env.set(name, value)?;
@@ -231,7 +424,6 @@ fn challenge_environment(lua: &mlua::Lua, job_id: &str) -> mlua::Result<mlua::Ta
         }
     }
     env.set("os", os)?;
-    env.set("UserSettings", user_settings)?;
     Ok(env)
 }
 
@@ -302,7 +494,7 @@ mod tests {
             );
         }
         // And what the program does need is there.
-        for name in ["Random", "bit32", "os", "UserSettings", "newproxy"] {
+        for name in ["Random", "bit32", "os", "UserSettings", "newproxy", "typeof", "game"] {
             let value: mlua::Value = env.get(name).expect("a table read");
             assert!(
                 !matches!(value, mlua::Value::Nil),
@@ -313,4 +505,75 @@ mod tests {
         let exit: mlua::Value = os.get("exit").expect("a table read");
         assert!(matches!(exit, mlua::Value::Nil), "a program cannot exit");
     }
+    /// **The two strings the `155` bytecode compares.** `tostring` of the
+    /// settings object is `"GlobalBasicSettings"` (the check is a byte sum of
+    /// 1924, which is that spelling) and `typeof` of an instance is
+    /// `"Instance"`. A table fails both, which is why they are userdata.
+    #[test]
+    fn the_environment_is_shaped_like_a_client() {
+        let lua = mlua::Lua::new();
+        let env = challenge_environment(&lua, "00000000-0000-4000-8000-000000000001")
+            .expect("the environment builds");
+        lua.globals().set("__env", env).unwrap();
+        let answer: (String, String, String, bool, bool, bool) = lua
+            .load(
+                r#"
+                local env = __env
+                return tostring(env.UserSettings()),
+                    typeof(env.UserSettings()),
+                    typeof(env.game),
+                    env.game:GetService("RunService"):IsStudio(),
+                    env.game:GetService("RunService"):IsClient(),
+                    env.UserSettings():GetService("UserGameSettings") ~= nil
+                "#,
+            )
+            .set_environment(lua.globals().get::<mlua::Table>("__env").unwrap())
+            .eval()
+            .expect("the program's own checks run");
+        assert_eq!(answer.0, "GlobalBasicSettings");
+        assert_eq!(answer.1, "Instance");
+        assert_eq!(answer.2, "Instance");
+        assert!(!answer.3, "a client is not Studio");
+        assert!(answer.4, "a client is the client");
+        assert!(answer.5, "its settings service exists");
+        // And the byte sum the bytecode actually compares: 1924.
+        let sum: i64 = answer.0.bytes().map(|b| i64::from(b)).sum();
+        assert_eq!(sum, 1924, "the bytecode's own check");
+        // The job id is the session's, which is what `game.JobId` is for.
+        let job: String = lua
+            .load("return __env.game.JobId")
+            .set_environment(lua.globals().get::<mlua::Table>("__env").unwrap())
+            .eval()
+            .expect("a field read");
+        assert_eq!(job, "00000000-0000-4000-8000-000000000001");
+    }
+
+    /// `Random` is PCG32 with increment 105, and the sequence is part of the
+    /// answer: a generator that keeps its state in an `f64` loses eleven bits
+    /// per word and returns a number the server refuses.
+    #[test]
+    fn random_is_pcg32_with_studios_increment_and_state() {
+        let mut rng = Pcg32::new(0);
+        assert_eq!(rng.inc, rustudio_core::mech::RANDOM_PCG_INC);
+        // The first four 32-bit draws from seed 0. Pinned here so a change to
+        // the arithmetic is a test failure rather than a wrong `155` answer.
+        let draws: Vec<u32> = (0..4).map(|_| rng.next_u32()).collect();
+        assert_eq!(draws, GOLDEN_SEED_ZERO, "PCG32 from seed 0");
+        // `NextInteger` uses one draw scaled by the span, not a unit number.
+        let mut rng = Pcg32::new(12345);
+        for _ in 0..64 {
+            let value = rng.next_int(7, 11);
+            assert!((7..=11).contains(&value), "NextInteger stays in its interval");
+        }
+        // A full-width span draws 64 bits rather than wrapping to nothing.
+        let mut rng = Pcg32::new(1);
+        assert_ne!(rng.next_int(i64::MIN, i64::MAX), 0);
+    }
+
+    /// PCG32's first four 32-bit draws from seed 0, computed from the published
+    /// multiplier and increment in an independent implementation (not by this
+    /// one): a wrong rotation, a wrong shift or a state kept in a float all
+    /// move these numbers.
+    const GOLDEN_SEED_ZERO: [u32; 4] = [0xc867_4a3c, 0x8d2c_333b, 0x1b8d_da22, 0x0469_409e];
+
 }

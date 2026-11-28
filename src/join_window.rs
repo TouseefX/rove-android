@@ -289,6 +289,13 @@ impl Editor {
         // to ask every frame.
         if live.pending() == 0 {
             self.join_win.live = Some(live.counters());
+            // **The overlay still runs.** This used to return here, and the
+            // overlay — the once-a-second `join live:` line, the `Replication
+            // Focus` a streaming server needs to keep sending, and the report —
+            // only ran on a frame that had a batch to apply. So a session whose
+            // packets had stopped, or had not started, stopped saying anything
+            // about itself: exactly when a person most needs the line.
+            self.live_join_overlay();
             return;
         }
         // Taken in one go rather than batched by hand: the queue is already in
@@ -764,15 +771,24 @@ impl Editor {
         // worse than the editor: the takeover that made it is over, and what is
         // on screen now is a place that will never arrive. It comes down and
         // says so, and the session's own "closed" reason is left in Output.
+        // **A session that has stopped is over, whether or not Play started.**
+        // The old condition also required `game.play.is_none()`, so a join that
+        // closed *after* `start_play` began (which is the normal order: Play
+        // starts on the first world, the session closes later) kept an opaque
+        // wall over a game that no longer had a server behind it. The only way
+        // out was tapping Report, which is exactly what was reported.
         let session_over = self
             .join_win
             .join
             .as_ref()
-            .is_some_and(|join| !join.running())
-            && self.game.play.is_none();
+            .is_some_and(|join| !join.running());
         if self.join_win.cover_until_played && session_over {
             self.join_win.cover_until_played = false;
-            self.info("join: the session ended before the world arrived");
+            if self.game.play.is_none() {
+                self.info("join: the session ended before the world arrived");
+            } else {
+                self.info("join: the session ended; the world it built is still here");
+            }
         }
         let Some(phase) = self.join_cover_phase() else {
             return;
@@ -940,15 +956,13 @@ impl Editor {
             return true;
         }
         let doc = &self.game.doc;
-        let root = doc.dom.root_ref();
-        let workspace = doc.workspace().is_some();
-        let me = doc
-            .find_child(root, "Players")
-            .and_then(|players| match doc.prop(players, "LocalPlayer") {
-                Some(Variant::Ref(p)) if doc.exists(p) => Some(p),
-                _ => None,
-            });
-        workspace && me.is_some()
+        // **A workspace is enough.** Waiting for `LocalPlayer` as well kept the
+        // wall up for the whole of a join whose `Player` had not replicated yet
+        // (or never would), and the wall is what made the game un-clickable:
+        // CoreGui's menu, chat and TopBar are behind it. Once Play is running on
+        // the replicated world there is a game underneath, and the thing that is
+        // still missing belongs in a banner over it, not in a cover over it.
+        doc.workspace().is_some()
     }
 
     /// The cover as a strip: what is still being waited for, over a game that is
@@ -1047,6 +1061,21 @@ impl Editor {
             Some(Variant::Bool(auto)) => auto,
             _ => true,
         };
+        // **A world that arrived, is not ours to walk around in yet, and has
+        // been sitting there.** If `LocalPlayer` never binds — a join the
+        // server never finished setting up, a `userId` that matched no `Player`
+        // — the cover would wait for a `me` that is not coming, and CoreGui
+        // (the menu, chat, TopBar) only starts once `me` is bound. So nothing
+        // under the wall would ever be clickable, which is exactly the report
+        // "I can't click in CoreGui buttons". A place with instances in it and
+        // a session that has been receiving for a while is a world somebody can
+        // look at: it comes down, and the banner says what is still missing.
+        let viewer_never_bound = me.is_none()
+            && self
+                .join_win
+                .live
+                .as_ref()
+                .is_some_and(|c| c.seconds >= 20 && c.instances > 0);
         // A join whose streaming handshake was refused, or that has been
         // waiting a long time, is not one to keep hidden: the game is in and
         // whoever is holding the phone can see what it looks like.
@@ -1054,8 +1083,21 @@ impl Editor {
             .join_win
             .live
             .as_ref()
-            .is_some_and(|c| c.seconds >= 45);
-        workspace && me.is_some() && (character || !auto || stalled)
+            .is_some_and(|c| c.seconds >= 45)
+            || self
+                .join_win
+                .join
+                .as_ref()
+                .is_some_and(|join| !join.running());
+        // **`me` is required only for the ordinary path.** A `LocalPlayer` that
+        // has not arrived is a join that is still going in, so the cover waits
+        // for it — unless the session has stalled or ended, where waiting can
+        // only keep a wall over a place that is already here. That case needs
+        // the workspace and nothing else.
+        if stalled || viewer_never_bound {
+            return workspace;
+        }
+        workspace && me.is_some() && (character || !auto)
     }
 
     /// Put the editor's own Show Core UI setting back after a join turned it on

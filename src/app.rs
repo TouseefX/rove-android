@@ -2925,8 +2925,25 @@ impl RustudioApp {
 
         self.reset_document_tabs();
         let ed = &mut self.ed;
-        if (ctx.zoom_factor() - ed.ui.zoom).abs() > 1e-3 {
-            ctx.set_zoom_factor(ed.ui.zoom);
+        // **One zoom for the whole of a join.** `play_full_frame` draws at 1.0
+        // (a point is Roblox's density-independent pixel), so while the join's
+        // cover is up but Play has not started yet — `play_fills_screen()` is
+        // false until `game.play` exists — this frame ran at the editor's zoom
+        // and the cover was laid out at one scale. The instant `start_play`
+        // created the session the other frame took over at 1.0, and the loading
+        // screen visibly resized under the person watching it. Using the game's
+        // scale here for the whole join means entering Play never changes
+        // `ctx.zoom_factor()`.
+        let game_scale = ed.ui.play_full
+            && (ed.join_win.cover_until_played
+                || ed
+                    .game
+                    .play
+                    .as_ref()
+                    .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client));
+        let wanted = if game_scale { 1.0 } else { ed.ui.zoom };
+        if (ctx.zoom_factor() - wanted).abs() > 1e-3 {
+            ctx.set_zoom_factor(wanted);
         }
         // The Start Page replaces the editor's chrome until something opens.
         if ed.start_page_ui(ui) {

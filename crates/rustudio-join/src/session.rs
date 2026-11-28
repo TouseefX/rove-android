@@ -594,12 +594,10 @@ impl Session {
         // on the world's. (`parse_control_open` is rove's own reader: a
         // ten-byte `2, app, channel u32 be, wire u32 be`.)
         if channel == rove_client_core::channels::CONTROL_CHANNEL {
-            let fed = self.control_channel(application, payload);
-            // A control packet can announce a channel, and a close can end a
-            // stream, but it never opens the marker gate; still, the settle is
-            // the same one place so a future arm cannot forget it.
-            self.settle();
-            return fed;
+            // The one `settle` for every outcome is at the end of this function:
+            // calling it here as well drained the marker queue twice for a
+            // control packet and made "markers sent" double-count.
+            return self.control_channel(application, payload);
         }
         let kind = payload.first().copied().unwrap_or(0);
         match (application, channel, kind) {
@@ -2180,10 +2178,20 @@ pub async fn run(
                 // the feed above, and a reply is only timely if it is written
                 // before the next read.
                 flush_pings(&mut session, &sender, &connection, &mut unreliable_writer).await;
-                // Republished every 16 packets: often enough that the overlay
-                // moves, rarely enough that the lock is not the hot path.
+                // Republished for the first packets as well as every 16 after:
+                // a join that stopped at three packets never reached a sixteen,
+                // so the report still said "log in: waiting" while the world was
+                // arriving. The first sixteen are the ones a person watches.
                 fed += 1;
-                if fed % 16 == 0 {
+                if fed <= 16 || fed % 16 == 0 {
+                    // The handover's counters too, not only the join report's:
+                    // `publish` (progress) and the overlay are two different
+                    // consumers, and a session whose world has stopped arriving
+                    // still has to keep saying where it is — the `join live:`
+                    // line and the focus are read from these.
+                    if let Some(handover) = session.handover.as_ref() {
+                        handover.set_counters(session.overlay_counters());
+                    }
                     progress(session);
                 }
             }

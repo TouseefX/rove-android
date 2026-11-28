@@ -155,7 +155,7 @@ impl Counters {
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
              acked {}/{} held · markers {}/{} · stream {}/{} {} · \
              dgram {}/{} on {} ch · acks {} · ping {}/{} ({} blocked) · phys {} · \
-             focus {} · {} s · {}",
+             focus {} · {} s · {}{}",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -185,6 +185,11 @@ impl Counters {
             self.pings,
             self.pings_blocked,
             self.physics_frames_sent,
+            // `focus` is the last thing before the clock, and the two
+            // diagnostics after it: the format string had lost the second of
+            // its two trailing holders, so the clock was printed as `focus {}`
+            // and `s` came out blank with a diagnosis where the seconds go.
+            self.focus_sent,
             self.seconds,
             // The first diagnosis, and only when there is one: a challenge the
             // server asked and this client did not answer is the reason a join

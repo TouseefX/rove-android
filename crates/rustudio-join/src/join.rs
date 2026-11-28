@@ -468,6 +468,12 @@ fn run(
             // schema and a feature table and built nothing has not joined a
             // place, and calling that "ok" is how a stalled join got reported
             // as a working one.
+            //
+            // The `receive` step is *already open* by now (`publish` opens it at
+            // the first packet, so the report is live while a session runs), so
+            // its outcome is settled here rather than pushed: `settle` replaces
+            // the waiting step in place, and a `push` would leave the report
+            // saying "waiting" above its own "ok".
             if ingested.packets == 0 {
                 settle(shared, |report| {
                     report.failed(
@@ -491,7 +497,16 @@ fn run(
                     )
                 });
             } else {
-                settle(shared, |report| report.ok("receive", note));
+                settle(shared, |report| {
+                    report.settle(
+                        "receive",
+                        crate::diagnostics::Step {
+                            name: "receive",
+                            outcome: crate::diagnostics::Outcome::Ok(note),
+                            took: std::time::Duration::ZERO,
+                        },
+                    )
+                });
             }
         }
         _ => settle(shared, |report| {
@@ -606,6 +621,23 @@ fn publish(shared: &Mutex<Shared>, session: &session::Session) {
         {
             shared.report.begins("log in");
             shared.report.waiting("log in");
+        }
+        // **`log in` ends at the first packet the server sends, not at the end
+        // of the session.** A live join runs until Stop or a disconnect, so
+        // `session::run` does not return while a person is playing: waiting for
+        // it to return is what made the report say "log in: waiting" forever on
+        // a session that was receiving two and a half thousand packets.
+        //
+        // The packet is the answer. The five packets were written and something
+        // came back, which is a successful login by the only definition that
+        // matters here; `receive` then begins, and its note moves with the
+        // packets instead of being written once at the end.
+        if session.stage == Stage::Receiving {
+            if !pushed(&shared.report, "receive") {
+                close_login(&mut shared.report, "5 packets");
+                shared.report.begins("receive");
+            }
+            shared.report.waiting("receive");
         }
         let ingested = session.ingested;
         // Fields the session does not own (nothing is applied to the document
