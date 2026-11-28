@@ -369,9 +369,6 @@ fn explicit(ty: &str, v: &J, class: &str, prop: &str) -> Option<Variant> {
     typed(variant_type(ty)?, v, class, prop)
 }
 
-/// A property value from project JSON: (canonical name, value), or an
-/// error naming what was wrong (Argon reports these as warnings and skips
-/// the property).
 /// The `ValueBase` family's `Value`, by the class that names its type.
 ///
 /// `Vector3Value.Value`, `CFrameValue.Value`, `Color3Value.Value`,
@@ -389,12 +386,14 @@ pub fn value_of(class: &str, prop: &str, v: &J) -> Option<Variant> {
     if prop != "Value" {
         return None;
     }
-    // The tagged form's payload, unwrapped, is the type's own JSON.
+    // **The tagged form** (`{"$vector3": [1, 2, 3]}`, `{"$string": "x"}`,
+    // `{"$brickcolor": 21}`, …) is rove's live spelling; the payload is the
+    // place file's shape for that type, so it is unwrapped to what the typed
+    // reader below expects. (Everything else is already that shape: a bare
+    // array for a `Vector3`, a number for a `double`.)
     let inner = match v.as_object().filter(|o| o.len() == 1) {
         Some(o) => {
             let (tag, inner) = o.iter().next()?;
-            // Only the tags whose payload *is* the place-file shape: a
-            // `$vector3` array, a `$cframe` object.
             match tag.as_str() {
                 "$vector3" | "$vector2" | "$color3" | "$number" | "$string" | "$cframe"
                 | "$brickcolor" | "$rect" | "$udim" | "$udim2" => match tag.as_str() {
@@ -405,10 +404,8 @@ pub fn value_of(class: &str, prop: &str, v: &J) -> Option<Variant> {
                             inner.as_f64()? as u16,
                         )?))
                     }
-                    "$vector3" => {
-                        let a = nums::<3>(inner)?;
-                        return Some(Variant::Vector3(Vector3::new(a[0], a[1], a[2])));
-                    }
+                    // (the payload of a `$vector3` is the same `[x, y, z]` a
+                    // place file writes, so it needs no unwrapping either)
                     _ => inner,
                 },
                 _ => return None,
@@ -416,15 +413,20 @@ pub fn value_of(class: &str, prop: &str, v: &J) -> Option<Variant> {
         }
         None => v,
     };
+    // (`api-dump.json` types every one of them as the plain type — a
+    // `Vector3Value.Value` is a `Vector3`, a `NumberValue.Value` a `double` —
+    // so the reflection database hands back `DataType::Value` for all of them,
+    // and the typed reader above is the whole conversion.)
     let (_, dt) = descriptor(class, prop)?;
-    let ty = match dt {
-        DataType::Value(ty) => ty,
-        // (`ValueBase.Value` typed as the plain type: the same reading.)
-        other => other,
-    };
-    typed(ty, inner, class, prop)
+    match dt {
+        DataType::Value(ty) => typed(ty, inner, class, prop),
+        _ => None,
+    }
 }
 
+/// A property value from project JSON: (canonical name, value), or an
+/// error naming what was wrong (Argon reports these as warnings and skips
+/// the property).
 pub fn resolve(class: &str, prop: &str, v: &J) -> Result<(String, Variant), String> {
     // Explicit: one key naming the type.
     if let Some(o) = v.as_object() {

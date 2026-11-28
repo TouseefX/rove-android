@@ -1228,6 +1228,36 @@ mod tests {
         assert!(owner.owns(&doc, made, made), "locally made: ours");
     }
 
+    /// A snapshot-built world is the server's, instance for instance: without
+    /// that stamp a join that started from a snapshot would read every part as
+    /// this client's own (`Document::owner` says `None` for a document with no
+    /// replicated instance at all) and simulate the whole map.
+    #[test]
+    fn a_snapshot_world_is_stamped_as_the_servers() {
+        let (doc, _live) = empty_world();
+        assert!(
+            doc.owner().is_some(),
+            "an empty snapshot still comes from a server"
+        );
+        let snapshot = crate::snapshot::parse(
+            r#"{"version":1,"sequence":0,"job_id":"live","services":{},
+                "class_parents":{},"defaults":{},"default_origins":{},
+                "nodes":[{"id":"3:1","class_name":"Part","parent":null,
+                          "properties":{"Name":"MapPart"}}]}"#,
+        )
+        .expect("parses");
+        let built = crate::world::build(snapshot, "Live".into()).expect("builds");
+        // (the `ids` map in hand first: `doc` moves out of `world` below)
+        let part = built.world.ids["3:1"];
+        let doc = built.world.doc;
+        assert_eq!(doc.replicated_peer.get(&part), Some(&SERVER_PEER));
+        let owner = doc.owner().expect("a server's world");
+        assert!(
+            !owner.owns(&doc, part, part),
+            "the server's part is not this client's to simulate"
+        );
+    }
+
     /// The three property types the phone's report counted as refused, each in
     /// rove's live spelling: `Vector3Value.Value` tagged, a part's
     /// `CustomPhysicalProperties` as the array `CurrentPhysicalProperties`
