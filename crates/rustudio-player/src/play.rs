@@ -2053,8 +2053,9 @@ impl Game {
         // parts, no map" is exactly a view standing where the character is not.
         let camera = {
             let doc = &mut self.doc;
-            let ws = doc.workspace();
-            let cam = ws.map(|ws| {
+            // (`and_then`, not `map`: the closure already answers "no camera at
+            // all" with `None`, and `map` would nest the two.)
+            let cam = doc.workspace().and_then(|ws| {
                 let existing = match doc.prop(ws, "CurrentCamera") {
                     Some(Variant::Ref(c)) if doc.exists(c) => Some(c),
                     _ => None,
@@ -2162,13 +2163,17 @@ impl Game {
             .or_else(|| self.doc.find_named(ch.model, "HumanoidRootPart"))
             .or_else(|| self.doc.find_named(ch.model, "Torso"))
             .unwrap_or(ch.rig.root);
-        match self.doc.prop(root, "NetworkOwnerV3") {
+        // `peer_of` reads the value once: `Some(peer)` is a grant (ours, or
+        // somebody else's) and `None` is the server's `nil`.
+        match rustudio_core::doc::peer_of(self.doc.prop(root, "NetworkOwnerV3")) {
             // Not arrived: the client's own character, until the server says
             // otherwise (`SetNetworkOwner(nil)` on a character is rare and
             // always arrives with the character's first delta).
-            None => true,
-            Some(v) => rustudio_core::doc::peer_of(Some(v)) == owner.self_peer
-                || rustudio_core::doc::peer_of(Some(v)).is_none(),
+            None => match self.doc.prop(root, "NetworkOwnerV3") {
+                None => true,
+                Some(_) => false,
+            },
+            Some(peer) => peer == owner.self_peer,
         }
     }
 
@@ -2399,7 +2404,9 @@ impl Game {
                     count,
                     if players { "" } else { ", no Players service" }
                 ));
-                live_wait_logged = true;
+                // (`live_wait_logged` itself was set on entry: this function
+                // runs every frame until the Player arrives, and the flag is
+                // what keeps the line to once.)
             }
             return;
         }
@@ -5214,11 +5221,10 @@ impl Game {
         // What a live client does *not* have is the other side of the map: no
         // local server, so `s.map.s2c` means nothing and `other_doc` is `None`.
         // On a join the client's own `Ref`s *are* the world's (`self.doc`), so
-        // every `s2c` lookup below is the identity — `live_s2c` — and the few
-        // places that read `other_doc` read `self.doc`.
+        // every `s2c` lookup below is the identity and the few places that read
+        // `other_doc` read `self.doc` — each one spelled out as `if live`.
         let live = mode == RunMode::Client;
         if matches!(mode, RunMode::Play | RunMode::Client) {
-            let live_s2c = |r: Ref| -> Option<Ref> { live.then_some(r) };
             let prep = rustudio_core::bench::scope("p6a_prep");
             // Server → client refs for just what this phase looks up (touches,
             // the character, humanoid states, moving parts): cloning the whole
