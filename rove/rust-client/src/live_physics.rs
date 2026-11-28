@@ -514,7 +514,7 @@ impl LivePhysicsSimulator {
             let mut best: Option<f64> = None;
             for surface in &self.surfaces {
                 let gap = foot - surface.maximum[1];
-                if !(0.0..=1.5).contains(&gap) {
+                if !(0.0..=2.5).contains(&gap) {
                     continue;
                 }
                 let overlaps = (0..3).step_by(2).all(|axis| {
@@ -781,14 +781,19 @@ fn received_snapshot_cached(
     // Gravity keeps the body slightly above the surface while falling; accept
     // a small gap so jumps from a settled stance work. Larger XZ overlap is
     // also allowed for edge landings.
+    // Preserve the received pose. An AABB overlap alone cannot distinguish a
+    // floor from a wall or establish where an embedded body should be moved.
     let grounded = surfaces.iter().any(|bounds| {
         let gap = position[1] - half_size[1] - bounds.maximum[1];
+        let overlaps = [0, 2].into_iter().all(|axis| {
+            position[axis] + half_size[axis] > bounds.minimum[axis]
+                && position[axis] - half_size[axis] < bounds.maximum[axis]
+        });
+        if !overlaps {
+            return false;
+        }
+        // Overlapping a side or the interior does not prove support.
         gap.abs() <= 0.35
-            && gap >= -0.35
-            && [0, 2].into_iter().all(|axis| {
-                position[axis] + half_size[axis] > bounds.minimum[axis]
-                    && position[axis] - half_size[axis] < bounds.maximum[axis]
-            })
     });
     let assembly = received_reference(view.get_property(&root, "AssemblyRootPart"));
     Some(ReceivedPhysicsSnapshot {
@@ -838,6 +843,11 @@ fn received_snapshot_cached(
 fn received_surfaces(view: &WorldView, parents: &HashMap<String, String>) -> Vec<Aabb> {
     let mut surfaces = Vec::new();
     view.for_each_node(|node| {
+        // Terrain is voxel geometry, not a solid box described by Size. Until
+        // its actual collision data is available, do not invent a floor.
+        if node.class_name() == "Terrain" {
+            return;
+        }
         let mut class = node.class_name();
         for _ in 0..64 {
             if class == "BasePart" {
@@ -1895,6 +1905,33 @@ mod tests {
             .unwrap();
         assert!(frame.simulated_seconds <= 0.25 + 1e-9);
         assert!(frame.dropped_seconds >= 1.75);
+    }
+
+    #[test]
+    fn terrain_does_not_fabricate_a_floor_or_move_the_received_pose() {
+        let mut source = received_world(7.0).to_snapshot();
+        source["nodes"].as_array_mut().unwrap().push(serde_json::json!({
+            "id":"1:8", "class_name":"Terrain", "parent":"1:4", "properties":{}
+        }));
+        let world = rove_client_core::world::WorldStore::from_snapshot(&source).unwrap();
+        let snapshot = received_snapshot(&world.view(), &test_parents(), "1:2", 42, 7, true, 1.0).unwrap();
+        assert_eq!(snapshot.body.center, [0., 2., 0.]);
+        assert_eq!(snapshot.surfaces, vec![Aabb::new([-10., -1., -10.], [10., 0., 10.]).unwrap()]);
+    }
+
+    #[test]
+    fn an_overlapping_wall_does_not_lift_or_ground_the_character() {
+        let mut source = received_world(7.0).to_snapshot();
+        for node in source["nodes"].as_array_mut().unwrap() {
+            if node["id"] == "1:7" {
+                node["properties"]["Size"] = serde_json::json!({"$vector3":[20,20,20]});
+                node["properties"]["CFrame"] = serde_json::json!({"position":[0,0,0],"rotation_id":2});
+            }
+        }
+        let world = rove_client_core::world::WorldStore::from_snapshot(&source).unwrap();
+        let snapshot = received_snapshot(&world.view(), &test_parents(), "1:2", 42, 7, true, 1.0).unwrap();
+        assert_eq!(snapshot.body.center, [0., 2., 0.]);
+        assert!(!snapshot.body.grounded);
     }
 
     #[test]

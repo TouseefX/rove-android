@@ -1,13 +1,18 @@
 # `rove/`: rove, kept as the network reference
 
-This directory is **rove, `alexkkork/rove` at `3c375c274696`** (main of
-2026-11-27), copied in unmodified except for the removals listed below and the
-pins in `client-core/Cargo.toml` (which follow this workspace's versions, with
-the reason stated there).
+The upstream reference is **`alexkkork/rove` at `3c375c274696`**. This is a
+selective mirror, not a complete copy: the removals below and workspace-specific
+adaptations are deliberate. Most retained source files match that revision;
+exceptions include `client-core/Cargo.toml`, `client-core/src/session.rs`,
+`client-core/src/wire.rs`, `rust-client/src/lib.rs`, `rust-client/src/live_session.rs`
+and the reference-only `rust-client/Cargo.lock`. The reference-only files
+`rust-client/src/asset_crypto.rs`, `live_physics.rs` and `live_runtime.rs` also
+contain local safety fixes described below. `wire.rs` omits upstream's opt-in
+raw packet-tail dump, which could expose network data.
 
-It was first pinned at `70b24c3b7d94` — the branch's own base — and the network
-files were updated to `3c375c27` when that revision still refused joins with
-status 12. What that update changed, and why it matters here:
+It was first based on `70b24c3b7d94`; selected files were then updated to
+`3c375c27`, and later divergent retained reference files were synchronized.
+Some changes represented by that upstream revision:
 
 | file | the change |
 |---|---|
@@ -22,11 +27,21 @@ The env-var switches upstream added (`ROVE_LENIENT_ISR`, `ROVE_LIVE_SESSION`)
 are **not** used. This copy of `client-core/src/session.rs` takes the policy as
 a constructor argument instead (`SessionCore::with_limits_live`), so a live join
 is lenient and a replayed recording is strict, whatever the machine's
-environment holds. It is not a workspace member and nothing in the
-app builds from it: `cargo check --workspace` never enters it. It is here so
-the bridge work (M1–M6) can read the reference decoder, transport and session
-code beside the client it is being ported into, with `git log`/`git blame`
-intact for anything cited from it.
+environment holds. `rove/client-core` **is** a workspace member used by the
+live and join crates. `rove/rust-client` is reference-only, except where
+individual files are explicitly included by offline comparisons. Synchronizing
+its files does not by itself add their behavior to the Android app; that needs
+a separate, tested port. This is a selective copy rather than upstream git
+history; use upstream's history and the pinned revision when citing changes.
+
+The reference-only safety changes do not infer solid terrain from its size or
+teleport overlapping characters, use AES-192 for 192-bit keys, avoid treating
+unregistered assets as encrypted merely because a default key exists, and
+preserve supplied input capabilities with a platform fallback. These are
+conservative choices: without terrain collision data, terrain support is not
+simulated, and default-key-only encrypted assets need verified identification
+before they can be decrypted. The standalone upstream client is incomplete in
+this mirror, so its tests must be run in a complete upstream checkout.
 
 The rules for what may be taken from it are in `docs/LIVE-JOIN.md`: the network
 backend only (`client-core` plus the transport/session pieces of
@@ -54,7 +69,6 @@ modules, `rust-runtime-sys/` (pinned for reference only), `tests/fixtures/`,
 rove had it.
 
 Assertions in `client-core`'s tests that referenced removed paths were left in
-place rather than edited: this copy is kept byte-for-byte where it still
-exists, so a diff against upstream `alexkkork/rove@70b24c3` shows only the
-deletions above. `docs/LIVE-JOIN.md` records the exact revision and each file
-the port actually uses.
+place rather than edited. `docs/LIVE-JOIN.md` describes the files used by the
+port; the exceptions above mean the mirror should not be assumed byte-identical
+without checking.

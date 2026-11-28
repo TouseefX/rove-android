@@ -34,6 +34,16 @@ const SHARED_QUEUE_RECORDS: usize = 4;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 const LARGE_SHARED_BYTES: usize = 256 * 1024;
 
+fn default_input_capabilities(snapshot: &mut Value, mobile: bool) {
+    if let Some(object) = snapshot.as_object_mut() {
+        object.entry("input_capabilities").or_insert_with(|| {
+            json!({"KeyboardEnabled": !mobile, "MouseEnabled": !mobile, "TouchEnabled": mobile,
+                   "GamepadEnabled": false, "AccelerometerEnabled": false,
+                   "GyroscopeEnabled": false, "VREnabled": false})
+        });
+    }
+}
+
 pub struct RuntimeConfig {
     source: String,
     memory: u32,
@@ -53,7 +63,7 @@ impl RuntimeConfig {
         }
     }
     pub fn from_file(path: &Path, memory: u32) -> Result<Self, String> {
-        if !(8..=512).contains(&memory) {
+        if !(8..=1536).contains(&memory) {
             return Err("Lua memory limit must be 8..512 MiB".into());
         }
         let file = File::open(path).map_err(|_| "script file unavailable")?;
@@ -72,7 +82,7 @@ impl RuntimeConfig {
         Ok(Self { source, memory, pinned_session_code: false, animation_backend: None, dashboard: None })
     }
     pub fn interactive(memory: u32, dashboard: crate::dashboard::DashboardControl) -> Result<Self, String> {
-        if !(8..=512).contains(&memory) { return Err("Lua memory limit must be 8..512 MiB".into()); }
+        if !(8..=1536).contains(&memory) { return Err("Lua memory limit must be 8..512 MiB".into()); }
         Ok(Self { source: String::new(), memory, pinned_session_code: false, animation_backend: None, dashboard: Some(dashboard) })
     }
     pub fn with_animation_backend(mut self, backend: Arc<dyn crate::animation_assets::AnimationBackend>) -> Self {
@@ -795,6 +805,9 @@ impl LiveRuntime {
                     .ok_or("initial shared world unavailable")?,
                 projection.clone(),
             );
+            // Keep caller-supplied capabilities; the fallback is only a
+            // platform default, not a device probe.
+            default_input_capabilities(&mut snapshot, cfg!(any(target_os = "android", target_os = "ios")));
             self.compacted_nodes += compact_snapshot(&mut snapshot, &view)? as u64;
             let sequence = snapshot["sequence"]
                 .as_u64()
@@ -1359,6 +1372,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn input_capabilities_preserve_observed_devices_and_default_by_platform() {
+        let mut mobile = json!({});
+        default_input_capabilities(&mut mobile, true);
+        assert_eq!(mobile["input_capabilities"]["TouchEnabled"], true);
+        assert_eq!(mobile["input_capabilities"]["KeyboardEnabled"], false);
+        let mut desktop = json!({});
+        default_input_capabilities(&mut desktop, false);
+        assert_eq!(desktop["input_capabilities"]["MouseEnabled"], true);
+        assert_eq!(desktop["input_capabilities"]["TouchEnabled"], false);
+        let mut observed = json!({"input_capabilities": {"TouchEnabled": true, "KeyboardEnabled": true}});
+        let before = observed.clone();
+        default_input_capabilities(&mut observed, false);
+        assert_eq!(observed, before);
+    }
+
     #[test]
     fn movement_backpressure_preserves_commands_until_physics_drains_them() {
         let snapshot = json!({"version":1,"sequence":0,

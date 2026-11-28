@@ -93,7 +93,7 @@ impl Runtime {
         animation_backend: Arc<dyn AnimationBackend>,
         world: Option<&SharedProjectedWorldView>,
     ) -> Result<Self, String> {
-        if !(8..=512).contains(&memory) {
+        if !(8..=1536).contains(&memory) {
             return Err("Lua memory limit must be 8..512 MiB".into());
         }
         let text_measurements = crate::engine_text_measure::Context::new(text_backend.clone());
@@ -235,7 +235,10 @@ impl Runtime {
         Ok(parsed)
     }
     pub fn poll(&mut self) -> Result<Value, String> {
-        self.poll_with_budget(5)
+        // Headless sleeping, not a display, paces this VM: games with a few
+        // hundred RenderStepped handlers need far more than one frame's worth
+        // of CPU to finish a batch without aborting callbacks mid-flight.
+        self.poll_with_budget(64)
     }
     pub(crate) fn poll_with_budget(&mut self, timeout_ms: u32) -> Result<Value, String> {
         if !(1..=2000).contains(&timeout_ms) {
@@ -294,6 +297,7 @@ impl Runtime {
             "host_stage_timings",
             "frame_stage_timings",
             "actor_stage_timings",
+            "far_nodes_pruned",
         ] {
             if let Some(value) = response.get(key) {
                 // Keep a compact diagnostic view; full actor/source catalogs

@@ -11,7 +11,10 @@
 //! corrupted payload therefore fails cleanly instead of yielding garbage.
 
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, AesGcm};
+use aes_gcm::aead::consts::U12;
+
+type Aes192Gcm = AesGcm<aes::Aes192, U12>;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -202,15 +205,10 @@ fn open(key: &[u8], nonce: &[u8], body: &[u8]) -> Option<Vec<u8>> {
             cipher.decrypt(nonce.into(), body).ok()
         }};
     }
-    // aes-gcm exposes 128/256 only; a 192-bit key is widened to 256 with the
-    // trailing 8 bytes zero-padded, which matches a zero-extended key schedule.
+    // AES-192 has a different key schedule from zero-padded AES-256.
     match key.len() {
         16 => attempt!(Aes128Gcm),
-        24 => {
-            let mut widened = [0u8; 32];
-            widened[..24].copy_from_slice(key);
-            attempt!(Aes256Gcm)
-        }
+        24 => attempt!(Aes192Gcm),
         32 => attempt!(Aes256Gcm),
         _ => None,
     }
@@ -254,13 +252,23 @@ pub fn decrypt_with_key(key: &[u8], payload: &[u8]) -> Result<Vec<u8>, DecryptEr
     Err(DecryptError::TagMismatch)
 }
 
-/// Decrypt for a specific asset, or pass the payload through when the asset is
-/// not registered. Returns whether decryption happened.
+/// Decrypt only assets explicitly marked encrypted. A session default key is
+/// not evidence that every downloaded asset is ciphertext. Do not silently
+/// fall back to plaintext when an explicitly registered asset fails its tag.
 pub fn decrypt_asset(asset_id: u64, payload: Vec<u8>) -> Result<(Vec<u8>, bool), DecryptError> {
-    let Some(key) = key_for(asset_id) else {
-        return Ok((payload, false));
-    };
-    decrypt_with_key(&key, &payload).map(|plain| (plain, true))
+    let key = registered_key(&lock(), asset_id);
+    decrypt_registered_key(key.as_deref(), payload)
+}
+
+fn registered_key(state: &Registry, asset_id: u64) -> Option<Vec<u8>> {
+    state.by_asset.get(&asset_id).cloned()
+}
+
+fn decrypt_registered_key(key: Option<&[u8]>, payload: Vec<u8>) -> Result<(Vec<u8>, bool), DecryptError> {
+    match key {
+        Some(key) => decrypt_with_key(key, &payload).map(|plain| (plain, true)),
+        None => Ok((payload, false)),
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +289,32 @@ mod tests {
         assert_eq!(decode_key(""), Err(KeyError::Empty));
         assert_eq!(decode_key("short"), Err(KeyError::BadLength));
         assert_eq!(decode_key(&"ab".repeat(17)), Err(KeyError::BadLength));
+    }
+
+    #[test]
+    fn aes_192_gcm_decrypts_a_known_answer() {
+        // AES-192-GCM, zero key/nonce, 16 zero plaintext bytes; independently
+        // checked against an AES-GCM implementation, not this encoder.
+        let key = [0u8; 24];
+        let mut payload = vec![0u8; 12];
+        payload.extend_from_slice(&[
+            0x98, 0xe7, 0x24, 0x7c, 0x07, 0xf0, 0xfe, 0x41,
+            0x1c, 0x26, 0x7e, 0x43, 0x84, 0xb0, 0xf6, 0x00,
+            0x2f, 0xf5, 0x8d, 0x80, 0x03, 0x39, 0x27, 0xab,
+            0x8e, 0xf4, 0xd4, 0x58, 0x75, 0x14, 0xf0, 0xfb,
+        ]);
+        assert_eq!(decrypt_with_key(&key, &payload).unwrap(), vec![0; 16]);
+    }
+
+    #[test]
+    fn default_key_alone_does_not_reclassify_plaintext_as_encrypted() {
+        let mut state = Registry::default();
+        state.default_key = Some(vec![0x11; 32]);
+        let key = registered_key(&state, 42);
+        assert_eq!(decrypt_registered_key(key.as_deref(), b"plain".to_vec()), Ok((b"plain".to_vec(), false)));
+        state.by_asset.insert(42, vec![0x22; 32]);
+        let key = registered_key(&state, 42);
+        assert!(decrypt_registered_key(key.as_deref(), b"not encrypted".to_vec()).is_err());
     }
 
     #[test]
