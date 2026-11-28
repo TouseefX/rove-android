@@ -160,6 +160,46 @@ pub struct Ingested {
     pub without_actions: usize,
 }
 
+/// A packet a session owes the server, and what kind it is.
+///
+/// The kind is not decoration: a property acknowledgment is the one reply whose
+/// *delivery* has to be reported back to its queue, and it is recognised by
+/// being what it is rather than by its first byte. It could not be the byte:
+/// `0x83` is also how `ReplicationFocus` (`[131, 26]`) and the streaming resume
+/// (`[131, 3]`) begin, so a focus packet sent while a receipt was in flight
+/// would have committed that receipt as delivered — a receipt the server then
+/// never resends and cannot know was lost.
+#[derive(Debug, Clone)]
+pub enum Outbound {
+    /// A marker reply, a ping reply, a focus, the streaming resume.
+    Reply(u8, u32, Vec<u8>),
+    /// A `CFrame` receipt acknowledgment: `[0x83, items…, 0]` on `(4, 1)`.
+    PropertyAck(u8, u32, Vec<u8>),
+}
+
+impl Outbound {
+    pub fn application(&self) -> u8 {
+        match self {
+            Outbound::Reply(application, _, _) | Outbound::PropertyAck(application, _, _) => {
+                *application
+            }
+        }
+    }
+    pub fn channel(&self) -> u32 {
+        match self {
+            Outbound::Reply(_, channel, _) | Outbound::PropertyAck(_, channel, _) => *channel,
+        }
+    }
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            Outbound::Reply(_, _, payload) | Outbound::PropertyAck(_, _, payload) => payload,
+        }
+    }
+    fn is_property_ack(&self) -> bool {
+        matches!(self, Outbound::PropertyAck(..))
+    }
+}
+
 /// The decoder, the journal reader and the bridge, together.
 ///
 /// Created once per session and fed for its whole life. The journal is read
@@ -278,7 +318,7 @@ pub struct Session {
     /// (`132` → `131, 4`) is answered here rather than in the network loop so
     /// the decision lives next to the packet that caused it, and the loop only
     /// writes what it finds.
-    pub outbound: Vec<(u8, u32, Vec<u8>)>,
+    pub outbound: Vec<Outbound>,
     /// **Unreliable channels, as the server announces them.**
     ///
     /// A datagram names only a `wire_id`; which application and channel it
@@ -530,7 +570,7 @@ impl Session {
                 match rove_client_core::replication_out::marker_reply(payload) {
                     Ok(reply) => {
                         self.outbound
-                            .push((application, channel, reply));
+                            .push(Outbound::Reply(application, channel, reply));
                         true
                     }
                     Err(error) => {
@@ -727,7 +767,7 @@ impl Session {
             FOCUS_TIMEOUT_MS,
         ) {
             self.outbound
-                .push((REPLICATION_APPLICATION, REPLICATION_CHANNEL, packet));
+                .push(Outbound::Reply(REPLICATION_APPLICATION, REPLICATION_CHANNEL, packet));
             self.focus_sent += 1;
             self.focus_last_sent = Some(position);
             self.focus_at = Some(std::time::Instant::now());
@@ -827,7 +867,7 @@ impl Session {
         match rove_client_core::replication_out::streaming_ready(guid, property, 9, evidence) {
             Ok(payload) => {
                 self.outbound
-                    .push((REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload));
+                    .push(Outbound::Reply(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload));
                 self.streaming_ready_sent = true;
                 true
             }
@@ -908,7 +948,7 @@ impl Session {
         match crate::ping::reply_to_request(payload, &telemetry) {
             Ok(Some(reply)) => {
                 self.outbound
-                    .push((crate::ping::PING_APPLICATION, crate::ping::PING_CHANNEL, reply));
+                    .push(Outbound::Reply(crate::ping::PING_APPLICATION, crate::ping::PING_CHANNEL, reply));
                 true
             }
             Ok(None) => {
@@ -1284,7 +1324,7 @@ impl Session {
         match self.property_acks.prepare(&view) {
             Ok(Some(prepared)) => {
                 self.ack_in_flight = Some(prepared.id());
-                self.outbound.push((
+                self.outbound.push(Outbound::PropertyAck(
                     REPLICATION_APPLICATION,
                     REPLICATION_CHANNEL,
                     prepared.payload().to_vec(),
@@ -1802,14 +1842,13 @@ async fn flush_outbound(session: &mut Session, sender: &ReliableSender) {
     // would otherwise be appended to the vector being drained and sent twice.
     let queued = std::mem::take(&mut session.outbound);
     let mut ack_written = None;
-    for (application, channel, reply) in queued {
+    for reply in queued {
+        let (application, channel) = (reply.application(), reply.channel());
         // A property acknowledgment is the one reply whose success the session
         // has to record: its queue holds the next version until this one is
-        // confirmed.
-        let is_ack = application == REPLICATION_APPLICATION
-            && channel == REPLICATION_CHANNEL
-            && reply.first() == Some(&0x83);
-        match sender.send(application, channel, &reply).await {
+        // confirmed. (By kind, never by first byte — `[131, 26]` is a focus.)
+        let is_ack = reply.is_property_ack();
+        match sender.send(application, channel, reply.payload()).await {
             Ok(()) => {
                 session.replies_sent += 1;
                 if is_ack {

@@ -392,15 +392,19 @@ fn a_marker_request_leaves_a_reply_for_the_network_loop() {
         1,
         "a request the server waits on leaves a reply to write"
     );
-    let (application, channel, reply) = &session.outbound[0];
-    assert_eq!((*application, *channel), (4, 1), "answered on its own stream");
+    let reply = session.outbound[0].payload();
+    assert_eq!(
+        (session.outbound[0].application(), session.outbound[0].channel()),
+        (4, 1),
+        "answered on its own stream"
+    );
     // rove's encoding: kind 131, sub 4, the marker echoed, a zero trailer.
-    assert_eq!(reply, &vec![131u8, 4, 1, 2, 3, 4, 0]);
+    assert_eq!(reply, &[131u8, 4, 1, 2, 3, 4, 0]);
 
     // And it is rove's own answer, not a second implementation of it.
     let reference = rove_client_core::replication_out::marker_reply(&request)
         .expect("rove answers this request");
-    assert_eq!(reply, &reference);
+    assert_eq!(reply, reference.as_slice());
 }
 
 /// A marker the client cannot read is counted and does not leave a reply or end
