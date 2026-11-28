@@ -421,10 +421,10 @@ impl Gui {
             // roots. `or` took the first and left the second's cache holding the
             // old parent's layout, so the instance drew in its old place until
             // something else invalidated that root.
-            let mut hit = [read.map(|x| x.0), listed.map(|x| x.0)];
-            hit.sort_unstable();
-            hit.dedup();
-            for g in hit.into_iter().flatten() {
+            // (`Ref` is not `Ord`, so a dedupe is a comparison, not a sort.)
+            let first = read.map(|x| x.0);
+            let second = listed.map(|x| x.0).filter(|second| Some(*second) != first);
+            for g in first.into_iter().chain(second) {
                 if self.cache.remove(&g).is_some() && why_on {
                     let what = match *m {
                         doc::Mark::Prop(_, n) => n.to_string(),
