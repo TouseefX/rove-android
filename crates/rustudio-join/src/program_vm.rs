@@ -57,7 +57,16 @@ pub fn run_verified_program(
 }
 
 /// Load and call the chunk in a VM of its own.
-fn evaluate(bytes: &[u8], job_id: &str, second: u32, first: u32) -> Result<f64, ProgramError> {
+///
+/// `pub(crate)` so the tests can run the pinned compiler fixture through the
+/// same path a challenge body takes — a VM test that built its own environment
+/// would prove nothing about the one the challenge is given.
+pub(crate) fn evaluate(
+    bytes: &[u8],
+    job_id: &str,
+    second: u32,
+    first: u32,
+) -> Result<f64, ProgramError> {
     let lua = mlua::Lua::new();
     let environment = challenge_environment(&lua, job_id)
         .map_err(|_| ProgramError::from_reason("challenge-environment-failed"))?;
@@ -234,4 +243,58 @@ pub fn report(program: &ProgramRun) -> Value {
         "bytecode": program.format,
         "runtime_integrity": program.integrity,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compiled `calculation.luau` fixture (compiler 0.730, `-O1 -g1`),
+    /// run the way a challenge body is: normalized, loaded as a binary chunk in
+    /// the restricted environment, called with two numbers.
+    ///
+    /// It returns `bit32.bxor(a + b, 0x1234)`, so the answer is arithmetic this
+    /// test can predict from the source — which is the whole point. A VM that
+    /// loaded the chunk but ran it in the wrong environment would fail on
+    /// `bit32` or on `...` rather than quietly returning a number.
+    const CALCULATION: &[u8] = include_bytes!("../tests/fixtures/luau-v9/calculation.luac");
+
+    #[test]
+    fn a_verified_program_runs_in_the_restricted_environment() {
+        let normalized = crate::bytecode_format::normalize(CALCULATION, None)
+            .expect("the pinned fixture needs no rewriting");
+        // `calculation.luau` reads `...` as `(a, b)` and returns
+        // `bit32.bxor(a + b, 0x1234)` plus a marker string, so only the first
+        // return value is read here (`evaluate` returns the first).
+        let value = evaluate(&normalized.bytes, "00000000-0000-4000-8000-000000000001", 4, 5)
+            .expect("the fixture runs");
+        assert_eq!(value, f64::from(9u32 ^ 0x1234));
+    }
+
+    #[test]
+    fn a_program_with_no_environment_cannot_reach_the_host() {
+        // The environment is built fresh per run and holds nothing of the
+        // caller's: a plain `print` is not in it, and neither is `require`.
+        let lua = mlua::Lua::new();
+        let env = challenge_environment(&lua, "00000000-0000-4000-8000-000000000001")
+            .expect("the environment builds");
+        for name in ["print", "require", "loadstring", "dofile", "collectgarbage"] {
+            let value: mlua::Value = env.get(name).expect("a table read");
+            assert!(
+                matches!(value, mlua::Value::Nil),
+                "{name} must not be in a challenge's environment"
+            );
+        }
+        // And what the program does need is there.
+        for name in ["Random", "bit32", "os", "UserSettings", "newproxy"] {
+            let value: mlua::Value = env.get(name).expect("a table read");
+            assert!(
+                !matches!(value, mlua::Value::Nil),
+                "{name} must be in a challenge's environment"
+            );
+        }
+        let os: mlua::Table = env.get("os").expect("os");
+        let exit: mlua::Value = os.get("exit").expect("a table read");
+        assert!(matches!(exit, mlua::Value::Nil), "a program cannot exit");
+    }
 }
