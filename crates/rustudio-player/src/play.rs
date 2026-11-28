@@ -2173,7 +2173,7 @@ impl Game {
                 None => true,
                 Some(_) => false,
             },
-            Some(peer) => peer == owner.self_peer,
+            Some(peer) => owner.self_peer == Some(peer),
         }
     }
 
@@ -2206,8 +2206,8 @@ impl Game {
         // (the CoreScripts come from the session unless this call brought them)
         let mut core = core;
         // Said once per session, not once a frame: this runs every frame until
-        // the server's Player arrives.
-        let mut live_wait_logged = self.play.as_ref().is_some_and(|s| s.live_wait_logged);
+        // the server's Player arrives, so the flag is read and set on entry.
+        let live_wait_logged = self.play.as_ref().is_some_and(|s| s.live_wait_logged);
         if let Some(s) = self.play.as_mut() {
             s.live_wait_logged = true;
         }
@@ -5884,6 +5884,9 @@ impl Game {
             }
             drop(_cj);
             let _cp = rustudio_core::bench::scope("p6e_client_physics");
+            // (a live client steps no second document below, so nothing there
+            // can fall; the variable stays because the Play Solo branch writes it)
+            #[allow(unused_mut)]
             let server_doc = self.doc.id;
             let mut client_fallen_signals: Vec<(Ref, Ref, Vec<Ref>)> = Vec::new();
             if let Some(s) = self.play.as_mut() {
