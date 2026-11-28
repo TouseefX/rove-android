@@ -183,6 +183,13 @@ pub struct ValueConverter {
 impl ValueConverter {
     /// One property value. `class`/`property` are for the error text and for
     /// asking `api-dump.json` what type the property has.
+    ///
+    /// The order is deliberate and is the reason `Vector3Value.Value` converted
+    /// in a test but was refused on a phone: the class's *own* type is asked
+    /// first (`value_of`, for a `…Value` family whose `Value` is the class's
+    /// subject), then rove's `$` tags, then the place-file reader. A tag this
+    /// bridge does not know is not a dead end either — `via_place_value` reads
+    /// the payload as the property's declared type before anything is refused.
     pub fn value(&mut self, property: &str, class: &str, v: &J) -> Result<Variant, String> {
         // **`NetworkOwnerV3`** is the network-ownership word the server writes on
         // an assembly's root: `1` (rove's server) for a part it simulates, our
@@ -244,6 +251,21 @@ impl ValueConverter {
                     return Err(detail);
                 }
             }
+        }
+        // **A property no client can read is not a fault.** `Player.User`
+        // (`User`, `RobloxSecurity`), `GameplayPaused` (`NotAccessibleSecurity`)
+        // and `CharacterRegionId` arrive because the server serialises its own
+        // Player; there is no reader for their types on this side and nothing to
+        // read. Counted as refusals they filled the report (`Vector3Value.Value`
+        // alongside them) and made a healthy join look broken — and, worse, a
+        // report whose top entry is expected has no room for the one that is
+        // not. `Live::refuse` already makes this distinction for the delta path;
+        // this is the same rule for the instant a value is *converted*.
+        if not_client_readable(class, property) {
+            return Err(format!(
+                "{class}.{property} is not readable by a client (its type has no \
+                 client-side reader); it keeps its default"
+            ));
         }
         self.scalar += 1;
         // A place-file value first: it is the reader that knows the property's

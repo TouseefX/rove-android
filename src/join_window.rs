@@ -72,6 +72,52 @@ struct CoverPhase {
     note: Option<String>,
 }
 
+/// One line about `Workspace`: how many parts it has, and how many of them a
+/// renderer and a physics solver can actually use.
+///
+/// The counts are the three ways a streamed part is useless without an error
+/// anywhere: no `CFrame` (it is at the origin), no `Size` (it is a point), and
+/// `Transparency >= 1` (it is there and invisible). `waiting_for_parent` is the
+/// fourth: instances whose create named a parent that has not arrived, which is
+/// a model that will never be in the tree.
+fn workspace_summary(doc: &rustudio_core::doc::Document) -> String {
+    let Some(ws) = doc.workspace() else {
+        return "join world: no Workspace in the replicated document".to_string();
+    };
+    let (mut parts, mut framed, mut no_cframe, mut no_size, mut invisible) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    for i in doc.dom.descendants_of(ws) {
+        if !rustudio_core::doc::is_a(&i.class, "BasePart") || i.class == "Terrain" {
+            continue;
+        }
+        parts += 1;
+        let has = |name: &str| i.properties.contains_key(&rbx_dom_weak::ustr(name));
+        if has("CFrame") {
+            framed += 1;
+        } else {
+            no_cframe += 1;
+        }
+        if !has("Size") {
+            no_size += 1;
+        }
+        if matches!(
+            i.properties.get(&rbx_dom_weak::ustr("Transparency")),
+            Some(rbx_dom_weak::types::Variant::Float32(t)) if *t >= 1.0
+        ) {
+            invisible += 1;
+        }
+    }
+    format!(
+        "join world: Workspace has {parts} BasePart(s): {framed} with a CFrame, \
+         {no_cframe} without, {no_size} without Size, {invisible} fully transparent"
+    )
+}
+
+/// The `Place` field's egui id: named so the focus can be given and taken
+/// deliberately, which is the difference between a report a phone can read and
+/// one with a soft keyboard over it.
+const PLACE_FIELD_ID: &str = "join_place_field";
+
 pub struct JoinWindow {
     pub open: bool,
     pub place_text: String,
@@ -85,6 +131,10 @@ pub struct JoinWindow {
     pub show_text: bool,
     /// The cover is up from the tap until the live client is in.
     pub cover_until_played: bool,
+    /// Whether the `Place` field should take focus this frame. `false` while a
+    /// join's report is read on a touch device (the soft keyboard would cover
+    /// it); set by the field itself being asked for, on a desk.
+    pub place_focus: bool,
     /// A Cancel/Stop asked for on the cover, taken on the next frame so the
     /// click handler does not stop a join from inside its own draw.
     pub cancel_requested: bool,
@@ -147,6 +197,7 @@ impl JoinWindow {
             installed: false,
             show_text: false,
             cover_until_played: false,
+            place_focus: !cfg!(target_os = "android"),
             cancel_requested: false,
             copied_at: None,
             recent: Vec::new(),
@@ -360,6 +411,14 @@ impl Editor {
                 services.len(),
                 made.join(", ")
             ));
+            // **Whether the map is a map.** Instances and properties written
+            // say the stream is alive; they do not say whether anything in
+            // `Workspace` can be drawn or stood on. A part with no `CFrame` is
+            // at the origin, one with no `Size` is a point, and one with
+            // `Transparency >= 1` is invisible — three different reasons a
+            // phone shows "the world arrived and I cannot see it", which the
+            // top-ten lists below cannot tell apart.
+            lines.push(workspace_summary(doc));
             // What *is* arriving, not only what is not. A report that lists
             // refusals and nothing else cannot tell "properties are being
             // written" from "nothing has been written since the world came".
@@ -395,6 +454,22 @@ impl Editor {
                     "join world: {} refused propert{} — {}",
                     refused.len(),
                     if refused.len() == 1 { "y" } else { "ies" },
+                    top.join(", ")
+                ));
+            }
+            // **By class**, when there is more than one property in one: the
+            // difference between "`Part.Shape` is not converted" and "nothing
+            // about `Model` converts" is a different bug and a different fix,
+            // and the top-ten list above cannot tell them apart.
+            let by_class = live.refused_properties_by_class();
+            if by_class.len() > 1 || by_class.first().is_some_and(|(_, n)| *n > 2) {
+                let top: Vec<String> = by_class
+                    .iter()
+                    .take(8)
+                    .map(|(name, count)| format!("{name} ×{count}"))
+                    .collect();
+                lines.push(format!(
+                    "join world: refusals by class — {}",
                     top.join(", ")
                 ));
             }
@@ -470,6 +545,16 @@ impl Editor {
             return;
         }
         self.join_win.live_logged_at = Some(Instant::now());
+        // **Where the view is, for the streamer.** A streaming server sends the
+        // parts around this client's `ReplicationFocus` and nothing else, so the
+        // camera's position is the one thing the session's thread cannot know by
+        // itself: it is on this side of the handover, and it is what decides
+        // which region the map arrives from. Sent once a second with the overlay
+        // (the session only sends when the focus moved or lapsed).
+        if let Some(live) = self.join_win.live_world.as_ref() {
+            let at = self.game.cam.pos;
+            live.set_focus([at.x, at.y, at.z]);
+        }
         let dropped = self
             .join_win
             .live_world
@@ -529,6 +614,18 @@ impl Editor {
         let Some(phase) = self.join_cover_phase() else {
             return;
         };
+        // **Past the point of the cover: a banner, not a wall.** The full-screen
+        // cover is what hides the editor before there is a game behind it. Once
+        // Play has started on the replicated world, the thing behind it is a
+        // running place — CoreGui, the camera, the touch controls, the map
+        // streaming in — and a sheet of opaque pixels over it that also swallows
+        // every tap is the same "the app froze" report in a different colour.
+        // From here the wait is one line at the top of the screen, and the game
+        // underneath takes input.
+        if self.cover_wants_banner() {
+            self.join_banner(ctx, &phase);
+            return;
+        }
         // The report window is drawn from the editor's frame (`join_window`),
         // which runs *before* this and is an `egui::Window`. A cover painted
         // over it hid the numbers a person had just asked for, so while the
@@ -659,6 +756,103 @@ impl Editor {
         }
     }
 
+    /// Whether the cover has become a banner: Play has started on the
+    /// replicated world, so there is a game under it to see and to touch.
+    ///
+    /// Two ways in, because a join can arrive in either order: the world's
+    /// services and a `LocalPlayer` (the ordinary case), or CoreGui live from
+    /// the CoreScripts (a place whose first frames are CoreGui-driven). Neither
+    /// waits for the character: that is exactly what the banner is *about*.
+    fn cover_wants_banner(&self) -> bool {
+        if !self.join_win.cover_until_played {
+            return false;
+        }
+        let Some(play) = self.game.play.as_ref() else {
+            return false;
+        };
+        if play.mode != rustudio_engine::runtime::RunMode::Client {
+            return false;
+        }
+        if play.game.core_scripts_active {
+            return true;
+        }
+        let doc = &self.game.doc;
+        let root = doc.dom.root_ref();
+        let workspace = doc.workspace().is_some();
+        let me = doc
+            .find_child(root, "Players")
+            .and_then(|players| match doc.prop(players, "LocalPlayer") {
+                Some(Variant::Ref(p)) if doc.exists(p) => Some(p),
+                _ => None,
+            });
+        workspace && me.is_some()
+    }
+
+    /// The cover as a strip: what is still being waited for, over a game that is
+    /// already playable.
+    ///
+    /// It allocates *its own* rectangle and nothing else, so every tap outside
+    /// it reaches the game — which is the whole difference from the cover. The
+    /// steps are the same three the cover draws, minus the two that are done:
+    /// what remains is the character, or a note that the map is still streaming.
+    fn join_banner(&mut self, ctx: &egui::Context, phase: &CoverPhase) {
+        let waiting: Vec<String> = phase
+            .steps
+            .iter()
+            .filter(|(_, state)| *state == CoverStep::Now)
+            .map(|(label, _)| label.clone())
+            .collect();
+        let text = match waiting.first() {
+            Some(label) => format!("{label}…"),
+            None => "Still streaming the rest of the place…".to_string(),
+        };
+        let screen = ctx.content_rect();
+        let mut open_report = false;
+        egui::Area::new(egui::Id::new("join_banner"))
+            .fixed_pos(egui::Pos2::new(screen.center().x - 132.0, screen.min.y + 52.0))
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(18, 20, 26))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new(&text)
+                                    .color(egui::Color32::from_rgb(214, 219, 230))
+                                    .size(15.0),
+                            );
+                            // The report is the only button: a Cancel would be a
+                            // 44-point target over a running game's controls,
+                            // and Stop (Shift+F5, or the editor's own) is
+                            // already there and already reachable.
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Report").size(14.0),
+                                    )
+                                    .min_size(egui::vec2(0.0, 32.0)),
+                                )
+                                .clicked()
+                            {
+                                open_report = true;
+                            }
+                        });
+                    });
+            });
+        if open_report {
+            self.join_win.open = true;
+            self.join_win.show_text = true;
+            // (the editor drew its windows before this frame's banner, so the
+            // window has to be asked for again or the tap appears to do nothing)
+            ctx.request_repaint();
+        }
+        // The game under the banner keeps drawing; the wait is a moving thing.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
     /// Whether the live client is far enough in to take the cover down:
     /// a session playing, `Workspace`, `LocalPlayer`, and a character bound.
     ///
@@ -755,7 +949,11 @@ impl Editor {
             .as_ref()
             .and_then(|s| s.character.as_ref())
             .is_some();
-        let signed_in = !matches!(stage, "idle" | "allocated");
+        // A session whose world is playing is past the handshake whatever its
+        // stage name still says: the stage is the *session's*, and the session
+        // keeps streaming long after Play started. (Before this, the cover went
+        // on saying "Joining" with a world on screen behind it.)
+        let signed_in = playing || !matches!(stage, "idle" | "allocated");
         let mut steps = Vec::with_capacity(3);
         steps.push((
             "Joining".to_string(),
@@ -781,13 +979,17 @@ impl Editor {
         // number that explains a join that has instances and no character:
         // `stream` is what tells a streaming server the spawn region arrived.
         let note = self.join_win.live.as_ref().map(|c| {
-            format!(
+            let mut line = format!(
                 "{} instances · {} packets · stream {} · {} s",
                 c.instances,
                 c.packets,
                 if c.streaming_ready { "acked" } else { "no-ack" },
                 c.seconds
-            )
+            );
+            if playing {
+                line.push_str(" · the rest of the place streams in as you play");
+            }
+            line
         });
         Some(CoverPhase { steps, note })
     }
@@ -887,6 +1089,9 @@ impl Editor {
             .unwrap_or(0);
         let started = self.join_win.join.is_some();
         let mut place_text = std::mem::take(&mut self.join_win.place_text);
+        // (taken out for the same reason: the window's closure holds `self`
+        // immutably, and this is written by it.)
+        let mut place_focus = std::mem::take(&mut self.join_win.place_focus);
 
         // `self.join_win` is not touched inside the closure: everything the
         // window draws was taken above, and what it asks for is applied below.
@@ -898,9 +1103,44 @@ impl Editor {
                 ui.horizontal(|ui| {
                     ui.label("Place");
                     ui.add(
-                        egui::TextEdit::singleline(&mut place_text)
-                            .desired_width(120.0)
-                            .hint_text("1818"),
+                        // **Not focused unless asked for.** A single-line field
+                        // added to a window takes focus on the frame the window
+                        // appears, and on Android that *opens the soft keyboard*
+                        // — a Report opened from the join cover put a phone's
+                        // keyboard over the report it was opened to read, and
+                        // the keyboard took the taps meant for the buttons
+                        // under it. The desk keeps the convenience (type a place
+                        // id as soon as the window is open); a touch device gets
+                        // the field only on the frame it was tapped.
+                        {
+                            // **Focus is given, not taken.** On Android a
+                            // focused text field *is* the soft keyboard:
+                            // opening the report from the join cover put a
+                            // keyboard over the report, and the taps meant for
+                            // its buttons went to the keyboard. So the field
+                            // holds the focus only after a tap on it
+                            // (`place_focus`, cleared when the window closes),
+                            // and a focus it acquired without one is released
+                            // here on the frame it appeared. A desk keeps the
+                            // old behaviour: the field is ready to type into as
+                            // soon as the window opens.
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut place_text)
+                                    .id(egui::Id::new(PLACE_FIELD_ID))
+                                    .desired_width(120.0)
+                                    .hint_text("1818"),
+                            );
+                            if response.clicked() {
+                                place_focus = true;
+                            }
+                            if !place_focus
+                                && ui.memory(|m| m.has_focus(egui::Id::new(PLACE_FIELD_ID)))
+                            {
+                                ui.memory_mut(|m| {
+                                    m.surrender_focus(egui::Id::new(PLACE_FIELD_ID))
+                                });
+                            }
+                        }
                     );
                     if ui
                         .add_enabled(!running, egui::Button::new("Join"))
@@ -1043,6 +1283,7 @@ impl Editor {
 
         // The field's text goes back, and the window's own ✕ is honoured.
         self.join_win.place_text = place_text;
+        self.join_win.place_focus = place_focus;
         // Close goes back to the cover while the join is still loading — it
         // opened the window from the cover, and the window closing must not put
         // the editor back. Once nothing is loading it closes for good.

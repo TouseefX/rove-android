@@ -427,6 +427,8 @@ pub struct PlaySession {
     live_core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
     /// `Players.LocalPlayer` was named and its client half started (`live_bound`).
     live_bound: bool,
+    /// The "LocalPlayer has no character to bind" line was printed once.
+    live_character_wait_logged: bool,
     /// The "our Player is not in the world yet" line was printed once.
     live_wait_logged: bool,
     /// Seconds since `Players.LocalPlayer` bound, so the ownership line (and
@@ -435,6 +437,15 @@ pub struct PlaySession {
     live_ownership_at: Option<f64>,
     /// The line printed that many seconds in (once, then never again).
     live_ownership_logged: bool,
+    /// `Workspace`'s parts this frame has already handed to physics.
+    ///
+    /// A streamed place adds parts for as long as the player is in it, and the
+    /// one `claim_owned` at Play saw the 62 instances the join had *then*. The
+    /// set is what keeps the walk incremental: only parts that were not here on
+    /// the previous frame are claimed, so nothing is rebuilt twice.
+    live_claimed: HashSet<Ref>,
+    /// Parts handed over since Play started (the report's number).
+    live_claimed_parts: u64,
     /// Which DataModel the editor shows (Explorer, Properties, viewport).
     pub showing: Side,
     pub map: RepMap,
@@ -532,9 +543,12 @@ impl PlaySession {
             other_doc: None,
             live_core: None,
             live_bound: false,
+            live_character_wait_logged: false,
             live_wait_logged: false,
             live_ownership_at: None,
             live_ownership_logged: false,
+            live_claimed: HashSet::new(),
+            live_claimed_parts: 0,
             showing: Side::Server,
             map: Default::default(),
             physics: PlayPhysics(None),
@@ -1986,6 +2000,27 @@ impl Game {
             Some(Variant::Ref(c)) if self.doc.exists(c) => Some(c),
             _ => None,
         }) else {
+            // Said once, and said with *why*: `Character` absent is the server
+            // not having spawned us, `Character` present but not in the world is
+            // a `$ref` held for a model that has not streamed, and neither is
+            // visible from the editor. This is the line a phone's report is read
+            // for when a join has a world and no body.
+            if !self.live_character_wait_logged {
+                if let Some(s) = self.play.as_mut() {
+                    s.live_character_wait_logged = true;
+                }
+                let raw = match self.doc.prop(local, "Character") {
+                    Some(Variant::Ref(c)) if c.is_none() => "nil (the server has not spawned us)",
+                    Some(Variant::Ref(_)) => "a ref to a model that has not arrived yet",
+                    Some(_) => "a value that is not a ref",
+                    None => "not replicated yet",
+                };
+                log::info!(
+                    "Live: LocalPlayer has no character to bind: Player.Character is {raw}; \
+                     character_auto_loads={:?}",
+                    self.doc.prop(local, "CharacterAutoLoads"),
+                );
+            }
             return;
         };
         if bound == Some(character) {
@@ -2097,9 +2132,100 @@ impl Game {
             self.cam.pos = pos;
             self.cam.focus = pos;
         }
+        log::info!(
+            "Live: character bound: model={character:?} rig={rig_label} humanoid={humanoid:?} \
+             at=({:.1}, {:.1}, {:.1}) camera={}",
+            start.x,
+            start.y,
+            start.z,
+            if camera.is_some() { "bound" } else { "none" },
+        );
         self.info(format!(
             "Live: bound to the server's character ({rig_label}); Workspace.CurrentCamera is Custom on its Humanoid",
         ));
+    }
+
+    /// `Workspace` as it stands: parts, how many have a `CFrame`, and what the
+    /// character is (if anything has arrived for it).
+    ///
+    /// One walk, for the logcat line that is read instead of the editor: the
+    /// question a phone's report asks is "did the map stream" and the answer is
+    /// three numbers — how many `BasePart`s are in `Workspace`, how many of them
+    /// have the `CFrame` a part is drawn at, and whether a `Character` is bound
+    /// yet. `(None, 0, 0)` before `Workspace` arrives.
+    fn live_world_facts(&self) -> (Option<usize>, usize, usize) {
+        let character = self
+            .play
+            .as_ref()
+            .and_then(|s| s.character.as_ref())
+            .map(|c| c.model);
+        let Some(ws) = self.doc.workspace() else {
+            return (character, 0, 0);
+        };
+        let mut parts = 0usize;
+        let mut framed = 0usize;
+        for i in self.doc.dom.descendants_of(ws) {
+            if !doc::is_a(&i.class, "BasePart") || i.class == "Terrain" {
+                continue;
+            }
+            parts += 1;
+            if i.properties.contains_key(&ustr("CFrame")) {
+                framed += 1;
+            }
+        }
+        (character, parts, framed)
+    }
+
+    /// **The parts that arrived since the last check, given to physics.**
+    ///
+    /// `claim_owned` used to be called once, at `start_play`, on the `Workspace`
+    /// the join had at that instant — 62 instances, none of them the map, which
+    /// streams in afterwards. Every part after that was replicated, drawn, and
+    /// never given to the solver: a character that walks through the floor of a
+    /// streamed place.
+    ///
+    /// This keeps the set it has already handed over (`live_claimed`) and passes
+    /// only the new refs, because `claim_owned` rebuilds an assembly it is given
+    /// and re-giving the same part every frame would rebuild the world sixty
+    /// times a second. A part that is destroyed is dropped from the set on the
+    /// next walk, so a freed ref is never handed over twice.
+    fn claim_streamed_parts(&mut self) {
+        let Some(owner) = self.doc.owner() else {
+            return;
+        };
+        let Some(ws) = self.doc.workspace() else {
+            return;
+        };
+        let mut fresh: Vec<Ref> = Vec::new();
+        let mut present: Vec<Ref> = Vec::new();
+        for i in self.doc.dom.descendants_of(ws) {
+            if !doc::is_a(&i.class, "BasePart") || i.class == "Terrain" {
+                continue;
+            }
+            let r = i.referent();
+            present.push(r);
+            if !self.live_claimed.contains(&r) {
+                fresh.push(r);
+            }
+        }
+        // The set is what is *here now*: a part that went away frees its ref,
+        // and the DOM may hand that ref to a later instance.
+        self.live_claimed = present.into_iter().collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let count = fresh.len();
+        if let Some(s) = self.play.as_mut() {
+            s.physics.claim_owned(&mut self.doc, owner, &fresh);
+            s.live_claimed_parts += count as u64;
+        }
+        // Once per arrival, not once per part: a streaming server sends parts in
+        // batches, and the line is there to date the moment the map became
+        // physical.
+        log::info!(
+            "Live: {count} streamed part(s) claimed for physics ({} total so far)",
+            self.play.as_ref().map_or(0, |s| s.live_claimed_parts)
+        );
     }
 
     /// How many of the place's parts this client simulates and how many are the
@@ -2233,7 +2359,7 @@ impl Game {
         // function returns `()`, the block's value is a tuple) — and even had it
         // compiled, it would have skipped the report at the bottom. `break 'bind`
         // leaves the block with that value and lets the function carry on.
-        let (_player, name, local, has_scripts_now) = 'bind: {
+        let (player_ref, name, local, has_scripts_now, matched_uid) = 'bind: {
         let doc = &mut self.doc;
         let root = doc.dom.root_ref();
         let players = doc.find_child(root, "Players");
@@ -2264,7 +2390,7 @@ impl Game {
             // (A `drop(doc)` here would be a no-op on a reborrow, which is what
             // the warning at this line said.)
             no_player_yet = true;
-            break 'bind (None, String::new(), Vec::new(), false);
+            break 'bind (None, String::new(), Vec::new(), false, None);
         };
         // (the Player ref itself is only used inside the block: outside it, the
         // `LocalPlayer` property is what names it)
@@ -2376,7 +2502,19 @@ impl Game {
         // Read after the insert above, so this says whether PlayerScripts is
         // *there now* — which is what the log line is about.
         let has_scripts_now = doc.find_child(player, "PlayerScripts").is_some();
-        (Some(player), name, local, has_scripts_now)
+        // The `UserId` the match was actually made on, read out of the world
+        // rather than assumed: a bind that says `LocalPlayer = me` without
+        // saying which number it matched is a bind that cannot be checked from
+        // a phone log.
+        let matched_uid = doc
+            .dom
+            .get_by_ref(player)
+            .and_then(|i| match i.properties.get(&ustr("UserId")) {
+                Some(Variant::Int64(v)) => Some(*v as u64),
+                Some(Variant::Int32(v)) => Some(*v as u64),
+                _ => None,
+            });
+        (Some(player), name, local, has_scripts_now, matched_uid)
         };
         if no_player_yet {
             // Said once, not once a frame, and with the count that says what is
@@ -2397,6 +2535,10 @@ impl Game {
                 (players.is_some(), count)
             };
             if !live_wait_logged {
+                log::info!(
+                    "Live: no LocalPlayer yet: account_uid={uid:?} players_service={players} \
+                     player_count={count}"
+                );
                 self.info(format!(
                     "Live: our Player (by UserId {:?}) is not in the world yet ({} Player(s) there{}); \
                      LocalPlayer binds when it arrives",
@@ -2440,6 +2582,27 @@ impl Game {
                 " (PlayerScripts was not in the world yet)"
             }
         ));
+        // The same four facts to logcat, where a phone's report is actually
+        // read: which `Player` was bound, the two numbers that had to match for
+        // it to be *ours*, whether a `Character` is already in the world, and
+        // how much of `Workspace` has streamed. The Output line above says the
+        // join worked; this says why it did or did not, in one grep-able line.
+        {
+            let (character, parts, cframe) = self.live_world_facts();
+            log::info!(
+                "Live: LocalPlayer bind: player={player_ref:?} name={name} account_uid={uid:?} \
+                 player_uid={matched_uid:?} uid_match={} character={character:?} \
+                 workspace_parts={parts} parts_with_cframe={cframe}",
+                // A server that replicated no `UserId` is not a mismatch: the
+                // comparison is unavailable, and the account's number is the
+                // only one in the line.
+                matched_uid.map_or("unknown", |id| if Some(id) == uid {
+                    "yes"
+                } else {
+                    "no"
+                }),
+            );
+        }
         if let Some(s) = self.play.as_mut() {
             s.live_bound = true;
             // (the clock starts here: the ownership re-print is due a second
@@ -4720,6 +4883,15 @@ impl Game {
                 }
             }
         }
+        // **The parts that arrived since the last frame, given to physics.**
+        // A live place streams its map in after Play starts, so the set of parts
+        // is never the one `start_play` saw: a claim that is not reminded of the
+        // new ones leaves them drawn but not simulated — a character who walks
+        // through a streamed floor. Before the block below, because the claim
+        // writes the document and that block holds `self.play`.
+        if mode == RunMode::Client {
+            self.claim_streamed_parts();
+        }
         // 1. Server script changes from last frame reach physics.
         let sc = rustudio_core::bench::scope("p1_physics_sync");
         {
@@ -4733,35 +4905,12 @@ impl Game {
                 Some(w) => std::mem::take(&mut w.velocity_requests),
                 None => Vec::new(),
             };
-            // **Who owns what, re-read before the step.** The server hands an
+            // (Who owns what, re-read before the step: the server hands an
             // assembly over when a player touches it and takes it back when they
-            // walk away, and a client script can make a part in any frame: a
-            // client that fixed the split at Play would leave a car it was
-            // granted frozen, or keep simulating a crate the server took back.
-            // (One walk of the parts, and only the ones that crossed the line are
-            // rebuilt — `Physics::claim_owned`.)
-            if mode == RunMode::Client {
-                if let Some(owner) = self.doc.owner() {
-                    let parts: Vec<Ref> = self
-                        .doc
-                        .workspace()
-                        .map(|ws| {
-                            self.doc
-                                .dom
-                                .descendants_of(ws)
-                                .filter(|i| {
-                                    doc::is_a(&i.class, "BasePart") && i.class != "Terrain"
-                                })
-                                .map(|i| i.referent())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // (the assembly root is read inside `claim_owned`, from the
-                    // document's `AssemblyRootPart`, not from a list taken before
-                    // the server's last write)
-                    s.physics.claim_owned(&mut self.doc, owner, &parts);
-                }
-            }
+            // walk away, and a client script can make a part in any frame — so
+            // `claim_streamed_parts` above runs every frame in a live client and
+            // claims only what is new. `Physics::claim_owned` is what rebuilds
+            // an assembly that crossed the line.)
             s.physics.sync(&mut self.doc);
             s.physics.set_streaming_visibility(
                 s.map.streaming_collider_revision(),

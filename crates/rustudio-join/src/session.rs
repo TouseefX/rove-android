@@ -71,6 +71,33 @@ pub const BYTECODE_RANGE_CAPABILITY: u64 = 0x10_0000;
 /// without limit.
 const HELD_PACKETS: usize = 4096;
 
+/// The application and channel the clock's own datagrams ride, as this client
+/// announces them (`(6, 2)` on wire 2 and `(6, 3)` on wire 4 upstream; the
+/// time-sync replies answer on `6/3`).
+pub const CLOCK_APPLICATION: u8 = 6;
+pub const CLOCK_CHANNEL: u32 = 3;
+
+/// How many datagram channels the server may announce. rove's own cap
+/// (`MAX_CHANNELS`); a place opens a handful — the clock's two, physics, ISR —
+/// and a server that announces dozens is one this client should not track
+/// without bound.
+pub const MAX_DATAGRAM_CHANNELS: usize = 16;
+
+/// The radius a streaming server is asked to keep loaded, and how long the
+/// focus stands before it lapses. rove's own client sends exactly these
+/// (`live_session.rs:762`: `512.0`, `4000`) — generous on purpose: without a
+/// focus the streamer has no idea what to send, so the spawn region never
+/// materializes and the place is a character in an empty sky.
+pub const FOCUS_RADIUS_STUDS: f32 = 512.0;
+pub const FOCUS_TIMEOUT_MS: u32 = 4000;
+
+/// How far the focus must move before the server is asked again.
+pub const FOCUS_MOVE_STUDS: f32 = 64.0;
+
+/// How long a focus stands before it is re-sent: comfortably inside
+/// [`FOCUS_TIMEOUT_MS`], so the region never lapses between refreshes.
+pub const FOCUS_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How many journal rows one read takes. The journal is read in batches and
 /// drained fully, so this is a page size and not a limit.
 const DRAIN_BATCH: usize = 64;
@@ -252,6 +279,52 @@ pub struct Session {
     /// the decision lives next to the packet that caused it, and the loop only
     /// writes what it finds.
     pub outbound: Vec<(u8, u32, Vec<u8>)>,
+    /// **Unreliable channels, as the server announces them.**
+    ///
+    /// A datagram names only a `wire_id`; which application and channel it
+    /// belongs to arrives once, on the reliable `CONTROL_CHANNEL` stream, as an
+    /// announcement (`parse_control_open`). Without this map every datagram but
+    /// the clock's was thrown away — and a live server sends the *interesting*
+    /// packets there: replication over unreliable transport, pings, instance
+    /// state. The phone's log is what that looks like: 40 seconds of a world
+    /// arriving with every part frozen, because every datagram was dropped.
+    pub channels: std::collections::BTreeMap<u32, (u8, u32)>,
+    /// Datagrams that named a `wire_id` no announcement had described.
+    pub unknown_datagrams: u64,
+    /// Datagrams fed through [`Session::feed_on`] (everything but the clock's).
+    pub datagrams_fed: u64,
+    /// Fragments that arrived incomplete (the transport splits large
+    /// datagrams; an incomplete one is not a packet).
+    pub fragmented_datagrams: u64,
+    /// Datagrams the transport could not parse at all.
+    pub unreadable_datagrams: u64,
+    /// Signed-program challenges (`155`) the server sent, and how many this
+    /// client could answer. Zero answered: there is no signature trust store
+    /// in this build, and a fabricated reply would be rejected — but the
+    /// number is what names the reason a server is holding state back.
+    pub program_challenges: u64,
+    pub program_answered: u64,
+    /// **Where this client is**, as `ReplicationFocus` asks the server to
+    /// stream around: the last position fed in from the renderer (its camera
+    /// or character). `None` until the first frame reports one.
+    pub focus_position: Option<[f32; 3]>,
+    /// The last focus position a packet was sent for, so an idle client does
+    /// not ask the server to re-stream a region it already has every tick.
+    pub focus_last_sent: Option<[f32; 3]>,
+    /// When that packet went, for [`Session::refocus`].
+    pub focus_at: Option<std::time::Instant>,
+    /// `CFrame` acknowledgments (`0x83` on `(4, 1)`). The server holds a
+    /// property's next version until the client confirms the one it sent, so a
+    /// client that never acknowledges is a client the world stops moving for.
+    property_acks: rove_client_core::property_acknowledgments::PropertyAcknowledgments,
+    /// Property acknowledgments the transport accepted.
+    pub property_acks_sent: u64,
+    /// The property-acknowledgment payload in flight, until the transport says
+    /// whether it was written.
+    ack_in_flight: Option<u64>,
+    /// `ReplicationFocus` packets sent, and the id the next one carries.
+    pub focus_sent: u64,
+    focus_id: u32,
 }
 
 impl Session {
@@ -308,6 +381,21 @@ impl Session {
             sync_replies: 0,
             handover: None,
             outbound: Vec::new(),
+            channels: std::collections::BTreeMap::new(),
+            unknown_datagrams: 0,
+            datagrams_fed: 0,
+            fragmented_datagrams: 0,
+            unreadable_datagrams: 0,
+            program_challenges: 0,
+            program_answered: 0,
+            focus_position: None,
+            focus_last_sent: None,
+            focus_at: None,
+            property_acks: rove_client_core::property_acknowledgments::PropertyAcknowledgments::new(),
+            property_acks_sent: 0,
+            ack_in_flight: None,
+            focus_sent: 0,
+            focus_id: 1,
         }
     }
 
@@ -360,6 +448,14 @@ impl Session {
     /// Returns whether the packet was world state the decoder accepted.
     pub fn feed_on(&mut self, application: u8, channel: u32, payload: &[u8]) -> bool {
         self.note_arrival(application, channel, payload);
+        // **A channel announcement**, before anything else looks at the packet:
+        // it is how a datagram's bare `wire_id` becomes `(application,
+        // channel)`, and it travels on the reliable control channel rather than
+        // on the world's. (`parse_control_open` is rove's own reader: a
+        // ten-byte `2, app, channel u32 be, wire u32 be`.)
+        if channel == rove_client_core::channels::CONTROL_CHANNEL {
+            return self.control_channel(application, payload);
+        }
         let kind = payload.first().copied().unwrap_or(0);
         match (application, channel, kind) {
             // The schema and the globals: these are what make a world, and
@@ -408,6 +504,23 @@ impl Session {
                     self.feed_inner_on(application, channel, payload)
                 }
             }
+            // **A signed-program challenge (`155`).** The server asks the
+            // client to run a program it signed and answer with the result; a
+            // client that ignores it is one the server does not trust, and it
+            // answers by holding the character and the map back. rove's
+            // `ProgramAuth` does the verification and the reply
+            // (`program_check.rs`), including a duplicate cache, and this
+            // session has no signature trust store yet — so the packet is
+            // *named* rather than silently counted as unhandled, and the
+            // report says how many went unanswered.
+            (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 155) => {
+                self.program_challenges += 1;
+                log::warn!(
+                    "session: the server asked a signed-program challenge (155); \
+                     this client has no signature trust store, so none was answered"
+                );
+                false
+            }
             // The server's feature-name/value table: the one packet that says
             // which encoding the server will use for the session.
             (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 147) => self.features_offered(payload),
@@ -438,6 +551,193 @@ impl Session {
                 self.unhandled += 1;
                 false
             }
+        }
+    }
+
+    /// A packet on the reliable control channel: a datagram channel's
+    /// announcement, a close, or the empty open the client itself sends.
+    ///
+    /// The announcement is the whole point: `(2, application, channel, wire)`
+    /// is the only thing that says what a datagram's `wire_id` means, and a
+    /// client that does not keep the map reads every datagram but the clock's
+    /// as unknown. rove's own session does exactly this
+    /// (`live_session.rs:2117`), with a cap and a re-assignment check; both are
+    /// kept, because a server that reassigns a wire id mid-session is telling
+    /// this client something it must not silently accept.
+    fn control_channel(&mut self, application: u8, payload: &[u8]) -> bool {
+        match payload.first().copied() {
+            // An announcement: `2, app, channel u32, wire u32`.
+            Some(2) => match rove_client_core::channels::parse_control_open(payload) {
+                Ok((app, channel, wire)) => {
+                    if self.channels.len() >= MAX_DATAGRAM_CHANNELS
+                        && !self.channels.contains_key(&wire)
+                    {
+                        log::warn!(
+                            "session: the server announced more than {MAX_DATAGRAM_CHANNELS} \
+                             datagram channels; {wire} is not tracked"
+                        );
+                        return false;
+                    }
+                    let wanted = (app, u32::from(channel));
+                    if self
+                        .channels
+                        .get(&wire)
+                        .is_some_and(|existing| *existing != wanted)
+                    {
+                        log::warn!(
+                            "session: wire id {wire} was re-announced as {app}/{channel}, \
+                             it was {:?}",
+                            self.channels.get(&wire)
+                        );
+                        return false;
+                    }
+                    self.channels.insert(wire, wanted);
+                    log::debug!("session: datagram channel {app}/{channel} is wire {wire}");
+                    true
+                }
+                Err(error) => {
+                    log::warn!("session: a control-channel announcement was refused: {error}");
+                    false
+                }
+            },
+            // The empty open (`[0, 0]`) a client sends, or anything else: not
+            // world state either way.
+            _ => {
+                self.unhandled += 1;
+                let _ = application;
+                false
+            }
+        }
+    }
+
+    /// **One unreliable datagram, routed.** The clock's channel goes to the
+    /// time-sync probe; everything else is a game packet that arrived over
+    /// datagrams instead of a stream, and goes through the same
+    /// [`Session::feed_on`] dispatch a reliable one takes.
+    ///
+    /// Upstream does this per datagram (`live_session.rs:2138`: look the wire id
+    /// up, then `(6, 3)` to the clock and everything else into the world). This
+    /// join used to keep only the clock's and drop the rest, which is why a
+    /// live world arrived with its instances and none of its motion.
+    ///
+    /// Returns whether the packet was world state this session accepted.
+    #[cfg(feature = "transport")]
+    pub fn datagram(
+        &mut self,
+        wire_id: u32,
+        payload: &[u8],
+        clock: &SessionWireClock,
+        sync: &mut TimeSyncProbe,
+    ) -> bool {
+        let Some(&(application, channel)) = self.channels.get(&wire_id) else {
+            self.unknown_datagrams += 1;
+            if self.unknown_datagrams == 1 {
+                // Said once, with the wire id: the first unannounced datagram is
+                // the answer to "is the server sending at all", and a repeated
+                // line would be 40 seconds of the same sentence.
+                log::warn!(
+                    "session: a datagram named wire id {wire_id}, which no control-channel \
+                     announcement described; it cannot be routed"
+                );
+            }
+            return false;
+        };
+        // The clock's own two datagram channels (6/2 and 6/3 upstream): the
+        // probe reads them, and they are not world state.
+        if application == CLOCK_APPLICATION && channel == CLOCK_CHANNEL {
+            match sync.receive(payload, clock, true) {
+                Ok(true) => self.sync_replies += 1,
+                Ok(false) => {}
+                Err(error) => log::warn!("session: time-sync reply refused: {error}"),
+            }
+            return false;
+        }
+        self.datagrams_fed += 1;
+        self.feed_on(application, channel, payload)
+    }
+
+    /// **Ask the streaming server to keep the region around us.**
+    ///
+    /// Called on the same tick as the clock probe, not by the renderer: the join
+    /// is a thread of its own and the editor's camera is on the other side of
+    /// the handover. The position reused is the last one sent — a focus names a
+    /// *region*, and the server keeps it for `FOCUS_TIMEOUT_MS` — so an idle
+    /// character's region does not lapse and stop streaming.
+    ///
+    /// Returns whether a packet was queued (the caller flushes).
+    #[cfg(feature = "transport")]
+    pub fn refocus(&mut self, from_editor: Option<[f32; 3]>) -> bool {
+        // Where the view is, if the editor has said: the camera moves with the
+        // character, so this is the region the player is actually in. Before the
+        // first frame that says, the spawn region's own focus (`note_regions`)
+        // is the only one that can be honest — and it has already been sent.
+        if let Some(position) = from_editor {
+            return self.request_focus(position, false);
+        }
+        // Otherwise the timeout decides: a focus lapses (`FOCUS_TIMEOUT_MS`),
+        // and the last one is re-sent well inside that, so the region never
+        // stops streaming while the character stands still.
+        let Some(sent_at) = self.focus_at else {
+            return false;
+        };
+        if sent_at.elapsed() < FOCUS_REFRESH {
+            return false;
+        }
+        let Some(position) = self.focus_position else {
+            return false;
+        };
+        self.request_focus(position, true)
+    }
+
+    /// `(6, 3)`'s time-sync, for a datagram whose announcement never arrived:
+    /// the wire id is only a name, and the application and channel are what
+    /// decide the reader. Kept for the case a recording carries the clock's
+    /// datagrams without its announcements (the harness's fixtures do).
+    #[cfg(feature = "transport")]
+    pub fn datagram_is_clock(&self, wire_id: u32) -> bool {
+        self.channels
+            .get(&wire_id)
+            .is_some_and(|&(application, channel)| {
+                application == CLOCK_APPLICATION && channel == CLOCK_CHANNEL
+            })
+    }
+
+    /// **Where we are, for the server's streamer.** A streaming place sends the
+    /// parts around the client's `ReplicationFocus` and nothing else, so a
+    /// client that never sends one is a client that gets the spawn region and
+    /// then silence — which is a spawn, a skybox and no map.
+    ///
+    /// Sent when the position has moved meaningfully since the last one, not
+    /// every frame: a focus packet names a radius, and re-sending the same
+    /// region is asking for parts that already arrived. `force` sends once
+    /// regardless, for the first frame after the character binds.
+    pub fn request_focus(&mut self, position: [f32; 3], force: bool) -> bool {
+        self.focus_position = Some(position);
+        let moved = match self.focus_last_sent {
+            None => true,
+            Some(last) => {
+                let d = |a: usize| position[a] - last[a];
+                d(0) * d(0) + d(1) * d(1) + d(2) * d(2) >= FOCUS_MOVE_STUDS * FOCUS_MOVE_STUDS
+            }
+        };
+        if !moved && !force {
+            return false;
+        }
+        self.focus_id = self.focus_id.wrapping_add(1);
+        if let Ok(packet) = rove_client_core::replication_out::replication_focus(
+            self.focus_id,
+            position,
+            FOCUS_RADIUS_STUDS,
+            FOCUS_TIMEOUT_MS,
+        ) {
+            self.outbound
+                .push((REPLICATION_APPLICATION, REPLICATION_CHANNEL, packet));
+            self.focus_sent += 1;
+            self.focus_last_sent = Some(position);
+            self.focus_at = Some(std::time::Instant::now());
+            true
+        } else {
+            false
         }
     }
 
@@ -587,17 +887,12 @@ impl Session {
         let to_stud = |index: usize| {
             (center[index].as_f64().unwrap_or(0.0) * 64.0 + 32.0) as f32
         };
-        self.focus_id = self.focus_id.wrapping_add(1);
-        if let Ok(packet) = rove_client_core::replication_out::replication_focus(
-            self.focus_id,
+        // The region centre in studs, sent as a focus: the streamer reads these
+        // and nothing else before a character exists to follow.
+        self.request_focus(
             [to_stud(0), to_stud(1), to_stud(2)],
-            512.0,
-            4000,
-        ) {
-            self.outbound
-                .push((REPLICATION_APPLICATION, REPLICATION_CHANNEL, packet));
-            self.focus_sent += 1;
-        }
+            self.focus_last_sent.is_none(),
+        );
     }
 
     /// A ping on `(4, 3)`, answered rather than counted.
@@ -835,6 +1130,12 @@ impl Session {
             // it). Without it the client cannot recognise its own ownership and
             // simulates nothing, which is a game where nothing moves.
             self_peer: self.core.scope().unwrap_or(0),
+            datagram_channels: self.channels.len(),
+            datagrams_fed: self.datagrams_fed,
+            unknown_datagrams: self.unknown_datagrams,
+            property_acks_sent: self.property_acks_sent,
+            program_challenges: self.program_challenges,
+            focus_updates: self.focus_sent,
         }
     }
 
@@ -912,6 +1213,14 @@ impl Session {
             if !self.character_seen && self.character_present() {
                 self.character_seen = true;
             }
+            // **Acknowledge the `CFrame`s this record changed.** The server
+            // keeps a property's next version queued until the client confirms
+            // the one it sent; a client that only reads is a client the world
+            // stops moving for, one property at a time. rove's
+            // `PropertyAcknowledgments` is the accounting (coalescing versions,
+            // one write in flight, no retry after an ambiguous send), and the
+            // payload it prepares is rove's own `0x83` packet.
+            self.acknowledge_properties(&row.value.property_changes);
             if self.prepare_streaming_resume() {
                 log::info!("session: spawn region acknowledged; the server will stream the character");
             }
@@ -950,6 +1259,73 @@ impl Session {
             }
         }
         read
+    }
+
+    /// Observe one record's property changes and queue the acknowledgment they
+    /// are owed, if there is one to send.
+    ///
+    /// Only `CFrame`s are acknowledged: rove's own rule
+    /// (`property_acknowledgments::eligible`), because a frame is the one
+    /// property the server will not send again until it knows the client has
+    /// this one. Observing more would acknowledge state this client reads but
+    /// the server never had to wait for.
+    fn acknowledge_properties(&mut self, changes: &[serde_json::Value]) {
+        if changes.is_empty() {
+            return;
+        }
+        let (Some(schema), Some(view)) = (self.core.schema(), self.core.world_view()) else {
+            return;
+        };
+        if let Err(error) = self
+            .property_acks
+            .observe(schema, &view, changes, self.rows_applied as u32)
+        {
+            log::debug!("session: property acknowledgment refused: {error}");
+            return;
+        }
+        // One payload in flight at a time (`prepare` says `None` while one is),
+        // and its id is kept: the transport is what says whether the write went,
+        // and an ambiguous one must not be retried.
+        match self.property_acks.prepare(&view) {
+            Ok(Some(prepared)) => {
+                self.ack_in_flight = Some(prepared.id());
+                self.outbound.push((
+                    REPLICATION_APPLICATION,
+                    REPLICATION_CHANNEL,
+                    prepared.payload().to_vec(),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => log::debug!("session: property acknowledgment not prepared: {error}"),
+        }
+    }
+
+    /// **The send the queue was waiting on has happened** (or provably has not).
+    ///
+    /// `written == false` is not a retry: rove's queue marks itself
+    /// `transport_submission_ambiguous_no_retry` and stops, because a receipt
+    /// that may or may not have arrived cannot be safely repeated.
+    pub fn property_ack_written(&mut self, written: bool) {
+        let Some(id) = self.ack_in_flight.take() else {
+            return;
+        };
+        if let Err(error) = self.property_acks.commit(id, written) {
+            log::debug!("session: property acknowledgment commit failed: {error}");
+        }
+    }
+
+    /// How many property acknowledgments have gone out, and how many are queued.
+    pub fn property_ack_report(&self) -> (u64, u64) {
+        let report = self.property_acks.report();
+        let sent = report
+            .get("packets_sent")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let pending = report
+            .get("pending")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        (sent, pending)
     }
 
     /// Rows the journal holds. A counter, not a scan: this is polled by a
@@ -1129,6 +1505,14 @@ pub async fn run(
             .await
             .map_err(|_| "a clock channel could not be announced")?;
     }
+    // The map is seeded with the same announcements, in the same place they are
+    // built: a datagram naming wire 2 or 4 is the clock's, and until the server
+    // announces its own channels that is the only way to know. The server's
+    // announcements replace nothing — `parse_control_open` of its own names more
+    // wires — so this is the client's half of the contract, not a guess.
+    for (channel, wire) in [(2u8, 2u32), (3, 4)] {
+        session.channels.insert(wire, (6, u32::from(channel)));
+    }
     let mut sync = TimeSyncProbe::default();
     sync.start(&clock).map_err(|_| "the time-sync probe could not be started")?;
     log::info!("session: wire clock initialized, clock channels 6/1, 6/2, 6/3 announced");
@@ -1262,25 +1646,7 @@ pub async fn run(
                 // Anything the packet asked for, written before the next one is
                 // read: a handshake the server is waiting on must not queue
                 // behind the world it is holding back.
-                if !session.outbound.is_empty() {
-                    for (out_application, out_channel, reply) in session.outbound.drain(..) {
-                        if let Err(error) = sender
-                            .send(out_application, out_channel, &reply)
-                            .await
-                        {
-                            // A reply that cannot be written is counted, not
-                            // fatal: the session keeps reading, and the report
-                            // says the handshake was not answered.
-                            session.replies_failed += 1;
-                            log::warn!(
-                                "session: a reply on {out_application}/{out_channel} could not be \
-                                 sent: {error}"
-                            );
-                        } else {
-                            session.replies_sent += 1;
-                        }
-                    }
-                }
+                flush_outbound(&mut session, &sender).await;
                 // Republished every 16 packets: often enough that the overlay
                 // moves, rarely enough that the lock is not the hot path.
                 fed += 1;
@@ -1315,29 +1681,69 @@ pub async fn run(
                     Ok(None) => {}
                     Err(error) => log::warn!("session: time-sync clock error: {error}"),
                 }
+                // And the streamer's own keep-alive, on the same tick: a
+                // streaming place only sends the parts around this client's
+                // focus, and a focus lapses. It cannot be `None` here — the
+                // `if` is the answer — but `refocus` re-checks, because it is
+                // also called from a path where no region has arrived.
+                let from_editor = session
+                    .handover
+                    .as_ref()
+                    .and_then(|live_world| live_world.focus());
+                if session.refocus(from_editor) {
+                    flush_outbound(&mut session, &sender).await;
+                }
             }
-            // A datagram. Only the time-sync channel's replies are interpreted
-            // here; everything else is counted, because a datagram a server
-            // sent and nobody read sits in the connection's queue, and the
-            // probe's answer is exactly the kind of packet that never arrives
-            // on a reliable stream.
+            // **A datagram, routed by its announcement.** This used to keep
+            // only the clock's and throw the rest away, which is exactly the
+            // bug that arrived reported from a phone: a live world with every
+            // instance in it and every part frozen, because `(6, 3)` was the
+            // only wire id this loop would read a payload from.
+            //
+            // Now the wire id is looked up in the map the control channel
+            // filled: the clock's channel goes to the probe, and everything
+            // else is world state and takes the same `feed_on` path a reliable
+            // packet takes. A datagram naming an unannounced wire id is
+            // *counted*, not dropped silently — the difference between "the
+            // server never announced it" and "the client ignored it" is the
+            // whole diagnosis.
             datagram = receive_unreliable(&connection) => {
                 session.datagrams += 1;
                 match datagram {
                     Ok(packet) => {
-                        if packet.wire_id == 4 && packet.complete {
-                            match sync.receive(&packet.payload, &clock, true) {
-                                Ok(true) => session.sync_replies += 1,
-                                Ok(false) => {}
-                                Err(error) => {
-                                    log::warn!("session: time-sync reply refused: {error}")
-                                }
+                        if !packet.complete {
+                            session.fragmented_datagrams += 1;
+                            continue;
+                        }
+                        // **The clock's replies, then world state.** The clock's
+                        // wire id is not hard-coded: the map is seeded with the
+                        // ids this client announces at login (`(6, 2)` on wire 2,
+                        // `(6, 3)` on wire 4), and `sync.receive` is the reader
+                        // that knows what a reply means. Every other datagram is
+                        // a game packet and takes `feed_on`'s path.
+                        let fed_world =
+                            session.datagram(packet.wire_id, &packet.payload, &clock, &mut sync);
+                        if fed_world {
+                            // Republished every 16 accepted packets, reliable or
+                            // not: a session moving only on datagrams still
+                            // moves the overlay.
+                            fed += 1;
+                            if fed % 16 == 0 {
+                                progress(session);
                             }
                         }
+                        // Whatever a datagram asked for goes out now: a ping
+                        // that arrives unreliably is a ping the server is
+                        // timing, and a reply queued behind the next read is a
+                        // reply the server has already given up on.
+                        flush_outbound(&mut session, &sender).await;
                     }
                     // A datagram that will not parse is not the end of the
                     // connection: count it and read the next one.
-                    Err(error) => log::debug!("session: a datagram was unreadable: {error}"),
+                    Err(error) => {
+                        session.unreadable_datagrams += 1;
+                        log::debug!("session: a datagram was unreadable: {error}");
+                    }
                 }
             }
             _ = &mut connection_closed => {
@@ -1379,6 +1785,54 @@ pub async fn run(
     connection.close(0u32.into(), b"done");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
     Ok(session.stage.clone())
+}
+
+/// Write everything a session has queued, in order, and account for it.
+///
+/// The session's replies are all `(application, channel, payload)` — marker
+/// handshakes, ping replies, property acknowledgments, replication focus — and
+/// the accounting is *per kind* only where a caller asks; here what matters is
+/// that a failed write is counted rather than being fatal (the session keeps
+/// reading) and that a property acknowledgment the transport refused is
+/// reported to its queue, which must never retry an ambiguous receipt.
+#[cfg(feature = "transport")]
+async fn flush_outbound(session: &mut Session, sender: &ReliableSender) {
+    if session.outbound.is_empty() {
+        return;
+    }
+    // `take`, not `drain` while awaiting: a reply queued by an await point
+    // would otherwise be appended to the vector being drained and sent twice.
+    let queued = std::mem::take(&mut session.outbound);
+    let mut ack_written = None;
+    for (application, channel, reply) in queued {
+        // A property acknowledgment is the one reply whose success the session
+        // has to record: its queue holds the next version until this one is
+        // confirmed.
+        let is_ack = application == REPLICATION_APPLICATION
+            && channel == REPLICATION_CHANNEL
+            && reply.first() == Some(&0x83);
+        match sender.send(application, channel, &reply).await {
+            Ok(()) => {
+                session.replies_sent += 1;
+                if is_ack {
+                    ack_written = Some(true);
+                    session.property_acks_sent += 1;
+                }
+            }
+            Err(error) => {
+                session.replies_failed += 1;
+                if is_ack {
+                    ack_written = Some(false);
+                }
+                log::warn!(
+                    "session: a reply on {application}/{channel} could not be sent: {error}"
+                );
+            }
+        }
+    }
+    if let Some(written) = ack_written {
+        session.property_ack_written(written);
+    }
 }
 
 /// The login packets for an allocation, in send order.

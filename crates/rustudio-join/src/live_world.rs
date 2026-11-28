@@ -39,7 +39,7 @@
 //! and `mark_all()` is never called, because a full rebuild every frame is the
 //! opposite of a live session.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value as J;
@@ -103,6 +103,23 @@ pub struct Counters {
     /// globals have arrived, which is also the honest answer — before them there
     /// is no scope, so no grant can be recognised.
     pub self_peer: u64,
+    /// **Datagram channels the server announced**, and how many datagrams were
+    /// routed through them. A live server sends its motion over datagrams; a
+    /// client with zero here is one whose world will not move, whatever its
+    /// reliable stream says.
+    pub datagram_channels: usize,
+    /// Datagrams fed into the world (the clock's excluded).
+    pub datagrams_fed: u64,
+    /// Datagrams naming a `wire_id` no announcement described: the number that
+    /// says the *client* was not told, rather than the server not sending.
+    pub unknown_datagrams: u64,
+    /// `CFrame` acknowledgments written back on `(4, 1)`.
+    pub property_acks_sent: u64,
+    /// Signed-program challenges (`155`) received, and answered.
+    pub program_challenges: u64,
+    /// `ReplicationFocus` packets sent: what a streaming server needs to know
+    /// which parts to keep sending.
+    pub focus_updates: u64,
 }
 
 impl Counters {
@@ -111,7 +128,8 @@ impl Counters {
     pub fn line(&self) -> String {
         format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
-             acked {}/{} held · markers {}/{} · stream {}/{} {} · {} s",
+             acked {}/{} held · markers {}/{} · stream {}/{} {} · dgram {}/{} on {} ch{} · \
+             acks {} · focus {}{} · {} s",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -127,6 +145,20 @@ impl Counters {
             self.regions,
             self.focus_sent,
             if self.streaming_ready { "acked" } else { "no-ack" },
+            // Datagrams: fed into the world out of how many arrived on a channel
+            // the server announced. A session whose world never moves is one
+            // where the second number is zero — the packets the motion travels
+            // in were dropped before the decoder.
+            self.datagrams_fed,
+            self.datagrams_fed + self.unknown_datagrams,
+            self.datagram_channels,
+            self.property_acks_sent,
+            self.focus_updates,
+            if self.unknown_datagrams > 0 {
+                format!(" · {} datagram(s) on unannounced wire ids", self.unknown_datagrams)
+            } else {
+                String::new()
+            },
             self.seconds
         )
     }
@@ -161,6 +193,17 @@ struct LiveWorldInner {
     dropped_batches: AtomicU64,
     /// How many stop requests were honoured, for the overlay.
     stopped: AtomicBool,
+    /// **Where the editor's view is**, in world studs, as the bits of three
+    /// `f32`s. The session's thread reads it to send `ReplicationFocus` — the
+    /// packet that tells a streaming server which region to keep sending.
+    ///
+    /// It lives here, on the shared handover, because the two halves are on
+    /// different threads and neither may borrow the other: the renderer knows
+    /// where the camera is and the session knows how to ask. `f32` has no atomic
+    /// form, so the bits go through a `u64` slot each and a "written" flag says
+    /// whether any of them is real (zero is a legitimate coordinate).
+    focus: [AtomicU32; 3],
+    focus_set: AtomicBool,
 }
 
 /// How many action batches may wait for the editor. Each is one journal read
@@ -246,6 +289,29 @@ impl LiveWorld {
     /// Batches dropped because the editor fell `BATCH_BACKLOG` behind.
     pub fn dropped(&self) -> u64 {
         self.inner.dropped_batches.load(Ordering::Relaxed)
+    }
+
+    /// **Tell the session where the view is.** Called by the editor each frame
+    /// with the camera's (or the character's) position in studs; the session's
+    /// thread turns it into `ReplicationFocus`, which is the packet a streaming
+    /// server needs before it will send anything but the spawn region.
+    pub fn set_focus(&self, position: [f32; 3]) {
+        for (slot, value) in self.inner.focus.iter().zip(position) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        self.inner.focus_set.store(true, Ordering::Relaxed);
+    }
+
+    /// The last focus the editor gave, or `None` before the first one.
+    pub fn focus(&self) -> Option<[f32; 3]> {
+        if !self.inner.focus_set.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut out = [0f32; 3];
+        for (o, slot) in out.iter_mut().zip(&self.inner.focus) {
+            *o = f32::from_bits(slot.load(Ordering::Relaxed));
+        }
+        out.iter().all(|v| v.is_finite()).then_some(out)
     }
 
     pub fn request_stop(&self) {

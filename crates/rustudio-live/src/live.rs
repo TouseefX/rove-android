@@ -73,6 +73,10 @@ pub struct ApplyStats {
     pub events: usize,
     /// Values the converter refused, so the property kept its default.
     pub refused_values: usize,
+    /// Values *not* counted as refusals because no client can read them at all
+    /// (`Player.User`, `GameplayPaused`, `CharacterRegionId`). Kept apart so the
+    /// report says "expected" with a number rather than nothing.
+    pub kept_client_unreadable: usize,
     /// Wall time this batch took.
     pub duration_ms: f64,
 }
@@ -91,6 +95,7 @@ impl ApplyStats {
         self.unknown_classes += other.unknown_classes;
         self.events += other.events;
         self.refused_values += other.refused_values;
+        self.kept_client_unreadable += other.kept_client_unreadable;
         self.duration_ms += other.duration_ms;
     }
 
@@ -155,6 +160,10 @@ pub struct Live {
     /// number: "{} refused" is a fault, `Part.Shape` refused 412 times is a
     /// thing to go and fix.
     refused_properties: std::collections::BTreeMap<String, usize>,
+    /// The same refusals, by **class**: the second question a report is read for
+    /// ("one property in one class", or "everything about `Model`"), and the one
+    /// the phone's log left unanswerable.
+    refused_class_totals: std::collections::BTreeMap<String, usize>,
     /// Creates whose class the reflection database does not know (or which
     /// named none). Every one of these made an instance nothing can draw or
     /// simulate, so the count is the answer to "why is the world half here".
@@ -193,6 +202,7 @@ impl Live {
             dropped_events: 0,
             written_properties: std::collections::BTreeMap::new(),
             refused_properties: std::collections::BTreeMap::new(),
+            refused_class_totals: std::collections::BTreeMap::new(),
             refused_classes: std::collections::BTreeMap::new(),
             dangling_refs: std::collections::BTreeMap::new(),
             pending_refs: std::collections::BTreeMap::new(),
@@ -211,6 +221,7 @@ impl Live {
             dropped_events: 0,
             written_properties: std::collections::BTreeMap::new(),
             refused_properties: std::collections::BTreeMap::new(),
+            refused_class_totals: std::collections::BTreeMap::new(),
             refused_classes: std::collections::BTreeMap::new(),
             dangling_refs: std::collections::BTreeMap::new(),
             pending_refs: std::collections::BTreeMap::new(),
@@ -287,6 +298,18 @@ impl Live {
     pub fn written_properties(&self) -> Vec<(String, usize)> {
         let mut out: Vec<(String, usize)> = self
             .written_properties
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Refusals by class, most-frequent first: "is this one property, or all of
+    /// one class".
+    pub fn refused_properties_by_class(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = self
+            .refused_class_totals
             .iter()
             .map(|(name, count)| (name.clone(), *count))
             .collect();
@@ -663,6 +686,7 @@ impl Live {
     /// reads, which is the one fault worse than a missing entry.
     fn refuse(&mut self, class: &str, property: &str, stats: &mut ApplyStats) {
         if crate::snapshot::not_client_readable(class, property) {
+            stats.kept_client_unreadable += 1;
             return;
         }
         stats.refused_values += 1;
@@ -670,6 +694,7 @@ impl Live {
             .refused_properties
             .entry(format!("{class}.{property}"))
             .or_default() += 1;
+        *self.refused_class_totals.entry(class.to_string()).or_default() += 1;
     }
 
     /// Remember a `$ref` whose target has not arrived, keyed by the owner and
