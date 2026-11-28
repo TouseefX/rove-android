@@ -95,20 +95,17 @@ fn a_datagram_on_an_announced_world_channel_reaches_the_world() {
     session.stage = Stage::LoggedIn;
     // The instance-state channel a real server sends most of a place on.
     announce(&mut session, 4, 5, 7);
-    // Not a valid instance-state packet: what matters is that the *session*
-    // took it — a refused packet is counted as refused, which can only happen
-    // if the bytes reached the dispatch at all.
-    let arrived = session.feed_on(4, 5, &[0xff, 0xff, 0xff, 0xff]);
-    let _ = arrived;
+    // An instance-state packet (`161`) before globals: the dispatch recognises
+    // it and *holds* it for the world, which is the proof that the bytes took
+    // the announced channel's route and not the drop.
+    session.feed_on(4, 5, &[161, 0x00]);
     assert_eq!(
-        session.arrivals.get(&(4, 5, 0xff)).copied(),
+        session.arrivals.get(&(4, 5, 161)).copied(),
         Some(1),
         "the packet was seen on the announced channel"
     );
-    assert!(
-        session.ingested.refused + session.ingested.packets > 0,
-        "and it reached the decoder"
-    );
+    assert_eq!(session.held, 1, "and the dispatch recognised it as world state");
+    assert_eq!(session.unhandled, 0, "it was not dropped as unknown");
 }
 
 #[test]
@@ -123,4 +120,17 @@ fn a_datagram_on_the_control_channel_is_not_world_state() {
         session.ingested.packets, before,
         "a channel announcement is not a world packet"
     );
+    assert_eq!(session.held, 0, "and it held nothing");
+}
+
+#[test]
+fn a_packet_the_dispatch_does_not_know_is_unhandled_not_held() {
+    let mut session = Session::new();
+    session.stage = Stage::LoggedIn;
+    announce(&mut session, 4, 5, 7);
+    // A kind nothing recognises: counted, and *said so* — the number the report
+    // reads to tell "the client dropped it" from "the server never sent it".
+    assert!(!session.feed_on(4, 5, &[0xff, 0xff, 0xff, 0xff]));
+    assert_eq!(session.unhandled, 1);
+    assert_eq!(session.held, 0);
 }

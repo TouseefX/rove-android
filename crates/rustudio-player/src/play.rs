@@ -2005,7 +2005,11 @@ impl Game {
             // a `$ref` held for a model that has not streamed, and neither is
             // visible from the editor. This is the line a phone's report is read
             // for when a join has a world and no body.
-            if !self.live_character_wait_logged {
+            if !self
+                .play
+                .as_ref()
+                .is_some_and(|s| s.live_character_wait_logged)
+            {
                 if let Some(s) = self.play.as_mut() {
                     s.live_character_wait_logged = true;
                 }
@@ -2153,7 +2157,9 @@ impl Game {
     /// three numbers — how many `BasePart`s are in `Workspace`, how many of them
     /// have the `CFrame` a part is drawn at, and whether a `Character` is bound
     /// yet. `(None, 0, 0)` before `Workspace` arrives.
-    fn live_world_facts(&self) -> (Option<usize>, usize, usize) {
+    fn live_world_facts(&self) -> (Option<Ref>, usize, usize) {
+        // A ref is not a count: the line says *which* model was bound (the
+        // handler formats it), and the numbers here are the map's.
         let character = self
             .play
             .as_ref()
@@ -2164,10 +2170,7 @@ impl Game {
         };
         let mut parts = 0usize;
         let mut framed = 0usize;
-        // (`&self.doc` explicitly: the loop borrows the document immutably, and
-        // the claim below needs it mutably — one `&` is the difference between
-        // a borrow that ends at the loop and one that ends at the function.)
-        for i in (&self.doc).dom.descendants_of(ws) {
+        for i in self.doc.dom.descendants_of(ws) {
             if !doc::is_a(&i.class, "BasePart") || i.class == "Terrain" {
                 continue;
             }
@@ -2199,6 +2202,13 @@ impl Game {
         let Some(ws) = self.doc.workspace() else {
             return;
         };
+        // The set is *taken* rather than cloned: this runs every frame of a
+        // live client, and a few thousand refs copied per frame is a phone
+        // spending its budget on bookkeeping. It goes back below, on both paths.
+        let mut claimed = match self.play.as_mut() {
+            Some(s) => std::mem::take(&mut s.live_claimed),
+            None => return,
+        };
         let mut fresh: Vec<Ref> = Vec::new();
         let mut present: Vec<Ref> = Vec::new();
         for i in self.doc.dom.descendants_of(ws) {
@@ -2207,20 +2217,24 @@ impl Game {
             }
             let r = i.referent();
             present.push(r);
-            if !self.live_claimed.contains(&r) {
+            if !claimed.contains(&r) {
                 fresh.push(r);
             }
         }
-        // The set is what is *here now*: a part that went away frees its ref,
-        // and the DOM may hand that ref to a later instance.
-        self.live_claimed = present.into_iter().collect();
-        if fresh.is_empty() {
-            return;
-        }
+        // What is here *now*: a part that went away frees its ref, and the DOM
+        // may hand that ref to a later instance.
+        claimed.clear();
+        claimed.extend(present);
         let count = fresh.len();
         if let Some(s) = self.play.as_mut() {
-            s.physics.claim_owned(&mut self.doc, owner, &fresh);
-            s.live_claimed_parts += count as u64;
+            if count > 0 {
+                s.physics.claim_owned(&mut self.doc, owner, &fresh);
+                s.live_claimed_parts += count as u64;
+            }
+            s.live_claimed = claimed;
+        }
+        if count == 0 {
+            return;
         }
         // Once per arrival, not once per part: a streaming server sends parts in
         // batches, and the line is there to date the moment the map became
