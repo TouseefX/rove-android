@@ -74,6 +74,34 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Build fresh headers for each attempt. The supplier is called here rather
+/// than at agent construction so a version invalidated by a rejected join is
+/// fetched again on the next request.
+fn request_headers(
+    cookie: &Secret,
+    csrf: Option<&Secret>,
+    has_body: bool,
+    user_agent: impl FnOnce() -> String,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("Cookie".into(), format!(".ROBLOSECURITY={}", cookie.expose())),
+        ("Accept".into(), "application/json".into()),
+        ("User-Agent".into(), user_agent()),
+        ("rbx-user-agent".into(), NATIVE_IDENTITY.into()),
+        ("Accept-Language".into(), "en-US,en;q=0.9".into()),
+        ("Roblox-Browser-Asset-Request".into(), "false".into()),
+        ("Origin".into(), "https://www.roblox.com".into()),
+        ("Referer".into(), "https://www.roblox.com/".into()),
+    ];
+    if has_body {
+        headers.push(("Content-Type".into(), "application/json".into()));
+    }
+    if let Some(token) = csrf {
+        headers.push(("X-CSRF-TOKEN".into(), token.expose().to_owned()));
+    }
+    headers
+}
+
 /// An authenticated Roblox account session: a cookie plus the anti-CSRF tokens
 /// hosts have issued for it.
 pub struct AccountSession {
@@ -121,9 +149,6 @@ impl AccountSession {
             // No redirects: the Cookie header must never follow a 3xx to a host
             // that is not on the allowlist above.
             .max_redirects(0)
-            // The live client version, not a pinned constant: the launcher
-            // refuses an unknown agent (see `crate::client_version`).
-            .user_agent(crate::client_version::user_agent())
             .build();
         let agent: ureq::Agent = config.into();
         Ok(Self {
@@ -165,33 +190,12 @@ impl AccountSession {
             ));
         }
         for attempt in 0..2u8 {
-            let mut headers: Vec<(String, String)> = vec![
-                (
-                    "Cookie".into(),
-                    format!(".ROBLOSECURITY={}", self.cookie.expose()),
-                ),
-                ("Accept".into(), "application/json".into()),
-                // **The launcher admits native clients and refuses web ones.**
-                // `gamejoin` answers HTTP 200 with status 12, "You are not
-                // allowed to play this game", to a request that identifies as
-                // a browser — and status 2 for the same place and cookie once
-                // it identifies as a native client (the research in
-                // H644b/Roblox-Public-Web-Play-Join measured exactly this,
-                // including that the HTTP `User-Agent` alone changes nothing:
-                // it is this header).
-                ("rbx-user-agent".into(), NATIVE_IDENTITY.into()),
-                // Present on real client traffic; some endpoints key off them.
-                ("Accept-Language".into(), "en-US,en;q=0.9".into()),
-                ("Roblox-Browser-Asset-Request".into(), "false".into()),
-                ("Origin".into(), "https://www.roblox.com".into()),
-                ("Referer".into(), "https://www.roblox.com/".into()),
-            ];
-            if body.is_some() {
-                headers.push(("Content-Type".into(), "application/json".into()));
-            }
-            if let Some(token) = self.csrf.get(host) {
-                headers.push(("X-CSRF-TOKEN".into(), token.expose().to_owned()));
-            }
+            let headers = request_headers(
+                &self.cookie,
+                self.csrf.get(host),
+                body.is_some(),
+                crate::client_version::user_agent,
+            );
             let url = format!("https://{host}{path}");
             // GET and POST are different request types in ureq 3
             // (`RequestBuilder<WithoutBody>` / `<WithBody>`), so each arm builds
@@ -293,6 +297,51 @@ fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<Str
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.chars().take(256).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_cached_version_is_used_without_recreating_session() {
+        // The version cache is process-wide; isolate it from parallel tests.
+        const CHILD: &str = "ROVE_AGENT_REFRESH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "http::tests::changed_cached_version_is_used_without_recreating_session"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::client_version::seed("0.100.0.1000000");
+        let session = AccountSession::new("test-cookie").unwrap();
+        let first = request_headers(&session.cookie, None, true, crate::client_version::user_agent);
+        crate::client_version::invalidate();
+        // Simulate a successful version fetch, without network access.
+        crate::client_version::seed("0.101.0.1010000");
+        let retry = request_headers(&session.cookie, None, true, crate::client_version::user_agent);
+        assert!(first.iter().any(|(k, v)| k == "User-Agent" && v.contains("0.100.0.1000000")));
+        assert!(retry.iter().any(|(k, v)| k == "User-Agent" && v.contains("0.101.0.1010000")));
+    }
+
+    #[test]
+    fn retry_builds_headers_from_current_user_agent() {
+        let cookie = Secret::new("test-cookie");
+        let token = Secret::new("csrf");
+        let first = request_headers(&cookie, None, true, || "old-version".into());
+        let retry = request_headers(&cookie, Some(&token), true, || "refreshed-version".into());
+        let get = |headers: &[(String, String)], name: &str| {
+            headers.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+        };
+        assert_eq!(get(&first, "User-Agent").as_deref(), Some("old-version"));
+        assert_eq!(get(&retry, "User-Agent").as_deref(), Some("refreshed-version"));
+        assert_eq!(get(&retry, "rbx-user-agent").as_deref(), Some(NATIVE_IDENTITY));
+        assert_eq!(get(&retry, "X-CSRF-TOKEN").as_deref(), Some("csrf"));
+        assert_eq!(get(&retry, "Cookie").as_deref(), Some(".ROBLOSECURITY=test-cookie"));
+    }
 }
 
 /// A path this client will request: absolute, ASCII, no fragment, and nothing
