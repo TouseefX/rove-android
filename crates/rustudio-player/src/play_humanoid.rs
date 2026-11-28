@@ -156,13 +156,27 @@ impl Game {
             }
             rt.dispatch();
         });
-        if mode != RunMode::Play {
+        // **A live client runs its own frame hooks too.** This was
+        // `mode != RunMode::Play`, so a joined session fired nothing on the
+        // client side: no `PreAnimation`, no `Stepped`, no `PreSimulation`, and
+        // with them no `RenderStepped` — every LocalScript in the place that
+        // animates, moves a camera or drives a viewmodel was dead, which is most
+        // of what "a Roblox game" is. `RenderMode` is why the mode test was
+        // there at all; `Client` is the same side of the same question.
+        if !matches!(mode, RunMode::Play | RunMode::Client) {
             return;
         }
-        let crs = self.play.as_ref().and_then(|s| s.other_doc.as_ref()).and_then(|cd| {
-            let r = cd.dom.root_ref();
-            cd.find_child(r, "RunService")
-        });
+        // The client's own `RunService`: Play Solo's client copy, or — a live
+        // client — the replicated place, which is the document it draws.
+        let live = mode == RunMode::Client;
+        let crs = if live {
+            self.doc.find_child(root, "RunService")
+        } else {
+            self.play.as_ref().and_then(|s| s.other_doc.as_ref()).and_then(|cd| {
+                let r = cd.dom.root_ref();
+                cd.find_child(r, "RunService")
+            })
+        };
         self.with_side(Side::Client, |rt, _, _| {
             let Some(rs) = crs else { return };
             if phase == 0 {
@@ -372,7 +386,21 @@ impl Game {
 
     /// The client's CurrentCamera: its CFrame and Focus.
     fn client_camera(&self) -> Option<(Xform, Option<Xform>)> {
-        let cd = self.play.as_ref()?.other_doc.as_ref()?;
+        // **A live client's camera is in the document it draws.** `other_doc`
+        // is Play Solo's client copy; `RunMode::Client` has none, so this
+        // answered `None` for every joined session and `hum_face_camera` never
+        // knew where the camera was. Shift lock, first person and
+        // `RotationType = CameraRelative` all turn the character by this
+        // heading, so a joined game had the camera and the body disagreeing.
+        let live = self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.mode == RunMode::Client);
+        let cd = if live {
+            &self.doc
+        } else {
+            self.play.as_ref()?.other_doc.as_ref()?
+        };
         let ws = cd.workspace()?;
         let cam = match cd.prop(ws, "CurrentCamera") {
             Some(Variant::Ref(r)) if cd.exists(r) => r,
@@ -1141,7 +1169,17 @@ impl Game {
             .play
             .as_ref()
             .is_some_and(|s| s.mode == RunMode::Client);
-        if !live_client {
+        // **Unless this client owns the body.** The paragraph above is right
+        // about a character the *server* simulates: its limb frames arrive in
+        // the delta stream and a local solve written over them is a lie. But a
+        // character the server has handed to this client (`NetworkOwnerV3` =
+        // our scope — the ordinary case for your own character) is stepped
+        // here, and nothing else moves it: not writing the solve left the legs
+        // and arms at the frame they were created with while the root moved,
+        // which is "the character walks but does not animate".
+        // `live_character_owned` is the same question the physics uplink asks,
+        // so it is asked in one place.
+        if !live_client || self.live_character_owned() {
             rig::write_pose(&mut self.doc, server_pose.as_ref().unwrap_or(&pose), None);
         }
         let humanoid = out.humanoid;

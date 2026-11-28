@@ -601,7 +601,17 @@ impl PlaySession {
             live_ownership_logged: false,
             live_claimed: HashSet::new(),
             live_claimed_parts: 0,
-            showing: Side::Server,
+            // **A live client is the client side, always.** `showing` is which
+            // of the two documents `self.doc` is; `RunMode::Client` has one
+            // document and it is the replicated place, so it is the client's.
+            // Left at `Server`, as Play Solo's default, every reader of this
+            // field answered "the server" for a joined game: `finish_view_gui`
+            // dropped all of `gui.events` / `gui.layout` (`game_view.rs`), a
+            // `GuiButton.Modal` never released the cursor, `R.playing()` said
+            // false to the client's own Luau, and the status line said "viewing
+            // server". The join drew a world and acted as though it were the
+            // side that made it.
+            showing: if mode == RunMode::Client { Side::Client } else { Side::Server },
             map: Default::default(),
             physics: PlayPhysics(None),
             pending_frame: None,
@@ -897,6 +907,23 @@ impl Game {
     /// Runs `f` with one side's runtime entered (its DataModel lent to Lua).
     /// `peer` is the other side's DataModel. Must be called with the server
     /// in front. Output is tagged with the side.
+    /// Replays a live batch's document changes through the client's runtime.
+    ///
+    /// A **client-side only** entry: nothing here may run on the server (a live
+    /// session has none), and the caller is the join window's bridge
+    /// (`src/live_bridge.rs`). `f` gets the runtime with the replicated document
+    /// in front, which is what every signal the bridge fires reads.
+    pub fn with_live_client<R>(&mut self, f: impl FnOnce(&Runtime) -> R) -> Option<R> {
+        let live = self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.mode == RunMode::Client);
+        if !live {
+            return None;
+        }
+        self.with_side(Side::Client, |rt, _, _| f(rt))
+    }
+
     pub(crate) fn with_side<R>(
         &mut self,
         side: Side,
@@ -2216,7 +2243,18 @@ impl Game {
                 // Where the character stands, so the frame before the
                 // PlayerModule's first RenderStepped is already looking at it
                 // rather than at the last place the editor camera was.
-                let look = rustudio_render::scene::xform_of(doc, cam).map(|xf| xf.pos);
+                //
+                // **Unless the replicated camera is at the origin.** A joined
+                // place's `Camera` often replicates with no `CFrame` at all,
+                // which reads as `(0, 0, 0)` — and this took it, so the first
+                // frame of every join was a camera at the world origin looking
+                // at the world origin: the report's "the map starts black and
+                // then the view is somewhere else". A camera with nothing to
+                // say falls back to the character, which is where a player
+                // looks from anyway.
+                let look = rustudio_render::scene::xform_of(doc, cam)
+                    .map(|xf| xf.pos)
+                    .filter(|p| p.x.abs() + p.y.abs() + p.z.abs() > 1e-3);
                 Some(look.unwrap_or(start))
             } else {
                 Some(start)
@@ -2225,6 +2263,41 @@ impl Game {
         if let Some(pos) = camera {
             self.cam.pos = pos;
             self.cam.focus = pos;
+        }
+        // **`CharacterAdded`, and the character's own scripts.** The character
+        // is replicated by the server and bound here, but nothing told the
+        // client's Luau that it had arrived: `Player.Character` was set in the
+        // document by the stream, so no signal fired, `PlayerModule` never
+        // re-bound the controls to the new body, and the `Animate` and `Health`
+        // scripts inside it — both `LocalScript`s, replicated with it — were
+        // never started. That is a joined character that stands in a T-pose and
+        // cannot be walked.
+        if let Some(player) = self
+            .play
+            .as_ref()
+            .filter(|s| s.mode == RunMode::Client)
+            .map(|s| s.player)
+            .filter(|p| !p.is_none() && self.doc.exists(*p))
+        {
+            // The property is the server's (`Live` wrote it); the signal is the
+            // client's, fired with the character the document already has.
+            self.doc.mark_prop(player, ustr("Character"));
+            self.with_live_client(|rt| {
+                // `CharacterAdded`, as the client fires it — the same three
+                // calls Play Solo's own spawn makes on its client side: the
+                // event, the property, and `CharacterAppearanceLoaded` for the
+                // scripts that wait on it (bevelled rigs, clothing).
+                rt.fire(player, "CharacterAdded", vec![rt.inst(character)]);
+                rt.notify_prop(player, "Character");
+                rt.spawn_global(
+                    "__rs_character_appearance_loaded",
+                    vec![rt.inst(player), rt.inst(character)],
+                );
+                // And explicitly, in case the property was already the same ref:
+                // `Animate` and `Health` are `LocalScript`s and they start here.
+                rt.start_scripts_in(character);
+                rt.dispatch();
+            });
         }
         log::info!(
             "Live: character bound: model={character:?} rig={rig_label} humanoid={humanoid:?} \
@@ -4470,8 +4543,21 @@ impl Game {
         let Some(s) = self.play.as_ref() else {
             return (Vec3::ZERO, true);
         };
-        let Some((cd, h)) = s.other_doc.as_ref().zip(s.map.s2c.get(&humanoid).copied()) else {
-            return (Vec3::ZERO, true);
+        // **A live client's Humanoid is in the one document it has.** In Play
+        // Solo the walk goes from the client's Humanoid to the server's through
+        // `s2c`; a joined client *is* the client, `self.doc` is the replicated
+        // place, and `other_doc`/`s2c` are empty by construction — so this
+        // returned `(ZERO, true)` for every joined session and the character
+        // never walked, whatever the stick said. `humanoid` is a ref in
+        // `self.doc` there, which is exactly the one to read.
+        let live = s.mode == RunMode::Client;
+        let (cd, h) = if live {
+            (&self.doc, humanoid)
+        } else {
+            let Some((cd, h)) = s.other_doc.as_ref().zip(s.map.s2c.get(&humanoid).copied()) else {
+                return (Vec3::ZERO, true);
+            };
+            (cd, h)
         };
         let dir = match cd.prop(h, "MoveDirection") {
             Some(Variant::Vector3(v)) => Vec3::new(v.x, v.y, v.z),

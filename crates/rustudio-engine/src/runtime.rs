@@ -7309,6 +7309,30 @@ impl Runtime {
     /// an earlier one can unparent or clone a later one's GUI in between
     /// (Place B' button scripts then ran with script.Parent nil).
     /// One left out stays unstarted, so moving it somewhere it runs starts it.
+    /// Whether this runtime's document has `r`. For a caller replaying
+    /// replication that wrote the document itself: an instance created and then
+    /// destroyed in the same batch has no signals left to fire.
+    pub fn has(&self, r: Ref) -> bool {
+        world(&self.lua).is_ok_and(|w| w.d().exists(r))
+    }
+
+    /// Queues the unstarted `Script`s and `LocalScript`s at and under `r` that
+    /// run here, for the next `dispatch` (`start_if_enabled`'s rule, applied to
+    /// a whole subtree).
+    ///
+    /// **For replication that writes the document directly.** Play Solo's
+    /// replication parents each arriving instance through `set_parent`, which
+    /// queues its scripts as a side effect; a live join's `Live::apply` writes
+    /// the document itself, so a `LocalScript` that arrived with the world — the
+    /// `Animate` and `Health` scripts in a character, a tool's, a `PlayerGui`
+    /// screen's — was never started. This is the missing side effect, without
+    /// the parent write that would undo the replication.
+    pub fn start_scripts_in(&self, r: Ref) {
+        let Ok(mut w) = world(&self.lua) else { return };
+        let refs: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).collect();
+        w.queue_subtree_scripts(&refs);
+    }
+
     pub fn start_collected(&self, r: Ref) {
         if world(&self.lua).is_ok_and(|w| w.runs_here(r)) {
             self.run_script(r);

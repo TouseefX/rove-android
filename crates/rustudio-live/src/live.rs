@@ -85,6 +85,26 @@ pub struct ApplyStats {
     pub kept_client_unreadable: usize,
     /// Wall time this batch took.
     pub duration_ms: f64,
+    /// **What a Runtime has to be told.** `Live` writes the document directly,
+    /// which is what makes a join fast and is also why nothing in it ran: a
+    /// `LocalScript` that arrived after the client's runtime started was never
+    /// started, and no `ChildAdded`, `DescendantAdded` or `AncestryChanged`
+    /// ever fired for the world it was writing. These are the refs, in order,
+    /// for the caller to replay through the client's own runtime.
+    pub changes: Vec<LiveChange>,
+}
+
+/// One thing that happened to the document, in the terms a `Runtime` needs to
+/// fire the right signals. Refs only: what the instance *was* is already gone
+/// or already there by the time a caller gets here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveChange {
+    /// A new instance, under this parent.
+    Created { child: Ref, parent: Ref },
+    /// An instance that already existed moved.
+    Reparented { child: Ref, old: Ref, new: Ref },
+    /// An instance was destroyed (the subtree went with it).
+    Removed { child: Ref, old: Ref },
 }
 
 impl ApplyStats {
@@ -104,6 +124,7 @@ impl ApplyStats {
         self.refused_values += other.refused_values;
         self.kept_client_unreadable += other.kept_client_unreadable;
         self.duration_ms += other.duration_ms;
+        self.changes.extend_from_slice(&other.changes);
     }
 
     /// The one line the harness prints (and `--result` carries).
@@ -459,6 +480,10 @@ impl Live {
                 // which counts instances this client added to its document.
                 doc.replicated_peer.insert(existing, self.peer);
                 stats.services_bound += 1;
+                // (no `Created`: the instance was already in this document, and
+                // a `ChildAdded` for it would be a lie the client's scripts act
+                // on — a second `Players.PlayerAdded` for a service that never
+                // moved.)
                 return;
             }
         }
@@ -485,6 +510,7 @@ impl Live {
         // nothing draws. One mark for one subtree — never `mark_all`, which
         // rebuilds the whole place.
         doc.mark_tree(r);
+        stats.changes.push(LiveChange::Created { child: r, parent: parent_ref });
         if parent_ref != doc.dom.root_ref() {
             stats.parents += 1;
         } else if let Some(parent) = wanted_parent {
@@ -655,6 +681,11 @@ impl Live {
             }
         };
         for d in &doomed {
+            // Its parent while the document still has it: after `destroy` there
+            // is nothing left to ask.
+            if let Some(old) = doc.dom.get_by_ref(*d).map(|i| i.parent()) {
+                stats.changes.push(LiveChange::Removed { child: *d, old });
+            }
             if let Some(id) = self.refs.remove(d) {
                 self.ids.remove(&id);
                 self.waiting_for_parent.remove(&id);
@@ -689,7 +720,15 @@ impl Live {
                     && doc.dom.get_by_ref(r).is_some() =>
             {
                 if r != parent_ref && r != doc.dom.root_ref() {
+                    let old_parent = doc.dom.get_by_ref(r).map(|i| i.parent());
                     doc.dom.transfer_within(r, parent_ref);
+                    if let Some(old) = old_parent {
+                        stats.changes.push(LiveChange::Reparented {
+                            child: r,
+                            old,
+                            new: parent_ref,
+                        });
+                    }
                     // A move changes the tree, not a property: the old parent
                     // has lost a child and the new one has gained one.
                     doc.mark_tree(r);

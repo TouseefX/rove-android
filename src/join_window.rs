@@ -337,14 +337,32 @@ impl Editor {
         let mut live_local = self.join_win.live_local.take().unwrap_or_default();
         let mut converter = std::mem::take(&mut self.join_win.live_converter);
         let mut written = 0usize;
+        // Everything the batch did, for the client's own runtime: `Live` writes
+        // the document directly, and a document a runtime never hears about is
+        // one where a late `LocalScript` never starts and no `ChildAdded` ever
+        // fires.
+        let mut changes: Vec<rustudio_live::live::LiveChange> = Vec::new();
         for batch in batches {
             let stats = live_local.apply(&mut self.game.doc, &batch.actions, &mut converter);
             written += stats.created + stats.properties + stats.removed;
+            changes.extend_from_slice(&stats.changes);
             self.join_win.live = Some(batch.counters);
         }
         self.join_win.live_local = Some(live_local);
         self.join_win.live_converter = converter;
         self.join_win.live_applied += written;
+        // **The client's runtime is told what its document did.** Play Solo's
+        // replication goes through `replicate::apply`, which is a `Runtime` call
+        // and fires every hierarchy signal on the way; a live join wrote the
+        // document behind the runtime's back, so a joined place's own scripts
+        // saw a world that never changed: no `ChildAdded` for the character's
+        // `Animate`/`Health`, none for a tool in the `Backpack`, none for a GUI
+        // in `PlayerGui`, and those scripts (all `LocalScript`s) were never
+        // started either. This is the bridge, and it only runs once a session is
+        // playing — before that there is no client runtime to tell.
+        if !changes.is_empty() && self.game.play.is_some() {
+            crate::live_bridge::replay(&mut self.game, &changes);
+        }
         // The two clocks the settle rule reads (`live_world_settled`): the last
         // burst, and the first one. Counted here rather than in `publish`,
         // because this is the frame the *editor* applied them on — the thing

@@ -791,12 +791,31 @@ impl Game {
         }
     }
 
+    /// The client-side ref for a ref in `self.doc`.
+    ///
+    /// **In a live session they are the same ref.** `RunMode::Client` has one
+    /// DataModel — the replicated place, which *is* the client's — so
+    /// `s.map.s2c` is empty by construction and this answered `None` for every
+    /// instance in a joined game. Everything keyed on it followed: no
+    /// `ClickDetector` fired (`detector_under` → `click_detector_for` →
+    /// `client_of`), no `PlayerAdded`/`Idled`/`CharacterAdded` reached a client
+    /// handler, no tool was equipped. The identity map is the honest answer:
+    /// the instance the client's Luau will see is the one it is already
+    /// holding.
     fn client_of(&self, server: Ref) -> Option<Ref> {
-        self.play.as_ref()?.map.s2c.get(&server).copied()
+        let s = self.play.as_ref()?;
+        if s.mode == RunMode::Client {
+            return self.doc.exists(server).then_some(server);
+        }
+        s.map.s2c.get(&server).copied()
     }
 
     fn server_of(&self, client: Ref) -> Option<Ref> {
-        self.play.as_ref()?.map.c2s.get(&client).copied()
+        let s = self.play.as_ref()?;
+        if s.mode == RunMode::Client {
+            return self.doc.exists(client).then_some(client);
+        }
+        s.map.c2s.get(&client).copied()
     }
 
     fn to_server(&self, side: Side, r: Ref) -> Option<Ref> {
@@ -839,7 +858,13 @@ impl Game {
     /// island): the click and hover fire on the client alone, as in Roblox.
     fn client_click_detector_for(&self, part: Ref, at: Vec3) -> Option<Ref> {
         let s = self.play.as_ref()?;
-        let cd = s.other_doc.as_ref()?;
+        // (a live client's "client document" is the one it draws: `other_doc`
+        // is Play Solo's second copy and is `None` here)
+        let cd = if s.mode == RunMode::Client {
+            &self.doc
+        } else {
+            s.other_doc.as_ref()?
+        };
         let det = click_detector_in(cd, part)?;
         reach_in(cd, det, at, self.character_pos()).then_some(det)
     }
@@ -852,7 +877,11 @@ impl Game {
         // replicated part (a game's lobby tab, its egg targets) exists only
         // there. A replicated detector fires on both sides.
         if side == Side::Client {
-            if let Some(cd) = self.play.as_ref().and_then(|s| s.other_doc.as_ref()) {
+            // A live client's client document is `self.doc` (see `client_of`).
+            let cd = self.play.as_ref().and_then(|s| {
+                if s.mode == RunMode::Client { Some(&self.doc) } else { s.other_doc.as_ref() }
+            });
+            if let Some(cd) = cd {
                 let det = click_detector_in(cd, part)?;
                 if !reach_in(cd, det, at, self.character_pos()) {
                     return None;
@@ -1366,7 +1395,10 @@ impl Game {
         self.unequip_tool();
         self.unequip_client_tool(true);
         let Some(s) = self.play.as_mut() else { return };
-        let Some(cd) = s.other_doc.as_ref() else { return };
+        // A live client's client document is the one it draws (`see
+        // `client_of`); `other_doc` is `None` there.
+        let live = s.mode == RunMode::Client;
+        let cd: &Document = if live { &self.doc } else { s.other_doc.as_ref()? };
         if !cd.class_of(tool).is_some_and(|c| doc::is_a(&c, "BackpackItem")) {
             return;
         }
@@ -1424,7 +1456,13 @@ impl Game {
         let Some(hand) = d.find_named(model, "RightHand").or_else(|| d.find_named(model, "Right Arm")) else { return };
         let Some(hx) = rustudio_render::scene::xform_of(d, hand) else { return };
         let posed = self.client_tool_pose(&[(hand, hx)]);
-        if let Some(cd) = self.play.as_mut().and_then(|s| s.other_doc.as_mut()) {
+        let live = self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.mode == RunMode::Client);
+        if live {
+            rustudio_engine::rig::write_pose(&mut self.doc, &posed, None);
+        } else if let Some(cd) = self.play.as_mut().and_then(|s| s.other_doc.as_mut()) {
             rustudio_engine::rig::write_pose(cd, &posed, None);
         }
     }
@@ -1435,7 +1473,11 @@ impl Game {
     /// ropes. Parts no longer in the tool are let go.
     fn follow_client_tool_welds(&mut self) {
         let Some(s) = self.play.as_mut() else { return };
-        let (Some(e), Some(cd)) = (s.game.client_tool.as_mut(), s.other_doc.as_ref()) else { return };
+        let live = s.mode == RunMode::Client;
+        let (Some(e), cd) = (
+            s.game.client_tool.as_mut(),
+            if live { Some(&self.doc) } else { s.other_doc.as_ref() },
+        ) else { return };
         let Some(handle) = tool_handle(cd, e.tool) else { return };
         let Some(hx) = rustudio_render::scene::xform_of(cd, handle) else { return };
         let mut edges: Vec<(Ref, Ref)> = Vec::new();
@@ -1493,8 +1535,16 @@ impl Game {
     pub(super) fn check_client_tool(&mut self) {
         let Some(s) = self.play.as_ref() else { return };
         let Some(e) = s.game.client_tool.as_ref() else { return };
-        let model = s.character.as_ref().filter(|c| !c.dead).and_then(|c| s.map.s2c.get(&c.model).copied());
-        let held = s.other_doc.as_ref().is_some_and(|cd| model.is_some_and(|m| cd.dom.get_by_ref(e.tool).map(|i| i.parent()) == Some(m)));
+        // A live client's character model is its own ref (`s2c` is empty), and
+        // the tool is in the one document.
+        let live = s.mode == RunMode::Client;
+        let model = if live {
+            s.character.as_ref().filter(|c| !c.dead).map(|c| c.model)
+        } else {
+            s.character.as_ref().filter(|c| !c.dead).and_then(|c| s.map.s2c.get(&c.model).copied())
+        };
+        let cd = if live { Some(&self.doc) } else { s.other_doc.as_ref() };
+        let held = cd.is_some_and(|cd| model.is_some_and(|m| cd.dom.get_by_ref(e.tool).map(|i| i.parent()) == Some(m)));
         if !held {
             self.unequip_client_tool(false);
         } else {
@@ -1505,7 +1555,8 @@ impl Game {
     /// The client-only Tool's parts (client refs) for this frame's body pose.
     pub(super) fn client_tool_pose(&self, pose: &[(Ref, Xform)]) -> Vec<(Ref, Xform)> {
         let Some(s) = self.play.as_ref() else { return Vec::new() };
-        let (Some(e), Some(cd)) = (s.game.client_tool.as_ref(), s.other_doc.as_ref()) else { return Vec::new() };
+        let cd = if s.mode == RunMode::Client { Some(&self.doc) } else { s.other_doc.as_ref() };
+        let (Some(e), Some(cd)) = (s.game.client_tool.as_ref(), cd) else { return Vec::new() };
         let grip = match cd.prop(e.tool, "Grip") {
             Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf),
             _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },

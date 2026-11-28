@@ -414,8 +414,17 @@ impl Gui {
             if let Some((g, p)) = listed {
                 self.memo_up(d, p, g);
             }
-            let hit = read.map(|x| x.0).or(listed.map(|x| x.0));
-            if let Some(g) = hit {
+            // **Both roots, when they differ.** An instance read in one
+            // `ScreenGui` and listed by another (reparented between two of a
+            // player's screens — a hotbar slot moving into an inventory frame,
+            // which is exactly what a live join replicates) touched two cached
+            // roots. `or` took the first and left the second's cache holding the
+            // old parent's layout, so the instance drew in its old place until
+            // something else invalidated that root.
+            let mut hit = [read.map(|x| x.0), listed.map(|x| x.0)];
+            hit.sort_unstable();
+            hit.dedup();
+            for g in hit.into_iter().flatten() {
                 if self.cache.remove(&g).is_some() && why_on {
                     let what = match *m {
                         doc::Mark::Prop(_, n) => n.to_string(),

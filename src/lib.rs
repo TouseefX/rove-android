@@ -39,6 +39,7 @@ pub mod join_ui;
 // rustudio_join::join, behind the feature the Android build turns on.
 #[cfg(feature = "live")]
 pub mod join_window;
+pub mod live_bridge;
 pub mod app;
 #[cfg(not(target_os = "android"))]
 mod native_loop;
