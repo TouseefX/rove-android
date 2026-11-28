@@ -2934,13 +2934,23 @@ impl RustudioApp {
         // screen visibly resized under the person watching it. Using the game's
         // scale here for the whole join means entering Play never changes
         // `ctx.zoom_factor()`.
-        let game_scale = ed.ui.play_full
-            && (ed.join_win.cover_until_played
-                || ed
+        //
+        // `join_win` is only in a build with the transport (`#[cfg(feature =
+        // "live")]`), so the editor's half of the condition is behind the same
+        // flag; without it a join cannot be in flight at all.
+        #[cfg(feature = "live")]
+        let joining = ed.ui.play_full && ed.join_win.cover_until_played;
+        #[cfg(not(feature = "live"))]
+        let joining = false;
+        let game_scale = joining
+            || ed
+                .ui
+                .play_full
+                && ed
                     .game
                     .play
                     .as_ref()
-                    .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client));
+                    .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client);
         let wanted = if game_scale { 1.0 } else { ed.ui.zoom };
         if (ctx.zoom_factor() - wanted).abs() > 1e-3 {
             ctx.set_zoom_factor(wanted);

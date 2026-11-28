@@ -519,43 +519,56 @@ mod tests {
     /// settings object is `"GlobalBasicSettings"` (the check is a byte sum of
     /// 1924, which is that spelling) and `typeof` of an instance is
     /// `"Instance"`. A table fails both, which is why they are userdata.
+    ///
+    /// Evaluated one expression at a time on purpose: a multi-value return in a
+    /// generated environment is exactly the kind of thing that fails for a
+    /// reason unrelated to what is being asserted, and a test that says "the
+    /// program's own checks run" should fail only about the checks.
     #[test]
     fn the_environment_is_shaped_like_a_client() {
         let lua = mlua::Lua::new();
         let env = challenge_environment(&lua, "00000000-0000-4000-8000-000000000001")
             .expect("the environment builds");
-        lua.globals().set("__env", env).unwrap();
-        let answer: (String, String, String, bool, bool, bool) = lua
-            .load(
-                r#"
-                local env = __env
-                return tostring(env.UserSettings()),
-                    typeof(env.UserSettings()),
-                    typeof(env.game),
-                    env.game:GetService("RunService"):IsStudio(),
-                    env.game:GetService("RunService"):IsClient(),
-                    env.UserSettings():GetService("UserGameSettings") ~= nil
-                "#,
-            )
-            .set_environment(lua.globals().get::<mlua::Table>("__env").unwrap())
-            .eval()
-            .expect("the program's own checks run");
-        assert_eq!(answer.0, "GlobalBasicSettings");
-        assert_eq!(answer.1, "Instance");
-        assert_eq!(answer.2, "Instance");
-        assert!(!answer.3, "a client is not Studio");
-        assert!(answer.4, "a client is the client");
-        assert!(answer.5, "its settings service exists");
-        // And the byte sum the bytecode actually compares: 1924.
-        let sum: i64 = answer.0.bytes().map(|b| i64::from(b)).sum();
+        let eval = |source: &str| -> mlua::Value {
+            lua.load(source)
+                .set_environment(env.clone())
+                .eval()
+                .unwrap_or_else(|error| panic!("{source} — {error}"))
+        };
+        let text = |source: &str| -> String {
+            let value = eval(source);
+            assert!(
+                matches!(value, mlua::Value::String(_)),
+                "{source} should be a string, got {}",
+                value.type_name()
+            );
+            String::from_utf8_lossy(value.to_string().unwrap().as_bytes()).into_owned()
+        };
+        let flag = |source: &str| -> bool {
+            let value = eval(source);
+            assert!(
+                matches!(value, mlua::Value::Boolean(_)),
+                "{source} should be a boolean, got {}",
+                value.type_name()
+            );
+            value.as_boolean().unwrap_or(false)
+        };
+
+        let settings = text("return tostring(UserSettings())");
+        assert_eq!(settings, "GlobalBasicSettings");
+        let sum: i64 = settings.bytes().map(i64::from).sum();
         assert_eq!(sum, 1924, "the bytecode's own check");
+        assert_eq!(text("return typeof(UserSettings())"), "Instance");
+        assert_eq!(text("return typeof(game)"), "Instance");
+        assert_eq!(text("return typeof(game:GetService('RunService'))"), "Instance");
+        assert!(!flag("return game:GetService('RunService'):IsStudio()"));
+        assert!(flag("return game:GetService('RunService'):IsClient()"));
+        assert!(!flag("return game:GetService('RunService'):IsServer()"));
+        assert!(flag("return game:GetService('RunService'):IsRunning()"));
+        assert!(flag("return UserSettings():GetService('UserGameSettings') ~= nil"));
+        assert!(!flag("return UserSettings():IsUserFeatureEnabled('Anything')"));
         // The job id is the session's, which is what `game.JobId` is for.
-        let job: String = lua
-            .load("return __env.game.JobId")
-            .set_environment(lua.globals().get::<mlua::Table>("__env").unwrap())
-            .eval()
-            .expect("a field read");
-        assert_eq!(job, "00000000-0000-4000-8000-000000000001");
+        assert_eq!(text("return game.JobId"), "00000000-0000-4000-8000-000000000001");
     }
 
     /// `Random` is PCG32 with increment 105, and the sequence is part of the
