@@ -885,7 +885,10 @@ impl Session {
     /// character's region does not lapse and stop streaming.
     ///
     /// Returns whether a packet was queued (the caller flushes).
-    #[cfg(feature = "transport")]
+    ///
+    /// Not behind `transport`: nothing here touches a socket. Its one caller
+    /// sits in the receive loop, and the rule it holds — *no region, no focus* —
+    /// is exactly the kind of thing that has to be checkable without one.
     pub fn refocus(&mut self, from_editor: Option<[f32; 3]>) -> bool {
         // Where the view is, if the editor has said: the camera moves with the
         // character, so this is the region the player is actually in. Before the
@@ -1908,6 +1911,7 @@ impl Session {
     /// Everything here is a counter or a map length — no document reads, no
     /// allocation beyond the line itself — because it runs on the session's own
     /// loop and the loop is the thing being measured.
+    #[cfg(feature = "transport")]
     fn report_stall(&mut self, silent_for: std::time::Duration, ticks: u64) {
         self.stalls_reported += 1;
         let (frames, ack_packets, ack_pending) = self.property_ack_counts();
