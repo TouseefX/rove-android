@@ -9054,7 +9054,9 @@ mod tests {
     #[test]
     fn stuck_loading_fallback_hides_only_default_loading_gui() {
         let mut doc = Document::new_place();
-        let core_gui = doc.find_child(doc.dom.root_ref(), "CoreGui").unwrap();
+        // new_place does not preinstall CoreGui; the live player normally does.
+        let root = doc.dom.root_ref();
+        let core_gui = doc.dom.insert(root, InstanceBuilder::new("CoreGui"));
         let loading = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
             .with_name("RobloxLoadingGui").with_property("Enabled", true));
         let other = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
