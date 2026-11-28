@@ -94,6 +94,15 @@ pub struct Counters {
     pub replies_sent: usize,
     pub replies_failed: usize,
     pub seconds: u64,
+    /// **This client's own network scope** — rove's `self.core.scope()`.
+    ///
+    /// The one id `NetworkOwnerV3` uses to say "this assembly is yours": the
+    /// server writes the owner's session scope, and a client that compares
+    /// against `1` (the server's) or against a `Player.NetworkId` it guessed at
+    /// would conclude it owns nothing and simulate nothing. Zero until the
+    /// globals have arrived, which is also the honest answer — before them there
+    /// is no scope, so no grant can be recognised.
+    pub self_peer: u64,
 }
 
 impl Counters {
@@ -163,6 +172,13 @@ pub const BATCH_BACKLOG: usize = 64;
 impl LiveWorld {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This client's own session scope (`Counters::self_peer`), published with
+    /// every batch: the document needs it to tell a `NetworkOwnerV3` that names
+    /// *us* from one that names the server or another player.
+    pub fn self_peer(&self) -> Option<u64> {
+        Some(self.counters().self_peer).filter(|v| *v != 0)
     }
 
     /// Publish a batch of actions for the editor to apply.

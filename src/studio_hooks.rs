@@ -115,6 +115,17 @@ impl Editor {
         // (View > Play Fills the Screen: every Play starts over the window;
         // the Studio button's exit lasted the last one)
         self.play_full_exit = false;
+        // **A joined game draws its own CoreGui.** A Roblox client's top bar,
+        // chat button, Esc menu, player list and backpack are `CoreGui`, and the
+        // view only draws `CoreGui` while `show_core_gui` is on — a saved layout
+        // with Show Core UI off, or a `--no-ui`-ish harness flag, would hand a
+        // join the 3D view alone. Set for the session, restored when it ends
+        // (nothing else in an editor run should be re-enabled by side effect).
+        if mode == RunMode::Client && !self.game.show_core_gui {
+            self.join_win.core_gui_was = Some(self.game.show_core_gui);
+            self.ui.show_core_gui = true;
+            self.game.show_core_gui = true;
+        }
         // (a teleport's new session keeps the Output, as Studio's does)
         let teleport = self.game.teleport_to.as_ref().map(|t| t.place_id);
         let clear_output = teleport.is_none()
@@ -194,10 +205,20 @@ impl Editor {
     }
 
     pub fn stop_play(&mut self) {
+        let was_live = self
+            .game
+            .play
+            .as_ref()
+            .is_some_and(|p| p.mode == RunMode::Client);
         self.with_game_host(|game, host| game.stop_play(host));
         self.plugins.stop_edit_audio_vm_state();
         self.finish_stopped_plugin_playtest();
         self.restore_place_context();
+        // A join turned Show Core UI on for the session (`start_play`): the
+        // editor's own setting comes back with the editor.
+        if was_live {
+            self.restore_core_gui();
+        }
     }
 
     /// After a teleported session: asset delivery answers for the open place again.

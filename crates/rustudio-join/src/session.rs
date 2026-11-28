@@ -828,6 +828,13 @@ impl Session {
             // forty seconds — the one number a person uses to tell "still
             // joining" from "stuck" was the one number that never moved.
             seconds: self.started.elapsed().as_secs(),
+            // `self.core.scope()` **is this client's peer id** — rove's own
+            // `Globals.scope`, committed from the globals packet, and the word
+            // the server writes into `NetworkOwnerV3` when it hands an assembly
+            // to this client (`GetNetworkOwner` returns this player because of
+            // it). Without it the client cannot recognise its own ownership and
+            // simulates nothing, which is a game where nothing moves.
+            self_peer: self.core.scope().unwrap_or(0),
         }
     }
 

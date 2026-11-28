@@ -120,6 +120,10 @@ pub struct JoinWindow {
     /// says the two documents are in step, and that a session is *drawing*
     /// rather than merely receiving.
     pub live_applied: usize,
+    /// The editor's own "Show Core UI" setting when a join turned it on, so it
+    /// comes back afterwards (a Roblox client always draws CoreGui, but the
+    /// editor's own setting is the person's). `None` = the join left it alone.
+    pub core_gui_was: Option<bool>,
     /// A world was installed and the session it came from should be *played*:
     /// F5 is pressed on the tick after `set_document`, because Play reads the
     /// document and the join window must not hold the editor mutably while it
@@ -154,6 +158,7 @@ impl JoinWindow {
             live_local: None,
             live_converter: Default::default(),
             live_applied: 0,
+            core_gui_was: None,
             play_next_tick: false,
         }
     }
@@ -194,6 +199,21 @@ impl Editor {
         else {
             return;
         };
+        // **Whose simulation is whose.** The join's own session scope — rove's
+        // `self.core.scope()`, published with every batch — is the id the server
+        // writes into a part's `NetworkOwnerV3` when it hands that assembly to
+        // this client. The physics reads it from the document, so it is taken
+        // here, before the world: a document with the peer and no world, or the
+        // world and no peer, cannot answer "do I simulate this?" in either
+        // direction.
+        let self_peer = live.self_peer();
+        let staged = match (self_peer, self.game.doc.self_peer) {
+            (Some(peer), seen) if seen != Some(peer) => Some(peer),
+            _ => None,
+        };
+        if let Some(peer) = staged {
+            self.game.doc.self_peer = Some(peer);
+        }
         // Nothing waiting: the common case, and the reason this is cheap enough
         // to ask every frame.
         if live.pending() == 0 {
@@ -681,6 +701,17 @@ impl Editor {
         workspace && me.is_some() && (character || !auto || stalled)
     }
 
+    /// Put the editor's own Show Core UI setting back after a join turned it on
+    /// (`start_play` for `RunMode::Client`), once per session.
+    pub fn restore_core_gui(&mut self) {
+        // (`Some(false)`: the join turned it on over a saved "off"; `Some(true)`
+        // is what a person already had, and restoring is a no-op then.)
+        if let Some(was) = self.join_win.core_gui_was.take() {
+            self.ui.show_core_gui = was;
+            self.game.show_core_gui = was;
+        }
+    }
+
     /// Give up on a join: drop the session and put the editor back.
     ///
     /// A join the person cancelled must leave nothing half-made — no cover, no
@@ -696,6 +727,7 @@ impl Editor {
         if self.game.play.is_some() {
             self.request_stop();
         }
+        self.restore_core_gui();
         self.info("join: cancelled");
     }
 

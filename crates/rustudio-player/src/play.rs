@@ -416,6 +416,25 @@ pub struct PlaySession {
     pub(super) presentation: Option<crate::play_worker::PlayView>,
     /// The DataModel not shown in the editor right now.
     other_doc: Option<Document>,
+    /// A live client's CoreScripts, waiting for `Players.LocalPlayer`.
+    ///
+    /// The join starts Play before the server's `Player` has arrived (the phone
+    /// log: `start_play` at 62 instances, our `Player` some packets later), so
+    /// the one moment `setup_live_client_player` used to run had no LocalPlayer
+    /// to bind to — it said so and **dropped the CoreScripts it had been given**,
+    /// and nothing ever ran them. They are kept here and started by the first
+    /// frame that finds the Player.
+    live_core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
+    /// `Players.LocalPlayer` was named and its client half started (`live_bound`).
+    live_bound: bool,
+    /// The "our Player is not in the world yet" line was printed once.
+    live_wait_logged: bool,
+    /// Seconds since `Players.LocalPlayer` bound, so the ownership line (and
+    /// its counts) can be printed again once the character has arrived: the
+    /// answer at bind time is the answer before the server granted anything.
+    live_ownership_at: Option<f64>,
+    /// The line printed that many seconds in (once, then never again).
+    live_ownership_logged: bool,
     /// Which DataModel the editor shows (Explorer, Properties, viewport).
     pub showing: Side,
     pub map: RepMap,
@@ -511,6 +530,11 @@ impl PlaySession {
             client: None,
             presentation: None,
             other_doc: None,
+            live_core: None,
+            live_bound: false,
+            live_wait_logged: false,
+            live_ownership_at: None,
+            live_ownership_logged: false,
             showing: Side::Server,
             map: Default::default(),
             physics: PlayPhysics(None),
@@ -795,13 +819,40 @@ impl Game {
                 (r, out)
             }
             Side::Client => {
+                // **A live client has one DataModel, and the client runtime owns
+                // it.** Play Solo keeps the server in `self.doc` and the client
+                // in `other_doc`; `RunMode::Client` has no local server, so the
+                // replicated place is the document the client's Luau reads, and
+                // there is no second document to lend or to hand back. Until
+                // this, every `with_side(Side::Client, ..)` on a join returned
+                // `None` on `other_doc.take()?` — no CoreScripts, no
+                // PlayerModule, no LocalScripts, no RenderStepped: the join drew
+                // a world and ran nothing. That is the logcat: `CoreGui 2239`,
+                // `Players 546`, and never once a `LocalPlayer =`.
+                let live = s.mode == RunMode::Client;
                 let c = s.client.as_mut()?;
                 let mut w = c.world.take()?;
-                w.doc = Some(s.other_doc.take()?);
+                if live {
+                    // (Lent out exactly as the server side lends the edit
+                    // document, and given straight back below.)
+                    w.doc = Some(std::mem::replace(&mut self.doc, Document::placeholder()));
+                } else {
+                    w.doc = Some(s.other_doc.take()?);
+                }
                 c.runtime.enter(w);
-                let r = f(&c.runtime, Some(&self.doc), &mut s.map);
+                let r = if live {
+                    // Nothing else: a live client's "other side" is a machine
+                    // somewhere else, not a document in this process.
+                    f(&c.runtime, None, &mut s.map)
+                } else {
+                    f(&c.runtime, Some(&self.doc), &mut s.map)
+                };
                 let mut w = c.runtime.leave();
-                s.other_doc = w.doc.take();
+                if live {
+                    self.doc = w.doc.take().expect("the live client's document returned");
+                } else {
+                    s.other_doc = w.doc.take();
+                }
                 let out = std::mem::take(&mut w.output);
                 c.world = Some(w);
                 (r, out)
@@ -1235,6 +1286,19 @@ impl Game {
             w.avatar = self.account.avatar().cloned();
         }
         physics.groups = groups;
+        if network_client {
+            // **A live client runs the physics it owns, and only that.** Never
+            // "nothing" and never "everything": Roblox's network ownership says
+            // the server simulates the place and replicates poses, the client
+            // simulates what the server handed it — its character, an assembly
+            // granted with `SetNetworkOwner(player)` — plus any part its own
+            // scripts made, which no one else has. Everything else (a
+            // server-owned root, or one owned by another player) arrives as
+            // replication and is only drawn. Skipping *all* of it froze the
+            // client's own parts; simulating all of it made the server's map
+            // fall out from under itself and `unparent_fallen_parts` delete it.
+            physics.drive_by_ownership(&mut self.doc);
+        }
         self.play = Some(PlaySession {
             _scripts_running: Some(scripts_running),
             server,
@@ -1242,6 +1306,8 @@ impl Game {
             // Play Solo's client document is the second side's; a live client
             // has one document and it is `self.doc`.
             other_doc: client_doc,
+            live_core: None,
+            live_bound: false,
             map,
             physics: PlayPhysics(Some(Box::new(physics))),
             gamepads: if two { crate::gamepad::Gamepads::new() } else { Default::default() },
@@ -1390,6 +1456,16 @@ impl Game {
             // character: the character is the server's, and it arrives through
             // the deltas like everything else.
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
+            // Kept on the session whether or not the Player has arrived: the
+            // join's own Player is later than Play (the log: `start_play` at 62
+            // instances, `Players 546` twenty seconds on), and CoreScripts
+            // handed to a `setup_live_client_player` that could not bind were
+            // dropped on the floor — the reason a joined game never started
+            // Roblox's own PlayerModule. `live_client_tick` starts them on the
+            // first frame that has a LocalPlayer.
+            if let Some(s) = self.play.as_mut() {
+                s.live_core = core_scripts.take();
+            }
             self.setup_live_client_player(core_scripts.take());
             rustudio_core::load_trace::mark("play: live client player set up");
             if self.play_shows_client {
@@ -1967,9 +2043,133 @@ impl Game {
             p.character = Some(ch);
             p.initial_spawn_frames = None;
         }
+        // **Workspace.CurrentCamera, Custom, subject = the Humanoid.** The
+        // camera the frame is drawn through is read from
+        // `Workspace.CurrentCamera` (step 7 of the tick), and a joined place's
+        // replicated `Workspace` often has none — Roblox's own client makes one
+        // when the character arrives. Without this the view stayed on whatever
+        // the editor's camera was, which over a streamed place is a camera
+        // floating far from the spawn: the report of "lighting and a few moving
+        // parts, no map" is exactly a view standing where the character is not.
+        let camera = {
+            let doc = &mut self.doc;
+            let ws = doc.workspace();
+            let cam = ws.map(|ws| {
+                let existing = match doc.prop(ws, "CurrentCamera") {
+                    Some(Variant::Ref(c)) if doc.exists(c) => Some(c),
+                    _ => None,
+                };
+                existing.or_else(|| {
+                    let c = doc.dom.insert(
+                        ws,
+                        InstanceBuilder::new("Camera")
+                            .with_name("Camera")
+                            .with_property("FieldOfView", mech::FOV_DEG),
+                    );
+                    if let Some(i) = doc.dom.get_by_ref_mut(ws) {
+                        i.properties.insert(ustr("CurrentCamera"), Variant::Ref(c));
+                    }
+                    doc.mark_prop(ws, ustr("CurrentCamera"));
+                    Some(c)
+                })
+            });
+            if let Some(cam) = cam {
+                if let Some(i) = doc.dom.get_by_ref_mut(cam) {
+                    i.properties.insert(
+                        ustr("CameraType"),
+                        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(mech::CAMERA_TYPE_CUSTOM)),
+                    );
+                    i.properties.insert(ustr("CameraSubject"), Variant::Ref(humanoid));
+                }
+                doc.mark_prop(cam, ustr("CameraType"));
+                doc.mark_prop(cam, ustr("CameraSubject"));
+                // Where the character stands, so the frame before the
+                // PlayerModule's first RenderStepped is already looking at it
+                // rather than at the last place the editor camera was.
+                let look = rustudio_render::scene::xform_of(doc, cam).map(|xf| xf.pos);
+                Some(look.unwrap_or(start))
+            } else {
+                Some(start)
+            }
+        };
+        if let Some(pos) = camera {
+            self.cam.pos = pos;
+            self.cam.focus = pos;
+        }
         self.info(format!(
-            "Live: bound to the server's character ({rig_label}); the camera follows it",
+            "Live: bound to the server's character ({rig_label}); Workspace.CurrentCamera is Custom on its Humanoid",
         ));
+    }
+
+    /// How many of the place's parts this client simulates and how many are the
+    /// server's to move, by [`rustudio_core::doc::Owner::owns`].
+    ///
+    /// One walk of Workspace's parts, asked for twice a session: when
+    /// `Players.LocalPlayer` binds (the log line the join is read by) and once
+    /// more a second later, after the server has handed over the character.
+    fn ownership_counts(&self) -> (usize, usize) {
+        let mut ours = 0usize;
+        let mut theirs = 0usize;
+        let Some(owner) = self.doc.owner() else {
+            return (ours, theirs);
+        };
+        let Some(ws) = self.doc.workspace() else {
+            return (ours, theirs);
+        };
+        for i in self.doc.dom.descendants_of(ws) {
+            if !doc::is_a(&i.class, "BasePart") || i.class == "Terrain" {
+                continue;
+            }
+            let r = i.referent();
+            let root = match self.doc.prop(r, "AssemblyRootPart") {
+                Some(Variant::Ref(root)) if !root.is_none() && self.doc.exists(root) => root,
+                _ => r,
+            };
+            if owner.owns(&self.doc, r, root) {
+                ours += 1;
+            } else {
+                theirs += 1;
+            }
+        }
+        (ours, theirs)
+    }
+
+    /// Whether this joined client's character is its to simulate, by network
+    /// ownership (`Document::owner`, rule 3): `Humanoid.RootPart` — or the rig's
+    /// `HumanoidRootPart` / `Torso` when the Humanoid has not replicated its
+    /// `RootPart` property yet — has a `NetworkOwnerV3` that names us.
+    ///
+    /// `true` on anything that is not a joined client (Play Solo's character is
+    /// the local machine's by construction) and `true` for a character whose
+    /// ownership has not arrived yet, because the alternative is a client that
+    /// stands still for the first frames of every spawn: an absent
+    /// `NetworkOwnerV3` is not a *server* grant, and the client asked for this
+    /// character.
+    fn live_character_owned(&self) -> bool {
+        let Some(s) = self.play.as_ref() else { return true };
+        if s.mode != RunMode::Client {
+            return true;
+        }
+        let Some(owner) = self.doc.owner() else { return true };
+        let Some(ch) = s.character.as_ref() else { return true };
+        let root = self
+            .doc
+            .prop(ch.humanoid, "RootPart")
+            .and_then(|v| match v {
+                Variant::Ref(r) if !r.is_none() && self.doc.exists(r) => Some(r),
+                _ => None,
+            })
+            .or_else(|| self.doc.find_named(ch.model, "HumanoidRootPart"))
+            .or_else(|| self.doc.find_named(ch.model, "Torso"))
+            .unwrap_or(ch.rig.root);
+        match self.doc.prop(root, "NetworkOwnerV3") {
+            // Not arrived: the client's own character, until the server says
+            // otherwise (`SetNetworkOwner(nil)` on a character is rare and
+            // always arrives with the character's first delta).
+            None => true,
+            Some(v) => rustudio_core::doc::peer_of(Some(v)) == owner.self_peer
+                || rustudio_core::doc::peer_of(Some(v)).is_none(),
+        }
     }
 
     /// The client half of a **live** session, on the replicated document.
@@ -1989,13 +2189,31 @@ impl Game {
     /// `CurrentCamera` set to Custom, and collect the LocalScripts to start.
     /// The character is not made here — the server replicates it, and
     /// `bind_live_character` picks it up when it arrives.
-    fn setup_live_client_player(
-        &mut self,
-        mut core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
-    ) {
+    ///
+    /// **Called every frame** (`live_client_tick`) until it succeeds, not once
+    /// at Play: a join's own `Player` is a packet that arrives *after* the
+    /// join's world, and the single call at `start_play` found `Players` with
+    /// no Player in it, said "our Player is not in the world yet", and returned
+    /// — leaving the session with no `LocalPlayer`, no `PlayerScripts`, no
+    /// CoreScripts and no LocalScripts for the rest of its life. The phone's
+    /// log had `Players 546` in it and never one `Players.LocalPlayer = …`.
+    fn setup_live_client_player(&mut self, core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>) {
+        // (the CoreScripts come from the session unless this call brought them)
+        let mut core = core;
+        // Said once per session, not once a frame: this runs every frame until
+        // the server's Player arrives.
+        let mut live_wait_logged = self.play.as_ref().is_some_and(|s| s.live_wait_logged);
+        if let Some(s) = self.play.as_mut() {
+            s.live_wait_logged = true;
+        }
         // Asked and answered in one statement, so no borrow of `self` survives
-        // into the work below (which needs `&mut self` throughout).
-        if !self.play.as_ref().is_some_and(|s| s.server.is_none()) {
+        // into the work below (which needs `&mut self` throughout). Only a live
+        // session (no server) does this, and only until it has succeeded.
+        if !self
+            .play
+            .as_ref()
+            .is_some_and(|s| s.server.is_none() && !s.live_bound)
+        {
             return;
         }
         // Everything that reads or writes the document happens in this block,
@@ -2156,10 +2374,33 @@ impl Game {
         (Some(player), name, local, has_scripts_now)
         };
         if no_player_yet {
-            self.info(
-                "Live: our Player (by UserId) is not in the world yet; \
-                 LocalPlayer binds when it arrives",
-            );
+            // Said once, not once a frame, and with the count that says what is
+            // missing: `Players` with no Player in it yet, or a Player whose
+            // UserId is not ours.
+            let (players, count) = {
+                let doc = &self.doc;
+                let players = doc.find_child(doc.dom.root_ref(), "Players");
+                let count = players
+                    .and_then(|p| doc.dom.get_by_ref(p))
+                    .map(|i| {
+                        i.children()
+                            .iter()
+                            .filter(|c| doc.class_of(**c).is_some_and(|k| k == "Player"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                (players.is_some(), count)
+            };
+            if !live_wait_logged {
+                self.info(format!(
+                    "Live: our Player (by UserId {:?}) is not in the world yet ({} Player(s) there{}); \
+                     LocalPlayer binds when it arrives",
+                    uid,
+                    count,
+                    if players { "" } else { ", no Players service" }
+                ));
+                live_wait_logged = true;
+            }
             return;
         }
         self.sync_view_size();
@@ -2172,8 +2413,19 @@ impl Game {
             }
             rt.dispatch();
         });
+        // Whose simulation is whose, said out loud with the count that decides
+        // it: everything the server owns is drawn from replication, and the
+        // parts listed as ours are the ones this client actually moves.
+        //
+        // The answer changes over the next second — the server hands a player
+        // its character's assembly, and characters stream in part by part — so
+        // the same line is repeated once more after a second with a "now"
+        // prefix. One line at bind time is what the last round logged, and it
+        // said nothing about whether anything was ours.
+        let (ours, theirs) = self.ownership_counts();
         self.info(format!(
-            "Live: Players.LocalPlayer = {name} (UserId {}), {started} client script(s) started{}",
+            "Live: Players.LocalPlayer = {name} (UserId {}), {started} client script(s) started{}; \
+             physics by network ownership: {ours} part(s) simulated here, {theirs} the server's (replicated)",
             uid.unwrap_or(0),
             if has_scripts_now {
                 ""
@@ -2181,15 +2433,52 @@ impl Game {
                 " (PlayerScripts was not in the world yet)"
             }
         ));
+        if let Some(s) = self.play.as_mut() {
+            s.live_bound = true;
+            // (the clock starts here: the ownership re-print is due a second
+            // later, when the server has had time to hand the character over)
+            s.live_ownership_at.get_or_insert(s.time);
+        }
         // CoreScripts, if the patch gave any: a joined place needs the player
-        // module, which is what binds the camera to the character.
-        if let Some(Ok((installed, _line))) = core.take() {
+        // module, which is what binds the camera to the character. The
+        // `OnServerInvoke` answers come first, because `SettingsHub` asks
+        // `RobloxReplicatedStorage.GetServerVersion` while the CoreScripts
+        // start and a `RemoteFunction` with no handler on either side raises
+        // inside Roblox's own settings module (setup_client_player does the
+        // same before its `start_core_scripts`; a live client has no server
+        // script to answer, so the stub runs on the client's identity).
+        let core = self
+            .play
+            .as_mut()
+            .and_then(|s| s.live_core.take())
+            .or(core.take().map(|c| c));
+        if let Some(Ok((installed, note))) = core {
+            self.info(note);
+            let _ = self.run_luau_as(
+                Side::Client,
+                r#"
+                    local rrs = game:GetService("RobloxReplicatedStorage")
+                    local gv = rrs:FindFirstChild("GetServerVersion")
+                    if gv then gv.OnServerInvoke = function() return "0.748.0.7481526" end end
+                    local gc = rrs:FindFirstChild("GetServerChannel")
+                    if gc then gc.OnServerInvoke = function() return "LIVE" end end
+                "#,
+                rustudio_engine::runtime::security::CORE,
+            );
             let started = self
-                .with_side(Side::Client, |rt, _, _| rt.start_core_scripts(installed))
-                .is_some_and(|result| result.is_ok());
-            if let Some(s) = self.play.as_mut() {
-                s.game.core_scripts_active = started;
+                .with_side(Side::Client, |rt, _, _| rt.start_core_scripts(installed));
+            match started {
+                Some(Ok(())) => {
+                    if let Some(s) = self.play.as_mut() {
+                        s.game.core_scripts_active = true;
+                    }
+                    self.info("Live: CoreScripts started on the client (PlayerModule, TopBar, chat, settings)");
+                }
+                Some(Err(e)) => self.error(format!("Live: CoreScripts: {e}")),
+                None => self.warn("Live: CoreScripts could not be started (no client runtime)"),
             }
+        } else if let Some(Err(e)) = core {
+            self.error(format!("Live: CoreScripts: {e}"));
         }
     }
 
@@ -2448,6 +2737,13 @@ impl Game {
     /// replicated PlayerGui during local Play.
     fn fire_server_gui_buttons(&mut self, buttons: Vec<GuiEvent>) {
         if buttons.is_empty() {
+            return;
+        }
+        // A joined game's buttons *are* the server's (one document, one set of
+        // instances) and the click already went to the GUI on the client side,
+        // which is where the place's LocalScripts and the CoreGui listen. There
+        // is no second DataModel here to fire a copy on.
+        if self.play.as_ref().is_some_and(|s| s.mode == RunMode::Client) {
             return;
         }
         let Some(gui) = self.play.as_ref()
@@ -3723,6 +4019,56 @@ impl Game {
     /// MouseIconEnabled (the view grabs the cursor) and UserGameSettings.RotationType.
     fn read_client_input_state(&mut self) {
         let Some(s) = self.play.as_mut() else { return };
+        // A live client's DataModel is `self.doc` (`RunMode::Client`), not Play
+        // Solo's `other_doc` — reading `other_doc` there read nothing, so
+        // MouseBehavior, the cursor and the rotation type a joined place's own
+        // scripts set were all ignored.
+        if s.mode == RunMode::Client {
+            // (the same two things, off the replicated document)
+            let doc = &self.doc;
+            if let Some(u) = doc.find_child(doc.dom.root_ref(), "UserInputService") {
+                let inst = doc.dom.get_by_ref(u);
+                s.mouse_behavior = match inst.and_then(|i| i.properties.get(&ustr("MouseBehavior"))) {
+                    Some(Variant::Enum(e)) => e.to_u32(),
+                    _ => 0,
+                };
+                s.mouse_icon = !matches!(
+                    inst.and_then(|i| i.properties.get(&ustr("MouseIconEnabled"))),
+                    Some(Variant::Bool(false))
+                );
+            }
+            let content = |r: Ref, name: &str| match doc.prop(r, name) {
+                Some(Variant::String(t)) => Some(t),
+                Some(Variant::ContentId(c)) => Some(c.as_str().to_string()),
+                Some(Variant::Content(c)) => c.as_uri().map(|u| u.to_string()),
+                _ => None,
+            }
+            .filter(|t| !t.trim().is_empty());
+            let uis_icon = doc
+                .find_child(doc.dom.root_ref(), "UserInputService")
+                .and_then(|u| content(u, "MouseIcon"));
+            let mouse = s
+                .client
+                .as_ref()
+                .and_then(|c| c.world.as_ref())
+                .and_then(|w| w.input.mouse);
+            s.cursor_image = uis_icon.or_else(|| mouse.and_then(|m| content(m, "Icon")));
+            if let Some(c) = s.client.as_ref() {
+                let rot: Option<String> = c
+                    .runtime
+                    .lua
+                    .globals()
+                    .get::<mlua::Table>("__rs_user_game_settings")
+                    .ok()
+                    .and_then(|t| t.get::<Value>("RotationType").ok())
+                    .and_then(|v| match v {
+                        Value::UserData(ud) => ud.borrow::<LEnumItem>().ok().map(|e| e.name.clone()),
+                        _ => None,
+                    });
+                s.camera_relative = rot.as_deref() == Some("CameraRelative");
+            }
+            return;
+        }
         if let Some(cd) = s.other_doc.as_ref() {
             if let Some(u) = cd.find_child(cd.dom.root_ref(), "UserInputService") {
                 let inst = cd.dom.get_by_ref(u);
@@ -4343,6 +4689,30 @@ impl Game {
             }
         }
 
+        // **Who owns what, a second after the Player bound.** At bind time the
+        // server had granted nothing yet, so the ownership line printed then
+        // says "0 part(s) simulated here" even for a character this client
+        // does own — the number a phone's logcat is read for, and the one
+        // number in it that must move. One walk of the parts, once a session.
+        if mode == RunMode::Client {
+            let due = self.play.as_ref().is_some_and(|s| {
+                !s.live_ownership_logged && s.live_ownership_at.is_some_and(|t| s.time - t >= 1.0)
+            });
+            if due {
+                let (ours, theirs) = self.ownership_counts();
+                let scope = self
+                    .doc
+                    .self_peer
+                    .map_or("unknown".to_string(), |p| p.to_string());
+                self.info(format!(
+                    "Live: network ownership now: {ours} part(s) simulated here, \
+                     {theirs} the server's (replicated); our scope is {scope}"
+                ));
+                if let Some(s) = self.play.as_mut() {
+                    s.live_ownership_logged = true;
+                }
+            }
+        }
         // 1. Server script changes from last frame reach physics.
         let sc = rustudio_core::bench::scope("p1_physics_sync");
         {
@@ -4356,6 +4726,35 @@ impl Game {
                 Some(w) => std::mem::take(&mut w.velocity_requests),
                 None => Vec::new(),
             };
+            // **Who owns what, re-read before the step.** The server hands an
+            // assembly over when a player touches it and takes it back when they
+            // walk away, and a client script can make a part in any frame: a
+            // client that fixed the split at Play would leave a car it was
+            // granted frozen, or keep simulating a crate the server took back.
+            // (One walk of the parts, and only the ones that crossed the line are
+            // rebuilt — `Physics::claim_owned`.)
+            if mode == RunMode::Client {
+                if let Some(owner) = self.doc.owner() {
+                    let parts: Vec<Ref> = self
+                        .doc
+                        .workspace()
+                        .map(|ws| {
+                            self.doc
+                                .dom
+                                .descendants_of(ws)
+                                .filter(|i| {
+                                    doc::is_a(&i.class, "BasePart") && i.class != "Terrain"
+                                })
+                                .map(|i| i.referent())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // (the assembly root is read inside `claim_owned`, from the
+                    // document's `AssemblyRootPart`, not from a list taken before
+                    // the server's last write)
+                    s.physics.claim_owned(&mut self.doc, owner, &parts);
+                }
+            }
             s.physics.sync(&mut self.doc);
             s.physics.set_streaming_visibility(
                 s.map.streaming_collider_revision(),
@@ -4402,6 +4801,14 @@ impl Game {
         // is where it becomes available, and it is re-bound on every respawn.
         // One property read on the frames where there is nothing to do.
         if mode == RunMode::Client {
+            // **The join's own Player arrives after Play starts.** The server
+            // sends the world, then the clients; `start_play` runs on the frame
+            // the first instance lands, so the single call it made found no
+            // `Players.LocalPlayer`, and nothing ever tried again — no
+            // CoreScripts, no PlayerModule, no LocalScripts, no camera bound to
+            // a character, for the whole session. This is the retry, and it is
+            // cheap once it has succeeded (one bool).
+            self.setup_live_client_player(None);
             self.bind_live_character();
         }
         let mut hum_out: Option<hum_glue::HumFrameOut> = None;
@@ -4409,7 +4816,18 @@ impl Game {
         // machine, jump, the animation driver and the camera's subject. Leaving
         // it Play-only is why a joined game had a character in it that nothing
         // stepped — and why the thumbstick had nothing to move.
+        // **The character steps only when it is ours.** A joined client's
+        // `Humanoid.RootPart` is usually granted to it (`NetworkOwnerV3` = our
+        // scope) and then it is the client's to integrate, exactly as in Roblox;
+        // but a server script can keep a character on the server
+        // (`SetNetworkOwner(nil)`), and stepping that one here is a second
+        // simulation of a body the server is moving — a rubber-banded walk the
+        // player cannot steer. The pose then arrives through replication, and the
+        // controller's own state (the Humanoid's state machine, the Animator, the
+        // camera's subject) still runs, which is what the `hum_post` half does.
+        let character_owned = mode != RunMode::Client || self.live_character_owned();
         if matches!(mode, RunMode::Play | RunMode::Client) && self.play_has_character()
+            && character_owned
             && !self.play.as_ref().is_some_and(|s| s.map.gameplay_paused())
         {
             let _s = rustudio_core::bench::scope("p2_player_humanoid");
@@ -4560,15 +4978,56 @@ impl Game {
         // Destroying, and it can be parented back), ancestor Models lose a
         // PrimaryPart that fell, and ancestor Models with no remaining BaseParts
         // are removed as well.
-        let (fallen_signals, fallen_removed) = unparent_fallen_parts(&mut self.doc, &result.fallen);
-        for r in &fallen_removed {
-            self.record(RepOp::Parent(*r));
-        }
-        for (r, old, below) in fallen_signals {
-            self.with_side(Side::Server, |rt, _, _| rt.notify_parent(r, old, Ref::none(), below));
-        }
-        if let Some(s) = self.play.as_mut() {
-            s.engine_orphans.extend(fallen_removed);
+        // **The test is per part, not per session.** Below `FallenPartsDestroyHeight`
+        // a part is ours to remove only if this client simulated it: a part the
+        // server owns is moved by the server, and it is the *server* that
+        // unparents it when the server's own solver sees it fall. Deleting a
+        // joined place's parts here is a client editing a DataModel the server
+        // still has — the "map disappeared" half of the report.
+        //
+        // Concretely: an assembly this client owns (rule 3 of
+        // `Document::owner`) or made (rule 2) is destroyed below the plane, and a
+        // server-owned one is not, whatever a stale body of ours once thought.
+        // The character's own parts never are: a character that fell out of the
+        // world is respawned, not deleted.
+        let fallen = {
+            let owner = self.doc.owner();
+            match owner {
+                None => result.fallen.clone(),
+                Some(owner) => result
+                    .fallen
+                    .iter()
+                    .copied()
+                    .filter(|r| {
+                        let root = match self.doc.prop(*r, "AssemblyRootPart") {
+                            Some(Variant::Ref(root)) if !root.is_none() && self.doc.exists(root) => {
+                                root
+                            }
+                            _ => *r,
+                        };
+                        // The character's own parts are its body's, not the
+                        // loose world's: a character that fell out of the map is
+                        // respawned, not deleted.
+                        !self
+                            .play
+                            .as_ref()
+                            .is_some_and(|s| s.physics.hums.of_part.contains_key(r))
+                            && owner.owns(&self.doc, *r, root)
+                    })
+                    .collect::<Vec<Ref>>(),
+            }
+        };
+        if !fallen.is_empty() {
+            let (fallen_signals, fallen_removed) = unparent_fallen_parts(&mut self.doc, &fallen);
+            for r in &fallen_removed {
+                self.record(RepOp::Parent(*r));
+            }
+            for (r, old, below) in fallen_signals {
+                self.with_side(Side::Server, |rt, _, _| rt.notify_parent(r, old, Ref::none(), below));
+            }
+            if let Some(s) = self.play.as_mut() {
+                s.engine_orphans.extend(fallen_removed);
+            }
         }
 
         drop(sc);
@@ -4744,7 +5203,22 @@ impl Game {
         let remotes_after_adopt = !phase.server_out.2.is_empty()
             || self.play.as_ref().is_some_and(|s| s.character_client_pending.is_some());
         let sc = rustudio_core::bench::scope("p6_client_lua");
-        if mode == RunMode::Play {
+        // **`RunMode::Client` too.** This whole block — CoreScripts' frame,
+        // PlayerModule, RenderStepped / Heartbeat / Stepped, UserInputService,
+        // GuiService, touch, and the place's own LocalScripts — was Play Solo's
+        // alone, so a joined game ran no client Luau at all: its camera never
+        // followed anything, its GUI never ticked, and a character the server
+        // replicated stood still. (The logcat: CoreGui and Players arrive, and
+        // not one client script ever runs.)
+        //
+        // What a live client does *not* have is the other side of the map: no
+        // local server, so `s.map.s2c` means nothing and `other_doc` is `None`.
+        // On a join the client's own `Ref`s *are* the world's (`self.doc`), so
+        // every `s2c` lookup below is the identity — `live_s2c` — and the few
+        // places that read `other_doc` read `self.doc`.
+        let live = mode == RunMode::Client;
+        if matches!(mode, RunMode::Play | RunMode::Client) {
+            let live_s2c = |r: Ref| -> Option<Ref> { live.then_some(r) };
             let prep = rustudio_core::bench::scope("p6a_prep");
             // Server → client refs for just what this phase looks up (touches,
             // the character, humanoid states, moving parts): cloning the whole
@@ -4754,6 +5228,9 @@ impl Game {
                 .as_ref()
                 .and_then(|s| s.character.as_ref())
                 .and_then(|c| c.seat);
+            // On a live client the server's refs *are* this document's refs, so
+            // each `s2c` lookup below takes that branch: `map_s2c` is the
+            // filtered server→client map whose pairs are the identity there.
             let map_s2c: rustudio_core::RefMap = self
                 .play
                 .as_ref()
@@ -4772,7 +5249,11 @@ impl Game {
                         .collect()
                 })
                 .unwrap_or_default();
-            let (crs, cuis) = match self.play.as_ref().and_then(|s| s.other_doc.as_ref()) {
+            let (crs, cuis) = match if live {
+                Some(&self.doc)
+            } else {
+                self.play.as_ref().and_then(|s| s.other_doc.as_ref())
+            } {
                 Some(cd) => {
                     let r = cd.dom.root_ref();
                     (
@@ -4789,10 +5270,24 @@ impl Game {
                 .as_mut()
                 .map(|s| std::mem::take(&mut s.client_touches))
                 .unwrap_or_default();
-            let humanoid_client = humanoid_server.and_then(|h| map_s2c.get(&h).copied());
+            // (on a live client the client's ref is the server's: `map_s2c`
+            // holds exactly the identity pairs it was built with)
+            let humanoid_client = humanoid_server.and_then(|h| {
+                if live {
+                    Some(h)
+                } else {
+                    map_s2c.get(&h).copied()
+                }
+            });
             let client_states = state_names
                 .iter()
-                .filter_map(|(k, v)| map_s2c.get(k).map(|c| (*c, *v)))
+                .filter_map(|(k, v)| {
+                    if live {
+                        Some((*k, *v))
+                    } else {
+                        map_s2c.get(k).map(|c| (*c, *v))
+                    }
+                })
                 .collect();
             let (gui_events, gui_layout, mouse_events, menu_events, menu_open) =
                 match self.play.as_mut() {
@@ -4817,11 +5312,15 @@ impl Game {
                 }
                 None => Default::default(),
             };
-            let gui_service = self
-                .play
-                .as_ref()
-                .and_then(|s| s.other_doc.as_ref())
-                .and_then(|cd| cd.find_child(cd.dom.root_ref(), "GuiService"));
+            let gui_service = if live {
+                let cd = &self.doc;
+                cd.find_child(cd.dom.root_ref(), "GuiService")
+            } else {
+                self.play
+                    .as_ref()
+                    .and_then(|s| s.other_doc.as_ref())
+                    .and_then(|cd| cd.find_child(cd.dom.root_ref(), "GuiService"))
+            };
             // Mouse over the game view: position (GUI coordinates, under the
             // top bar), motion and wheel since last frame.
             let (mouse_xy, mouse_delta, mouse_moved, mouse_move_processed, wheel, wheel_processed) =
@@ -4861,7 +5360,12 @@ impl Game {
             let client_velocities: rustc_hash::FxHashMap<Ref, Vec3> = {
                 let mut v: rustc_hash::FxHashMap<Ref, Vec3> = velocities
                     .iter()
-                    .filter_map(|(k, v)| map_s2c.get(k).map(|c| (*c, *v)))
+                    .filter_map(|(k, v)| {
+                        if live {
+                            return Some((*k, *v));
+                        }
+                        map_s2c.get(k).map(|c| (*c, *v))
+                    })
                     .collect();
                 if let Some((root, vel)) = self
                     .play
@@ -4869,7 +5373,9 @@ impl Game {
                     .and_then(|s| s.character.as_ref())
                     .map(|c| (c.rig.root, c.velocity))
                 {
-                    if let Some(cr) = map_s2c.get(&root) {
+                    if live {
+                        v.insert(root, vel);
+                    } else if let Some(cr) = map_s2c.get(&root) {
                         v.insert(*cr, vel);
                     }
                 }
@@ -4887,7 +5393,13 @@ impl Game {
             drop(prep);
             let vehicle_input: Option<(Ref, Ref, f32, f32)> = current_seat
                 .filter(|&seat| self.doc.class_of(seat).as_deref() == Some("VehicleSeat"))
-                .and_then(|seat| map_s2c.get(&seat).copied().map(|cseat| (seat, cseat)))
+                .and_then(|seat| {
+                    if live {
+                        Some((seat, seat))
+                    } else {
+                        map_s2c.get(&seat).copied().map(|cseat| (seat, cseat))
+                    }
+                })
                 .map(|(seat, cseat)| {
                     let fwd = keys.contains("W") || keys.contains("Up");
                     let back = keys.contains("S") || keys.contains("Down");
@@ -4919,9 +5431,13 @@ impl Game {
             // step poses its whole assembly before PostSimulation.
             {
                 let _cj = rustudio_core::bench::scope("p6a_client_joints");
-                if let Some(s) = self.play.as_mut() {
-                    if let Some(cd) = s.other_doc.as_mut() {
-                        s.client_joints.solve(cd, &s.map.c2s);
+                // (a live client's own joints are the world's: its character's
+                // rig is solved by `play_humanoid`, not by a second document)
+                if !live {
+                    if let Some(s) = self.play.as_mut() {
+                        if let Some(cd) = s.other_doc.as_mut() {
+                            s.client_joints.solve(cd, &s.map.c2s);
+                        }
                     }
                 }
             }
@@ -5155,7 +5671,13 @@ impl Game {
                     rt.fire(*a, twin, vec![rt.inst(*b)]);
                     rt.fire(*b, twin, vec![rt.inst(*a)]);
                 }
-                let cseat = seat_server.and_then(|s| map_s2c.get(&s).copied());
+                let cseat = seat_server.and_then(|s| {
+                    if live {
+                        Some(s)
+                    } else {
+                        map_s2c.get(&s).copied()
+                    }
+                });
                 // Roblox switches CurrentCamera.CameraSubject to a VehicleSeat
                 // on sit (activating PlayerModule's VehicleCamera) and restores
                 // it to the Humanoid on stand.
@@ -5330,7 +5852,7 @@ impl Game {
                     .iter()
                     .copied()
                     .find(|r| self.doc.class_of(*r).is_some_and(|c| c == "Animator"))?;
-                let ca = s.map.s2c.get(&sa).copied()?;
+                let ca = if live { sa } else { s.map.s2c.get(&sa).copied()? };
                 Some((sa, ca))
             }) {
                 let snaps = self
@@ -5344,10 +5866,14 @@ impl Game {
             }
             drop(req);
             // The client's own assemblies (its simulation step in Studio).
+            // (A live client has none: its character's rig is `play_humanoid`'s,
+            // and no part of a joined place is simulated here.)
             let _cj = rustudio_core::bench::scope("p6d_client_joints");
-            if let Some(s) = self.play.as_mut() {
-                if let Some(cd) = s.other_doc.as_mut() {
-                    s.client_joints.solve(cd, &s.map.c2s);
+            if !live {
+                if let Some(s) = self.play.as_mut() {
+                    if let Some(cd) = s.other_doc.as_mut() {
+                        s.client_joints.solve(cd, &s.map.c2s);
+                    }
                 }
             }
             drop(_cj);
@@ -5357,8 +5883,11 @@ impl Game {
             if let Some(s) = self.play.as_mut() {
                 // Velocities client scripts gave parts (the character's own
                 // stay for client_root_movers).
-                let own: HashSet<Ref> =
-                    s.physics.skip.iter().filter_map(|r| s.map.s2c.get(r).copied()).collect();
+                let own: HashSet<Ref> = if live {
+                    s.physics.skip.iter().copied().collect()
+                } else {
+                    s.physics.skip.iter().filter_map(|r| s.map.s2c.get(r).copied()).collect()
+                };
                 let vel: Vec<(Ref, glam::Vec3)> = match s.client.as_mut().and_then(|c| c.world.as_mut()) {
                     Some(mut w) => {
                         let (keep, take) = std::mem::take(&mut w.velocity_requests)
@@ -5415,7 +5944,13 @@ impl Game {
                     let bodies = s.physics.link_bodies();
                     s.client_sim.kick(&kicks, &bodies);
                 }
-                if let Some(cd) = s.other_doc.as_mut() {
+                // **A live client has no client world of its own.** `other_doc`
+                // is Play Solo's second DataModel (the client copy the local
+                // server replicates into); a join's world is `self.doc` and its
+                // parts are the server's, so there is nothing here to step.
+                if live {
+                    // (nothing to step: see above)
+                } else if let Some(cd) = s.other_doc.as_mut() {
                     let out = s.client_sim.step(&s.physics, cd, &s.map.s2c, &s.map.c2s, &vel, dt);
                     if linked {
                         let motion = s.client_sim.link_motion();

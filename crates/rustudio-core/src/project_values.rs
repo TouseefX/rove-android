@@ -81,21 +81,50 @@ fn cframe(v: &J) -> Option<CFrame> {
     })
 }
 
+/// A `Font` from its JSON — the place-file form (`{"family": "rbxasset://…",
+/// "weight": "Bold", "style": "Italic"}`) **and rove's live form**, which writes
+/// the enums as numbers (`{"family": …, "weight": 700, "style": 1}`, see
+/// `rove/runtime/font_values.inc` `Font encode`).
+///
+/// Reading only the string form is why `TextLabel.FontFace ×2` was in the
+/// phone's refusal list: an integer weight fell through to `Regular`, and a
+/// weight outside `Enum.FontWeight` made the whole property a refusal — a label
+/// that draws in the wrong face is a smaller fault than one that does not draw,
+/// but neither is the conversion the server sent.
 fn font(v: &J) -> Option<Font> {
-    let family = v.get("family")?.as_str()?;
-    let weight = match v.get("weight").and_then(|w| w.as_str()).unwrap_or("Regular") {
-        "Thin" => FontWeight::Thin,
-        "ExtraLight" => FontWeight::ExtraLight,
-        "Light" => FontWeight::Light,
-        "Medium" => FontWeight::Medium,
-        "SemiBold" => FontWeight::SemiBold,
-        "Bold" => FontWeight::Bold,
-        "ExtraBold" => FontWeight::ExtraBold,
-        "Heavy" => FontWeight::Heavy,
+    let family = v
+        .get("family")
+        .or_else(|| v.get("Family"))
+        .and_then(|f| f.as_str())?;
+    let weight = match v.get("weight").or_else(|| v.get("Weight")) {
+        Some(J::String(s)) => match s.as_str() {
+            "Thin" => FontWeight::Thin,
+            "ExtraLight" => FontWeight::ExtraLight,
+            "Light" => FontWeight::Light,
+            "Medium" => FontWeight::Medium,
+            "SemiBold" => FontWeight::SemiBold,
+            "Bold" => FontWeight::Bold,
+            "ExtraBold" => FontWeight::ExtraBold,
+            "Heavy" => FontWeight::Heavy,
+            _ => FontWeight::Regular,
+        },
+        // `Enum.FontWeight` is 100..=900 (`Thin` … `Heavy`): the wire's
+        // numbering, which `Font::new` keeps as a `u16`. An unknown one is
+        // `Regular` rather than a refusal — this is a font, not a physics body.
+        Some(J::Number(n)) => {
+            let n = n.as_u64().filter(|n| *n <= u64::from(u16::MAX)).unwrap_or(400) as u16;
+            FontWeight::from_u16(n).unwrap_or(FontWeight::Regular)
+        }
         _ => FontWeight::Regular,
     };
-    let style = match v.get("style").and_then(|s| s.as_str()) {
-        Some("Italic") => FontStyle::Italic,
+    let style = match v.get("style").or_else(|| v.get("Style")) {
+        Some(J::String(s)) if s == "Italic" => FontStyle::Italic,
+        Some(J::Number(n)) => match n.as_u64() {
+            // `Enum.FontStyle`: 0 Normal, 1 Italic (rove's own numbering).
+            Some(1) => FontStyle::Italic,
+            Some(0) | None => FontStyle::Normal,
+            _ => return None,
+        },
         _ => FontStyle::Normal,
     };
     Some(Font::new(family, weight, style))
@@ -259,6 +288,28 @@ fn typed(ty: VariantType, v: &J, class: &str, prop: &str) -> Option<Variant> {
         }
         VariantType::PhysicalProperties => Variant::PhysicalProperties(match v {
             J::String(s) if s == "Default" => PhysicalProperties::Default,
+            // **rove's live form is an array**, not an object: five (or six)
+            // floats in `CurrentPhysicalProperties`' order — density, friction,
+            // elasticity, friction weight, elasticity weight [, acoustic
+            // absorption] — as rove's own fixtures carry it
+            // (`client-core/src/instance_state_tests.rs`).
+            // The object form below is the place file's; an array used to be a
+            // refusal, which is `Part.CustomPhysicalProperties ×8` in the phone's
+            // report — every part that had custom physics kept plastic's.
+            J::Array(a) if a.len() >= 5 => {
+                let f = |i: usize, d: f32| a.get(i).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+                PhysicalProperties::Custom(CustomPhysicalProperties::new(
+                    f(0, 0.7),
+                    f(1, 0.3),
+                    f(2, 0.5),
+                    f(3, 1.0),
+                    f(4, 1.0),
+                    f(5, 1.0),
+                ))
+            }
+            // `null` is the property's *unset* value (a part on the material's
+            // own physics), which is `Default`, not a refusal.
+            J::Null => PhysicalProperties::Default,
             J::Object(o) => {
                 let f = |k: &str| o.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
                 PhysicalProperties::Custom(CustomPhysicalProperties::new(
@@ -321,6 +372,59 @@ fn explicit(ty: &str, v: &J, class: &str, prop: &str) -> Option<Variant> {
 /// A property value from project JSON: (canonical name, value), or an
 /// error naming what was wrong (Argon reports these as warnings and skips
 /// the property).
+/// The `ValueBase` family's `Value`, by the class that names its type.
+///
+/// `Vector3Value.Value`, `CFrameValue.Value`, `Color3Value.Value`,
+/// `BrickColorValue.Value`, `NumberValue.Value`, `IntValue.Value`,
+/// `StringValue.Value` and `BoolValue.Value` are all a property called `Value`
+/// whose type is the class's subject. `api-dump.json` types them (`Vector3`,
+/// `CoordinateFrame`, …), so the typed reader above already handles the shape —
+/// except when rove sends the value **tagged** (`{"$vector3": …}`), which is how
+/// the live stream writes it: the tag's own reader is in the bridge, and this is
+/// the one place that has both the tag and the class.
+///
+/// Reading it here rather than only in the bridge means a `Vector3Value` created
+/// by a join's *snapshot* converts the same way as one that arrived in a delta.
+pub fn value_of(class: &str, prop: &str, v: &J) -> Option<Variant> {
+    if prop != "Value" {
+        return None;
+    }
+    // The tagged form's payload, unwrapped, is the type's own JSON.
+    let inner = match v.as_object().filter(|o| o.len() == 1) {
+        Some(o) => {
+            let (tag, inner) = o.iter().next()?;
+            // Only the tags whose payload *is* the place-file shape: a
+            // `$vector3` array, a `$cframe` object.
+            match tag.as_str() {
+                "$vector3" | "$vector2" | "$color3" | "$number" | "$string" | "$cframe"
+                | "$brickcolor" | "$rect" | "$udim" | "$udim2" => match tag.as_str() {
+                    "$number" => return Some(Variant::Float64(inner.as_f64()?)),
+                    "$string" => return Some(Variant::String(inner.as_str()?.to_string())),
+                    "$brickcolor" => {
+                        return Some(Variant::BrickColor(BrickColor::from_number(
+                            inner.as_f64()? as u16,
+                        )?))
+                    }
+                    "$vector3" => {
+                        let a = nums::<3>(inner)?;
+                        return Some(Variant::Vector3(Vector3::new(a[0], a[1], a[2])));
+                    }
+                    _ => inner,
+                },
+                _ => return None,
+            }
+        }
+        None => v,
+    };
+    let (_, dt) = descriptor(class, prop)?;
+    let ty = match dt {
+        DataType::Value(ty) => ty,
+        // (`ValueBase.Value` typed as the plain type: the same reading.)
+        other => other,
+    };
+    typed(ty, inner, class, prop)
+}
+
 pub fn resolve(class: &str, prop: &str, v: &J) -> Result<(String, Variant), String> {
     // Explicit: one key naming the type.
     if let Some(o) = v.as_object() {

@@ -191,6 +191,16 @@ pub fn build(snapshot: Snapshot, title: String) -> Result<Built, String> {
 
     let mut doc = Document::from_play_dom(dom.clone(), title);
     doc.revision += 1;
+    // **Whose instances these are.** Every node in a snapshot came from the
+    // server, and `Document::owner` needs to know that to tell a part the server
+    // simulates from one *this* client's scripts made: without the stamp a
+    // snapshot-built world says "everything here is local", so a client that
+    // joined from a snapshot would integrate the whole map and delete what fell.
+    // (`refs` is keyed by `Ref` and the `ids` map is the same pairing.)
+    doc.replicated_peer.reserve(refs.len());
+    for r in refs.keys() {
+        doc.replicated_peer.insert(*r, crate::live::SERVER_PEER);
+    }
 
     let local_player = snapshot.local_player().and_then(|id| ids.get(id).copied());
     if let Some(player) = local_player {

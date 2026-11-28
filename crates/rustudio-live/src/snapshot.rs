@@ -184,6 +184,41 @@ impl ValueConverter {
     /// One property value. `class`/`property` are for the error text and for
     /// asking `api-dump.json` what type the property has.
     pub fn value(&mut self, property: &str, class: &str, v: &J) -> Result<Variant, String> {
+        // **`NetworkOwnerV3`** is the network-ownership word the server writes on
+        // an assembly's root: `1` (rove's server) for a part it simulates, our
+        // own session scope (`self.core.scope()`) for one it has handed to this
+        // client, another player's scope for one it handed to them, and `nil`
+        // for the server. It is not in `api-dump.json` at all — it is rove's
+        // replication field, not a Roblox member a place file holds — so the
+        // typed reader below refuses it ("Unknown property BasePart.
+        // NetworkOwnerV3", eight of them in the phone's report) and the
+        // document kept whatever default it had, which is precisely the fact
+        // that decides whose solver may move the part. Read here, as a number,
+        // which is what both sides of the wire agree it is
+        // (`rove/rust-client/src/live_physics.rs`).
+        if property == "NetworkOwnerV3" {
+            return Ok(Variant::Int64(match v {
+                J::Number(n) => n
+                    .as_f64()
+                    .filter(|x| x.is_finite() && *x >= 0.0)
+                    .ok_or_else(|| format!("NetworkOwnerV3 wants a peer id: {v}"))?
+                    as i64,
+                // Nil is a *value* here: the server owns it.
+                J::Null => -1,
+                J::Object(o) if o.len() == 1 => match o.get("$number") {
+                    Some(n) => n.as_f64().unwrap_or(0.0) as i64,
+                    // A `$ref` to a Player is the same ownership said the long
+                    // way round; the peer is the ref's own scope word.
+                    None => o
+                        .get("$ref")
+                        .and_then(J::as_str)
+                        .and_then(|id| id.split(':').next())
+                        .and_then(|scope| scope.parse::<i64>().ok())
+                        .unwrap_or(-1),
+                },
+                _ => return Err(format!("NetworkOwnerV3 wants a peer id: {v}")),
+            }));
+        }
         // `Tags` is CollectionService's list, and rove sends it as the same
         // comma-separated string Roblox stores (`instance_state.rs` writes the
         // raw field). `api-dump.json` has no `Tags` member at all, so
@@ -193,6 +228,12 @@ impl ValueConverter {
         // and a hex blob both convert here.
         if property.eq_ignore_ascii_case("tags") {
             return Ok(Variant::BinaryString(tags(v)));
+        }
+        // The `…Value` family's `Value`, which the class types and the stream
+        // tags: read where both are known (`Vector3Value.Value` was a refusal,
+        // `Vector3Value.Value ×7` in the phone's report).
+        if let Some(variant) = rustudio_core::project_values::value_of(class, property, v) {
+            return Ok(variant);
         }
         if let Some((tag, inner)) = tagged(v) {
             self.converted += 1;

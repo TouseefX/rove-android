@@ -199,6 +199,27 @@ pub struct Document {
     /// Bumped when tree structure or style-relevant properties (Name, Tags,
     /// Attributes, Selector, Priority, StyleSheet) change.
     pub style_revision: u64,
+    /// **The instances a server sent us, and who we are to it** — the two facts
+    /// network ownership turns on.
+    ///
+    /// A joined client's DataModel holds two kinds of instance: the ones that
+    /// arrived through replication (the server's, and *it* owns their physics
+    /// unless it says otherwise) and the ones this client's own scripts made
+    /// (its own, and nobody else has them at all). Without the distinction a
+    /// local solver has no way to tell a part it must not integrate from one it
+    /// must, so it either simulates everything (parts falling that the server
+    /// is holding still) or nothing (a client-created part frozen in the air).
+    ///
+    /// `replicated_peer` is that per-`Ref` half; `self_peer` is this session's
+    /// own network scope — rove's `self.core.scope()`, the same id a
+    /// `NetworkOwnerV3` names when the server hands an assembly to *us*.
+    ///
+    /// Empty on an edit document and on Play Solo's server, where every part is
+    /// this process's own (see [`Document::is_local_physics`]).
+    pub replicated_peer: rustc_hash::FxHashMap<Ref, u64>,
+    /// This client's own session scope (rove's `self.core.scope()`), once the
+    /// join's globals have arrived.
+    pub self_peer: Option<u64>,
     journal: Journal,
     /// ChangeHistoryService's state (doc_history.rs).
     history: history::History,
@@ -207,6 +228,46 @@ pub struct Document {
 #[path = "doc_history.rs"]
 mod history;
 pub use history::{studio_step_name, FinishOp, HistoryEvent};
+
+/// Who a joined document's parts belong to (see [`Document::owner`]).
+///
+/// Deliberately a two-word copy taken once per frame, not a borrow of the
+/// document: the readers (physics, the play session) walk the tree while
+/// holding `&mut Document`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner {
+    /// This client's own session scope (rove's `self.core.scope()`); `None`
+    /// until the join's globals have arrived, and until then nothing that came
+    /// from the server is simulated here (ownership needs the id to say "ours").
+    pub self_peer: Option<u64>,
+}
+
+impl Owner {
+    /// Whether `r` (in the assembly rooted at `root`) is simulated here.
+    pub fn owns(&self, doc: &Document, r: Ref, root: Ref) -> bool {
+        // Rule 2: this client's own scripts made it — no other machine has it,
+        // so nothing will ever replicate its pose.
+        if !doc.replicated_peer.contains_key(&r) && !doc.replicated_peer.contains_key(&root) {
+            return true;
+        }
+        // Rule 3: the server handed the assembly to us.
+        let Some(me) = self.self_peer else { return false };
+        peer_of(doc.prop(root, "NetworkOwnerV3")) == Some(me)
+    }
+}
+
+/// A `NetworkOwnerV3` property as the peer id it is, whatever width it arrived
+/// in (rove writes it as a number; the bridge stores `Int64`, and a `$ref`-to-
+/// Player spelling is read as that ref's own scope word).
+pub fn peer_of(v: Option<Variant>) -> Option<u64> {
+    match v? {
+        Variant::Int64(n) => u64::try_from(n).ok().filter(|n| *n != 0),
+        Variant::Int32(n) => u64::try_from(n).ok().filter(|n| *n != 0),
+        Variant::Float64(n) => (n >= 1.0 && n.fract() == 0.0).then_some(n as u64),
+        Variant::Float32(n) => (n >= 1.0 && n.fract() == 0.0).then_some(n as u64),
+        _ => None,
+    }
+}
 
 /// Studio's default for a property missing from a place file, where it
 /// isn't the reflection database's: Lighting.Brightness reads 1 in Studio and
@@ -851,6 +912,8 @@ impl Document {
             id: NEXT_DOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             tree_revision: 0,
             style_revision: 0,
+            replicated_peer: Default::default(),
+            self_peer: None,
             journal: Journal {
                 base: 0,
                 marks: Vec::new(),
@@ -1486,6 +1549,56 @@ impl Document {
     #[inline]
     pub fn class_of(&self, r: Ref) -> Option<Ustr> {
         self.dom.get_by_ref(r).map(|i| i.class)
+    }
+
+    /// **Whose simulation moves this part** — Roblox's network ownership, as a
+    /// joined client has to decide it.
+    ///
+    /// Roblox does not simulate a client's world on the client. The server
+    /// simulates every assembly and replicates its `CFrame` / `ReplicationPV`;
+    /// a client simulates only what it *owns*, and it owns what the server hands
+    /// it: its own character, and (`SetNetworkOwner(player)`) a handful of loose
+    /// assemblies — a car's chassis, a pushed crate, a dropped ball. Everything
+    /// else arrives as motion, and a local solver under it is a second
+    /// simulation of somebody else's world: a part the server is holding still
+    /// falls here, and a part the server is dropping hovers because this side's
+    /// solver disagreed about the floor.
+    ///
+    /// So a part is simulated locally when
+    ///
+    /// 1. this document is not a joined one at all (`owner()` is `None`: an edit
+    ///    place, Play Solo's server, a self-test), so every part is this
+    ///    process's; or
+    /// 2. this client's scripts made it — it is not in `replicated_peer`, so no
+    ///    other machine has it and nobody can send its pose; or
+    /// 3. the server named this client as its network owner: its root part's
+    ///    `NetworkOwnerV3` is our `self_peer` (not nil, not the server's id, not
+    ///    another player's).
+    ///
+    /// A part the server owns *and* a part owned by another player are the same
+    /// answer here — not ours; their pose arrives from the server, and this side
+    /// only draws them.
+    ///
+    /// `root` is the assembly's root part (`AssemblyRootPart`, or the part
+    /// itself), which is what `NetworkOwnerV3` is read from: ownership is an
+    /// assembly's, not a part's, and a welded chassis part carries none of its
+    /// own.
+    pub fn owner(&self) -> Option<Owner> {
+        if self.replicated_peer.is_empty() {
+            return None;
+        }
+        Some(Owner { self_peer: self.self_peer })
+    }
+
+    /// Whether physics should integrate `r` (with `root` its assembly root):
+    /// [`Document::owner`]'s rule 2 and 3.
+    ///
+    /// A caller that has already established `owner().is_some()` passes the
+    /// `Owner` it took; the two-argument form is for the places that read a
+    /// part without one.
+    pub fn is_local_physics(&self, r: Ref, root: Ref) -> bool {
+        let Some(owner) = self.owner() else { return true };
+        owner.owns(self, r, root)
     }
 
     /// `class_of`, also for an instance removed to limbo.

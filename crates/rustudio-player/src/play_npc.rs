@@ -130,6 +130,10 @@ impl Game {
         let Some(ws) = self.doc.workspace() else { return };
         let mine = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
         let doc = &self.doc;
+        // A joined place's NPCs are the server's to simulate; only a character
+        // whose root the server handed to this client gets a local state machine
+        // (see the `models` filter in `npc_pre`).
+        let owner = doc.owner();
         let drivable = |h: Ref| -> Option<(Ref, Ref, Ref)> {
             let model = doc.dom.get_by_ref(h)?.parent();
             if Some(model) == mine || !doc.class_of(model).is_some_and(|c| c == "Model") {
@@ -138,6 +142,11 @@ impl Game {
             let root = doc.find_named(model, "HumanoidRootPart")?;
             if !doc.class_of(root).is_some_and(|c| doc::is_a(&c, "BasePart")) {
                 return None;
+            }
+            if let Some(owner) = owner {
+                if !owner.owns(doc, root, root) {
+                    return None;
+                }
             }
             let health = match doc.prop(h, "Health") {
                 Some(Variant::Float32(h)) => h,
@@ -299,7 +308,31 @@ impl Game {
             }
         }
         self.npc_journal();
-        let models: Vec<Ref> = self.play.as_ref().map(|s| s.npcs.by_model.keys().copied().collect()).unwrap_or_default();
+        // **Only the characters this client owns are stepped here** (Roblox's
+        // network ownership). On a joined place every NPC is the server's: its
+        // `HumanoidRootPart` carries the server's `NetworkOwnerV3`, so the server
+        // simulates it and replicates the pose, and a local state machine under
+        // it is a second simulation fighting the one that is sent — exactly the
+        // player's own character's bug, once per NPC in the map. The ones left
+        // in (`Owner::owns`) are an assembly the server handed us, which the
+        // client does drive.
+        let models: Vec<Ref> = {
+            let owner = self.doc.owner();
+            self.play
+                .as_ref()
+                .map(|s| {
+                    s.npcs
+                        .by_model
+                        .iter()
+                        .filter(|(_, n)| match owner {
+                            None => true,
+                            Some(owner) => owner.owns(&self.doc, n.root, n.root),
+                        })
+                        .map(|(m, _)| *m)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let gravity = self.play.as_ref().map(|s| s.physics.gravity).unwrap_or(mech::GRAVITY);
         // The ownership boundary: characters a script kept on the server
         // (SetNetworkOwner(nil) on their root) against the player's.

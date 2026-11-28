@@ -323,6 +323,21 @@ struct Sig {
     massless: bool,
 }
 
+/// The root part of `r`'s assembly, as the document names it.
+///
+/// `NetworkOwnerV3` is an *assembly's* ownership and the server writes it on the
+/// assembly's root (`BasePart.AssemblyRootPart`); a welded chassis part carries
+/// none of its own. So the question "is this part mine" is asked of the root,
+/// and the root is whatever the server put in `AssemblyRootPart` when that is a
+/// live part of this document — falling back to the part itself, which is what
+/// an unanchored, unwelded part is.
+fn assembly_root(doc: &Document, r: Ref) -> Ref {
+    match doc.prop(r, "AssemblyRootPart") {
+        Some(Variant::Ref(root)) if !root.is_none() && doc.exists(root) => root,
+        _ => r,
+    }
+}
+
 fn part_sig(doc: &Document, r: Ref) -> Option<(Xform, Sig)> {
     let class = doc.class_of(r)?;
     let xf = xform_of(doc, r)?;
@@ -1584,6 +1599,112 @@ impl Physics {
 
     fn workspace_of(doc: &Document) -> Option<Ref> {
         doc.workspace()
+    }
+
+    /// **Drive the world by network ownership, as a Roblox client does.**
+    ///
+    /// A joined client is not the simulation. The server simulates the place and
+    /// replicates `CFrame` / `ReplicationPV`; what the client simulates is what
+    /// the server hands it, and nothing else:
+    ///
+    /// - its own character (the server grants it — `Humanoid.RootPart`'s
+    ///   `NetworkOwnerV3` is our scope),
+    /// - any other assembly the server granted it the same way (a car the player
+    ///   is driving, a crate it kicked), and
+    /// - **parts this client's own scripts made**, which no other machine has,
+    ///   so no replication will ever move them (`Document::replicated_peer` says
+    ///   which instances arrived from the server).
+    ///
+    /// Everything else — a part whose root is server-owned (`NetworkOwnerV3` nil
+    /// or the server's id), or owned by *another* player — is not integrated
+    /// here. Its body stays where the server put it and its `CFrame` writes are
+    /// teleports, which is exactly how a client draws a part it does not own. A
+    /// local solver under those parts is a second simulation of somebody else's
+    /// world, and it shows: unanchored parts fall here that the server is holding
+    /// up, and `unparent_fallen_parts` deletes them below
+    /// `FallenPartsDestroyHeight` — a client editing a DataModel that is not its
+    /// own.
+    ///
+    /// Called by `Editor::start_play` for `RunMode::Client` (the sets are
+    /// refreshed every frame after that, [`Physics::claim_owned`], because
+    /// ownership changes hands mid-session).
+    pub fn drive_by_ownership(&mut self, doc: &mut Document) {
+        let Some(owner) = doc.owner() else { return };
+        let Some(ws) = Self::workspace_of(doc) else { return };
+        // Every part of the place, by its assembly root: an unowned part is one
+        // `skip` holds, and the character's own parts are added to `skip` by
+        // whoever builds its body (`ensure_hum_body`), never removed here.
+        let parts: Vec<Ref> = doc
+            .dom
+            .descendants_of(ws)
+            .filter(|i| doc::is_a(&i.class, "BasePart") && i.class != "Terrain")
+            .map(|i| i.referent())
+            .collect();
+        // (no `sync` here: the whole world is rebuilt on the next line, so
+        // queueing the crossed parts would be work thrown away)
+        if self.set_ownership(&owner, doc, &parts) {
+            self.reconcile(doc);
+        }
+    }
+
+    /// Re-reads the ownership split for `parts` and rebuilds only what crossed it.
+    ///
+    /// Ownership is not a one-time fact: the server hands an assembly over when a
+    /// player touches it and takes it back when they leave it alone
+    /// (`SetNetworkOwnershipAuto`), and a client script can make a part at any
+    /// moment. Cheap when nothing moved (the list is the caller's, already
+    /// walked), and it never rebuilds the limbs of a character — those are in
+    /// `skip` and stay there.
+    pub fn claim_owned(&mut self, doc: &mut Document, owner: rustudio_core::doc::Owner, parts: &[Ref]) {
+        if !self.set_ownership(&owner, doc, parts) {
+            return;
+        }
+        // `sync` (not `refresh`): a part that left `skip` must be *built* now,
+        // in this frame's solve, and one that entered it must lose its body.
+        self.sync(doc);
+    }
+
+    /// [`Physics::claim_owned`]'s split itself: `skip` gains and loses exactly
+    /// the parts whose ownership changed, and nothing is rebuilt. `true` when
+    /// something crossed the line.
+    fn set_ownership(&mut self, owner: &rustudio_core::doc::Owner, doc: &Document, parts: &[Ref]) -> bool {
+        let mut gained: Vec<Ref> = Vec::new();
+        let mut lost: Vec<Ref> = Vec::new();
+        for r in parts {
+            let root = assembly_root(doc, *r);
+            // A Humanoid's own parts are its body's, not a loose assembly: the
+            // character build keeps them out of `parts` and steps them itself
+            // (`ensure_hum_body`), and handing them back here would give the
+            // character two bodies. (The player's and every NPC's.)
+            if self.hums.of_part.contains_key(r) || self.hums.of_part.contains_key(&root) {
+                continue;
+            }
+            // **Theirs: a fixed collider that follows replication.** Not
+            // simulated (no gravity, no contacts of its own, no
+            // `unparent_fallen_parts`) and not absent either — a part the
+            // character cannot stand on is a client falling through the map.
+            // `external` is exactly this in the client world
+            // (physics_client.rs: `anchored = true` at build, `teleport` on a
+            // replicated `CFrame`), so it is what a server-owned part becomes.
+            let mine = owner.owns(doc, *r, *root);
+            let following = self.external.contains(r);
+            if mine && following {
+                self.external.remove(r);
+                gained.push(*r);
+            } else if !mine && !following {
+                self.external.insert(*r);
+                self.skip.remove(r);
+                lost.push(*r);
+            }
+        }
+        if gained.is_empty() && lost.is_empty() {
+            return false;
+        }
+        // A part that changed hands is rebuilt: ours becomes a body, theirs a
+        // fixed follower. `queued` is how `sync` is told both without a full
+        // rebuild of the world.
+        self.queued.extend(gained.iter().chain(lost.iter()).copied());
+        true
     }
 
     /// A part the simulation should hold: a BasePart under Workspace, not skipped.
@@ -5177,6 +5298,68 @@ mod tests {
     use std::collections::HashSet;
     use rbx_dom_weak::types::{CFrame, Vector3};
     use rbx_dom_weak::InstanceBuilder;
+
+    /// **Ownership decides what the solver builds.** A joined client's world is
+    /// mostly the server's: those parts are fixed colliders whose pose arrives
+    /// as replication, and a part the server granted to us — or one this
+    /// client's own scripts made — is a body. Getting this wrong in either
+    /// direction is the bug this pins: simulate everything and the server's map
+    /// falls out from under the client (and is deleted below
+    /// `FallenPartsDestroyHeight`); build nothing for it and the character
+    /// falls through a map it can see.
+    #[test]
+    fn ownership_decides_which_bodies_exist() {
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().expect("a Workspace");
+        let make = |doc: &mut Document, name: &str, owner: i64| {
+            let mut b = InstanceBuilder::new("Part")
+                .with_name(name)
+                .with_property("Size", Vector3::new(4.0, 1.0, 4.0))
+                .with_property("Anchored", false)
+                .with_property("CFrame", CFrame::new(Vector3::new(0.0, 40.0, 0.0), CFrame::identity().orientation));
+            if owner >= 0 {
+                b = b.with_property("NetworkOwnerV3", owner);
+            }
+            doc.dom.insert(ws, b)
+        };
+        // The server's map, an assembly handed to us, and one our scripts made.
+        let theirs = make(&mut doc, "Map", 1);
+        let ours = make(&mut doc, "Crate", 0x2a);
+        let made = make(&mut doc, "Tracer", -1);
+        // (The first two came over the wire, which is what makes them the
+        // server's to give away; the third this client's scripts made, and no
+        // other machine has it.)
+        doc.replicated_peer.insert(theirs, 1);
+        doc.replicated_peer.insert(ours, 1);
+        doc.self_peer = Some(0x2a);
+
+        let mut p = Physics::new(&mut doc);
+        p.drive_by_ownership(&mut doc);
+        // The server's map is a fixed follower: collidable (the character walks
+        // on it) and never integrated here.
+        assert!(p.parts.contains_key(&theirs), "the map's collider exists");
+        assert!(p.external.contains(&theirs), "and only follows replication");
+        assert!(p.parts[&theirs].asm.is_none(), "a fixed collider, so it cannot fall");
+        // What is ours is a dynamic assembly.
+        for r in [ours, made] {
+            let pb = p.parts.get(&r).unwrap_or_else(|| panic!("a body for {r:?}"));
+            assert!(pb.asm.is_some(), "ours moves: {r:?}");
+            assert!(!p.external.contains(&r));
+        }
+        // The server takes the crate back: it stops being simulated here (its
+        // pose will arrive from the server) without a full rebuild of the world.
+        doc.dom.get_by_ref_mut(ours).unwrap().properties.insert(
+            ustr("NetworkOwnerV3"),
+            Variant::Int64(1),
+        );
+        let owner = doc.owner().expect("an owner");
+        p.claim_owned(&mut doc, owner, &[ours]);
+        assert!(p.external.contains(&ours), "handed back to the server");
+        assert!(
+            p.parts.get(&ours).is_some_and(|b| b.asm.is_none()),
+            "and its body is fixed again"
+        );
+    }
 
     /// Terrain water is found by point (what starts Humanoid Swimming).
     #[test]

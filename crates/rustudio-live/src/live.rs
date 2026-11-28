@@ -28,6 +28,11 @@
 //! in one place, with both directions and the counts that say whether it is
 //! keeping up.
 
+/// The peer id a joined world's creates are stamped with: rove's server is peer
+/// `1` in the session ids it hands out (`rove/rust-client/src/live_physics.rs`,
+/// `SERVER_NETWORK_OWNER`), and the client's own scope is a larger word.
+pub const SERVER_PEER: u64 = 1;
+
 use std::collections::{HashMap, HashSet};
 
 use rbx_dom_weak::types::{Ref, Variant};
@@ -174,6 +179,9 @@ pub struct Live {
     pending_refs: std::collections::BTreeMap<(String, String), String>,
     /// `$ref`s resolved by the batch that made their target, for the report.
     refs_bound: usize,
+    /// The network peer these deltas came from (the server's session id), stamped
+    /// onto every instance created here (`Document::replicated_peer`).
+    peer: u64,
 }
 
 impl Live {
@@ -189,6 +197,7 @@ impl Live {
             dangling_refs: std::collections::BTreeMap::new(),
             pending_refs: std::collections::BTreeMap::new(),
             refs_bound: 0,
+            peer: SERVER_PEER,
         }
     }
 
@@ -206,6 +215,7 @@ impl Live {
             dangling_refs: std::collections::BTreeMap::new(),
             pending_refs: std::collections::BTreeMap::new(),
             refs_bound: 0,
+            peer: SERVER_PEER,
         }
     }
 
@@ -401,6 +411,13 @@ impl Live {
         let r = doc.dom.insert(parent_ref, instance);
         self.ids.insert(id.to_string(), r);
         self.refs.insert(r, id.to_string());
+        // **Whose instance this is.** Every create that arrives here came over
+        // the wire, and the peer that sent it owns its physics unless it hands
+        // the assembly to us (`NetworkOwnerV3`). `Document::owner` reads this to
+        // decide what a local solver may integrate — the alternative is a client
+        // that simulates the whole of somebody else's place, where unanchored
+        // parts fall out of a world nobody dropped them in.
+        doc.replicated_peer.insert(r, self.peer);
         stats.created += 1;
         // A new instance is new to every reader of the document, not only to the
         // one that made it: `Scene::sync` learns about changes from the journal's
@@ -726,9 +743,21 @@ impl Live {
         value: &J,
         conv: &mut ValueConverter,
     ) -> Result<Variant, ConvertError> {
-        // `$ref` needs the id map, which the converter does not have.
-        if let Some(target) = value.get("$ref").and_then(J::as_str) {
-            return Err(ConvertError::Ref(target.to_string()));
+        // **A null ref is a ref to nothing.** `Player.Character` is set to
+        // `nil` on death and on respawn (`{"$ref": null}` on the wire), as are a
+        // dying tool's `Part1` and a Model's `PrimaryPart` when its part goes:
+        // three of the phone's log's refused properties were this, and each one
+        // left the property at its default (a player still pointing at the
+        // character that no longer exists). `Ref::none()` is what Roblox means by
+        // it, and it is a value, not a refusal.
+        match value.get("$ref") {
+            Some(J::Null) => return Ok(Variant::Ref(Ref::none())),
+            Some(v) => {
+                if let Some(target) = v.as_str() {
+                    return Err(ConvertError::Ref(target.to_string()));
+                }
+            }
+            None => {}
         }
         conv.value(property, class, value)
             .map_err(ConvertError::Value)
@@ -789,6 +818,7 @@ pub fn stale_ids(world_ids: &HashSet<String>, live: &Live) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rbx_dom_weak::types::Vector3;
 
     fn empty_world() -> (Document, Live) {
         let snapshot = crate::snapshot::parse(
@@ -1122,6 +1152,135 @@ mod tests {
             other => panic!("PrimaryPart is a ref to the part: {other:?}"),
         }
         assert_eq!(live.refs_pending(), 0, "nothing is left waiting");
+    }
+
+    /// **A create from the server is stamped with the peer that sent it**, which
+    /// is what `Document::owner` reads to decide what a local solver may
+    /// integrate: a replicated part is somebody else's until a
+    /// `NetworkOwnerV3` hands its assembly over.
+    #[test]
+    fn a_replicated_create_is_stamped_with_the_server_peer() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let part = serde_json::json!({
+            "sequence": 1, "kind": "create", "id": "3:1",
+            "node": {"id": "3:1", "class_name": "Part", "parent": null,
+                     "properties": {"Name": "Floor", "Anchored": true}},
+        });
+        let stats = live.apply(&mut doc, &[action(part)], &mut conv);
+        assert_eq!(stats.created, 1, "{stats:?}");
+        let r = live.referent("3:1").expect("the part");
+        assert_eq!(
+            doc.replicated_peer.get(&r).copied(),
+            Some(SERVER_PEER),
+            "the part came from the server"
+        );
+        // And a document like this has an owner: `None` means "an edit place,
+        // simulate everything".
+        assert!(doc.owner().is_some(), "a replicated world has an owner");
+    }
+
+    /// **`NetworkOwnerV3` is read, not refused** — it is the one property that
+    /// decides whose solver moves a part, and it is not in `api-dump.json` at
+    /// all (`BasePart.NetworkOwnerV3 ×2` in the phone's refusal list).
+    #[test]
+    fn network_ownership_is_decoded_and_says_whose_part_it_is() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        // Our own scope, as `self.core.scope()` reports it.
+        doc.self_peer = Some(0x2a);
+        let owned = serde_json::json!({
+            "sequence": 1, "kind": "create", "id": "3:1",
+            "node": {"id": "3:1", "class_name": "Part", "parent": null,
+                     "properties": {"Name": "Chassis", "Anchored": false,
+                                    "NetworkOwnerV3": 42}},
+        });
+        let server = serde_json::json!({
+            "sequence": 2, "kind": "create", "id": "3:2",
+            "node": {"id": "3:2", "class_name": "Part", "parent": null,
+                     "properties": {"Name": "MapPart", "Anchored": false,
+                                    "NetworkOwnerV3": 1}},
+        });
+        let nil = serde_json::json!({
+            "sequence": 3, "kind": "create", "id": "3:3",
+            "node": {"id": "3:3", "class_name": "Part", "parent": null,
+                     "properties": {"Name": "Kept", "Anchored": false,
+                                    "NetworkOwnerV3": null}},
+        });
+        let stats = live.apply(&mut doc, &[owned, server, nil], &mut conv);
+        assert_eq!(stats.refused_values, 0, "no refusal: {stats:?}");
+        assert!(
+            live.refused_properties().is_empty(),
+            "{:?}",
+            live.refused_properties()
+        );
+        let owner = doc.owner().expect("a replicated world has an owner");
+        let mine = live.referent("3:1").expect("ours");
+        let theirs = live.referent("3:2").expect("the server's");
+        let kept = live.referent("3:3").expect("nil is a value, not a refusal");
+        assert!(owner.owns(&doc, mine, mine), "42 is our scope: ours to move");
+        assert!(!owner.owns(&doc, theirs, theirs), "1 is the server's: only drawn");
+        assert!(!owner.owns(&doc, kept, kept), "nil is the server's too");
+        assert_eq!(doc.prop(kept, "NetworkOwnerV3"), Some(Variant::Int64(-1)));
+        // A part this client's own scripts made is nobody's but ours, whatever
+        // any `NetworkOwnerV3` says — nothing will replicate its pose.
+        let made = doc.dom.insert(doc.dom.root_ref(), InstanceBuilder::new("Part"));
+        assert!(owner.owns(&doc, made, made), "locally made: ours");
+    }
+
+    /// The three property types the phone's report counted as refused, each in
+    /// rove's live spelling: `Vector3Value.Value` tagged, a part's
+    /// `CustomPhysicalProperties` as the array `CurrentPhysicalProperties`
+    /// carries, and a label's `FontFace` with numeric weight and style.
+    #[test]
+    fn the_refused_types_convert_in_the_live_spelling() {
+        let (mut doc, mut live) = empty_world();
+        let mut conv = ValueConverter::default();
+        let creates = vec![
+            action(serde_json::json!({
+                "sequence": 1, "kind": "create", "id": "3:1",
+                "node": {"id": "3:1", "class_name": "Vector3Value", "parent": null,
+                         "properties": {"Name": "Size", "Value": {"$vector3": [1.0, 2.0, 3.0]}}},
+            })),
+            action(serde_json::json!({
+                "sequence": 2, "kind": "create", "id": "3:2",
+                "node": {"id": "3:2", "class_name": "Part", "parent": null,
+                         "properties": {"Name": "Heavy", "Anchored": true,
+                                        "CustomPhysicalProperties": [3.0, 0.1, 0.2, 1.0, 1.0]}},
+            })),
+            action(serde_json::json!({
+                "sequence": 3, "kind": "create", "id": "3:3",
+                "node": {"id": "3:3", "class_name": "TextLabel", "parent": null,
+                         "properties": {"Name": "Label",
+                                        "FontFace": {"family": "rbxasset://fonts/families/SourceSansPro.json",
+                                                     "weight": 700, "style": 1}}},
+            })),
+        ];
+        let stats = live.apply(&mut doc, &creates, &mut conv);
+        assert_eq!(stats.refused_values, 0, "no refusal: {stats:?}");
+        assert!(
+            live.refused_properties().is_empty(),
+            "{:?}",
+            live.refused_properties()
+        );
+        let value = live.referent("3:1").expect("the value object");
+        assert_eq!(
+            doc.prop(value, "Value"),
+            Some(Variant::Vector3(Vector3::new(1.0, 2.0, 3.0)))
+        );
+        let heavy = live.referent("3:2").expect("the part");
+        match doc.prop(heavy, "CustomPhysicalProperties") {
+            Some(Variant::PhysicalProperties(rbx_dom_weak::types::PhysicalProperties::Custom(c))) => {
+                assert!((c.density() - 3.0).abs() < 1e-6, "{c:?}");
+                assert!((c.friction() - 0.1).abs() < 1e-6, "{c:?}");
+            }
+            other => panic!("the part has its custom physics: {other:?}"),
+        }
+        let label = live.referent("3:3").expect("the label");
+        match doc.prop(label, "FontFace") {
+            Some(Variant::Font(f)) => assert_eq!(f.family, "rbxasset://fonts/families/SourceSansPro.json"),
+            other => panic!("the label has its font: {other:?}"),
+        }
     }
 
     /// A `$ref` whose target never arrives stays held (and is reported as
