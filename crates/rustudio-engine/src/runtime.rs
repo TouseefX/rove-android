@@ -9034,6 +9034,24 @@ mod tests {
     }
 
     #[test]
+    fn removing_default_loading_gui_fires_replicated_first_signal_once() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Client);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        security::with_main_identity(&rt.lua, security::CORE, || rt.lua.load(r#"
+            local rf = game:GetService("ReplicatedFirst")
+            removed_events = 0
+            rf.DefaultLoadingGuiRemoved:Connect(function() removed_events += 1 end)
+            rf:RemoveDefaultLoadingScreen()
+            rf:RemoveDefaultLoadingScreen()
+        "#).exec()).unwrap();
+        rt.dispatch();
+        rt.lua.load("assert(removed_events == 1)").exec().unwrap();
+    }
+
+    #[test]
     fn stuck_loading_fallback_hides_only_default_loading_gui() {
         let mut doc = Document::new_place();
         let core_gui = doc.find_child(doc.dom.root_ref(), "CoreGui").unwrap();

@@ -125,6 +125,9 @@ pub fn event_exists(class: &str, name: &str) -> bool {
         }
         "FocusLost" | "Focused" | "ReturnPressedFromOnScreenKeyboard" => class == "TextBox",
         "Chatted" | "Idled" | "CharacterAppearanceLoaded" => class == "Player",
+        // These signals are fired by the loading lifecycle, but must also be
+        // exposed for CoreScripts to connect to them.
+        "FinishedReplicating" | "DefaultLoadingGuiRemoved" => class == "ReplicatedFirst",
         "MoveToFinished" | "Seated" | "Climbing" | "GettingUp" | "PlatformStanding" | "Ragdoll"
         | "Strafing" | "Swimming" | "FallingDown" | "AnimationPlayed" | "Touched" => {
             class == "Humanoid" || (name == "Touched" && is("BasePart"))
