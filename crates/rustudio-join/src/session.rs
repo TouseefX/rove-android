@@ -894,14 +894,10 @@ impl Session {
         // character, so this is the region the player is actually in. Before the
         // first frame that says, the spawn region's own focus (`note_regions`)
         // is the only one that can be honest — and it has already been sent.
-        // The editor asks every frame (`LiveWorld::focus`), and on a place with
-        // no streamer there is nobody to ask: the spawn region is the whole
-        // world and a focus packet every tenth of a second is traffic about
-        // nothing. Before the first region, `self.streamer_seen` is false.
+        // The editor asks every frame (`LiveWorld::focus`); on a place with no
+        // streamer there is nobody to ask, and `request_focus` is where that is
+        // decided.
         if let Some(position) = from_editor {
-            if !self.streamer_seen {
-                return false;
-            }
             return self.request_focus(position, false);
         }
         // Otherwise the timeout decides: a focus lapses (`FOCUS_TIMEOUT_MS`),
@@ -943,6 +939,18 @@ impl Session {
     /// region is asking for parts that already arrived. `force` sends once
     /// regardless, for the first frame after the character binds.
     pub fn request_focus(&mut self, position: [f32; 3], force: bool) -> bool {
+        // **No region has arrived, so there is no streamer to answer.** A place
+        // that streams sends its spawn region before any of its parts; a place
+        // that does not never sends one, and a focus for it is a packet about a
+        // streamer that does not exist there. The gate is here, in the one
+        // method that queues a focus, so no caller can get round it — the
+        // editor's per-frame position, the spawn region and the keep-alive all
+        // come through this door. (`note_regions` sets `streamer_seen` *before*
+        // it calls this for the region it just read.)
+        if !self.streamer_seen {
+            self.focus_position = Some(position);
+            return false;
+        }
         self.focus_position = Some(position);
         let moved = match self.focus_last_sent {
             None => true,

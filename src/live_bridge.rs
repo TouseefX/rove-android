@@ -29,7 +29,7 @@
 use rbx_dom_weak::types::Ref;
 use rustudio_live::live::LiveChange;
 
-use crate::play::Game;
+use crate::game::Game;
 
 /// Replay one batch's worth of document changes through the live client's
 /// runtime.

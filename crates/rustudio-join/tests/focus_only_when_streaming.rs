@@ -21,7 +21,10 @@ fn no_focus_is_sent_before_a_region_arrives() {
     // The editor asks every frame. Before a region, the answer is no — and not
     // even a forced one, which is what a keep-alive would pass.
     assert!(!session.refocus(Some([0.0, 5.0, 0.0])), "a non-streaming place is not asked about");
-    assert!(!session.request_focus([0.0, 5.0, 0.0], true), "and nothing was queued for it");
+    // The gate is in `request_focus` — the one place a focus is queued — so no
+    // caller gets round it, including a forced one.
+    assert!(!session.request_focus([0.0, 5.0, 0.0], true), "nothing was queued for it");
+    assert_eq!(session.focus_sent, 0, "and nothing reached the wire");
 }
 
 #[test]
