@@ -31,6 +31,7 @@
 use crate::login::ticket_hash;
 use crate::session_integrity::SessionIntegrity;
 use rove_client_core::wire::decompress_bytes;
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 use std::fmt;
 
@@ -175,7 +176,7 @@ impl PublicTrust {
 
     fn from_pinned_bytes(raw: &[u8], provenance: &Value) -> Result<Self> {
         if raw.len() != COEFFICIENTS * 12
-            || blake3_hash_hex(raw) != TABLE_HASH
+            || sha256_hex(raw) != TABLE_HASH
             || provenance["table_sha256"] != TABLE_HASH
             || provenance["source_binary_sha256"] != SOURCE_HASH
         {
@@ -436,14 +437,16 @@ fn unpack_container_observed(blob: &[u8], observer: Option<&SessionIntegrity>) -
 
 /// A 32-byte digest of a whole packet, for the duplicate cache.
 ///
-/// A blake3 digest as lowercase hex.
+/// A SHA-256 digest as lowercase hex.
 ///
-/// `blake3::Hash` has no `LowerHex` (and `to_hex()` returns another type whose
-/// `as_str` borrows it), so the pinned-hash comparisons spell the digest out
-/// here once rather than each doing it slightly differently.
-fn blake3_hash_hex(bytes: &[u8]) -> String {
-    blake3::hash(bytes)
-        .as_bytes()
+/// **SHA-256, not blake3.** The table is `RBX::Crypto::HashStateBlake3`'s own
+/// data, but the hashes that pin *which* table it is are SHA-256 (upstream
+/// compares `Sha256::digest` to the same string): the blake3 in this file is the
+/// challenge signature's, over a body, and it is a different question. Using
+/// one for the other is a table that fails its own provenance check forever —
+/// which is how this was found, in a test, rather than in a join.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()

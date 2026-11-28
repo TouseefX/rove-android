@@ -13,6 +13,10 @@ base64 = "0.23"
 # The signature over a `155` challenge is a blake3 digest, and the message
 # digest of the unverified body is the one thing that cannot be faked.
 blake3 = "1"
+# The pinned public trust table is checked by the SHA-256 of its own bytes (and
+# its provenance names the SHA-256 of the binary it was dumped from), which is
+# what `sha2` is for: the table's digest is not a blake3 one.
+sha2 = "0.10"
 # The challenge program is Luau bytecode: the *vendored* Luau this workspace
 # already builds its VM from (`[patch]`ed to `vendor/mlua`, features `luau`),
 # loaded as a binary chunk. The same VM a place's CoreScripts run in, so a
