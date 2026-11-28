@@ -12,12 +12,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.23"
 # The signature over a `155` challenge is a blake3 digest, and the message
 # digest of the unverified body is the one thing that cannot be faked.
-blake3 = { workspace = true }
+blake3 = "1"
 # The challenge program is Luau bytecode: the *vendored* Luau this workspace
 # already builds its VM from (`[patch]`ed to `vendor/mlua`, features `luau`),
 # loaded as a binary chunk. The same VM a place's CoreScripts run in, so a
 # verified challenge needs no C++ host of its own.
-mlua = { workspace = true }
+mlua = { version = "0.12", features = ["luau"] }
 # The decoder this session feeds, and (behind `transport`) rove's own
 # WebTransport client: the same connect, pins and RUPP envelope a live session
 # uses, so this does not grow a second, subtly different one.
