@@ -848,16 +848,44 @@ impl Editor {
                         CoverStep::Now => egui::Color32::WHITE,
                         CoverStep::Waiting => egui::Color32::from_rgb(110, 116, 130),
                     };
-                    let mark = match state {
-                        CoverStep::Done => "✓",
-                        CoverStep::Now => "•",
-                        CoverStep::Waiting => "·",
+                    // A done step's tick is the bundled icon font, not U+2713
+                    // in the proportional face: neither of egui's two families
+                    // has that codepoint — `tests/ui_glyphs.rs` fails the tree
+                    // for a literal that no bundled font can draw, and the tick
+                    // was drawing as egui's replacement box.
+                    let icon = match state {
+                        CoverStep::Done => rustudio_engine::ti::glyph("check"),
+                        CoverStep::Now => rustudio_engine::ti::glyph("point"),
+                        CoverStep::Waiting => None,
                     };
+                    let mark = match (state, icon) {
+                        (CoverStep::Waiting, _) => "\u{00b7}".to_string(),
+                        (_, Some((ch, _))) => ch.to_string(),
+                        // The icon set is bundled, so these are not reachable,
+                        // and both codepoints are in Ubuntu Light's cmap — the
+                        // rule `tests/ui_glyphs.rs` holds the rest of the tree to.
+                        (CoverStep::Done, None) => "\u{2714}".to_string(),
+                        (CoverStep::Now, None) => "\u{2022}".to_string(),
+                    };
+                    let size = if *state == CoverStep::Now { 21.0 } else { 18.0 };
+                    let family = match icon {
+                        Some((_, family)) => family,
+                        None => egui::FontFamily::Proportional,
+                    };
+                    let galley =
+                        painter.layout_no_wrap(mark, egui::FontId::new(size, family), colour);
+                    // Centred as a whole: the mark and the label are different
+                    // fonts, so they are two galleys laid side by side rather
+                    // than one `format!`.
+                    let gap = 8.0;
+                    let mark_size = galley.size();
+                    let left = centre.x - (mark_size.x + gap) / 2.0;
+                    painter.galley(egui::Pos2::new(left, y - mark_size.y / 2.0), galley, colour);
                     painter.text(
-                        egui::Pos2::new(centre.x, y),
-                        egui::Align2::CENTER_CENTER,
-                        format!("{mark}  {label}"),
-                        egui::FontId::proportional(if *state == CoverStep::Now { 21.0 } else { 18.0 }),
+                        egui::Pos2::new(left + mark_size.x + gap, y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(size),
                         colour,
                     );
                     y += 30.0;

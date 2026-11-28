@@ -152,8 +152,11 @@ pub fn install(ctx: &egui::Context) {
     }
     let mono = defs.families[&FontFamily::Monospace].clone();
     defs.families.entry(FontFamily::Name("mono-bold".into())).or_default().extend(mono);
-    // Symbols the faces lack (a game's text in egui's default font, "✓"):
-    // the same fallback fonts as game fonts get.
+    // Symbols the faces lack (a game's text in egui's default font, say "⌘"):
+    // the same fallback fonts as game fonts get. Not an excuse for editor text:
+    // `tests/ui_glyphs.rs` requires the editor's own strings to be drawable by
+    // what is bundled, and U+2713 is in none of these faces — an icon comes
+    // from `glyph()` instead.
     for (i, bytes) in crate::gui::fallback_fonts().iter().enumerate() {
         let key = format!("fallback{i}");
         defs.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData::from_static(bytes)));

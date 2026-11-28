@@ -62,6 +62,25 @@ jobs:
           set -o pipefail
           cargo check -p rustudio --features live --locked \
             --message-format=short 2>&1 | tee -a "$RUNNER_TEMP/check.log"
+      # `tests/ui_glyphs.rs` is the only thing that catches a UI string no
+      # bundled font can draw, and it runs where the suite runs — macOS, after a
+      # queue that is often longer than the job. The rule is a property of the
+      # source, so it is applied here too, on the two runners that finish in
+      # three minutes: a glyph mistake stops a run at three minutes rather than
+      # after the slow job has spent its hour finding it.
+      #
+      # Both halves run. The Python preflight is the same scan without a
+      # toolchain (it is what makes this step cheap); the Rust test is the
+      # authority. Running both is what keeps the cheap one honest — were they
+      # ever to disagree, this step is where it shows, and it is the one test
+      # binary that does not need a display.
+      - name: UI text uses glyphs the bundled fonts have
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tools/ci/ui_glyphs_preflight.py 2>&1 | tee -a "$RUNNER_TEMP/check.log"
+          cargo test --locked -p rustudio --test ui_glyphs --message-format=short \
+            2>&1 | tee -a "$RUNNER_TEMP/check.log"
       # Tests run on macOS and the two release jobs (docs/M0-UNDERSTANDING.md
       # 10.9: "tests on macOS only"). Not Linux — no display. Not Windows
       # either: the suite needs a display as well, and on that runner it has
