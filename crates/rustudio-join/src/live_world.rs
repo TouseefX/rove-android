@@ -117,19 +117,16 @@ pub struct Counters {
     pub property_acks_sent: u64,
     /// Signed-program challenges (`155`) received, and answered.
     pub program_challenges: u64,
-    /// `ReplicationFocus` packets sent: what a streaming server needs to know
-    /// which parts to keep sending.
-    pub focus_updates: u64,
 }
 
 impl Counters {
     /// The one line the overlay shows. Deliberately short: it is read over a 3D
     /// view on a phone, and a wide line is an unreadable one.
     pub fn line(&self) -> String {
-        format!(
+        let mut line = format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
-             acked {}/{} held · markers {}/{} · stream {}/{} {} · dgram {}/{} on {} ch{} · \
-             acks {} · focus {}{} · {} s",
+             acked {}/{} held · markers {}/{} · stream {}/{} {} · \
+             dgram {}/{} on {} ch · acks {} · focus {} · {} s · {}",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -145,22 +142,29 @@ impl Counters {
             self.regions,
             self.focus_sent,
             if self.streaming_ready { "acked" } else { "no-ack" },
-            // Datagrams: fed into the world out of how many arrived on a channel
-            // the server announced. A session whose world never moves is one
-            // where the second number is zero — the packets the motion travels
-            // in were dropped before the decoder.
+            // Datagrams: fed into the world out of how many were routed at all.
+            // A session whose world never moves is one where the first number
+            // stands still — the packets the motion travels in were dropped
+            // before the decoder.
             self.datagrams_fed,
             self.datagrams_fed + self.unknown_datagrams,
             self.datagram_channels,
             self.property_acks_sent,
-            self.focus_updates,
+            self.focus_sent,
+            self.seconds,
+            // The diagnosis, only when there is one: an unannounced wire id
+            // means the client was not told which channel a datagram belongs
+            // to, which is a different fault from "the server sent nothing".
             if self.unknown_datagrams > 0 {
-                format!(" · {} datagram(s) on unannounced wire ids", self.unknown_datagrams)
+                format!(
+                    " · {} datagram(s) on unannounced wire ids",
+                    self.unknown_datagrams
+                )
             } else {
                 String::new()
-            },
-            self.seconds
-        )
+            }
+        );
+        line
     }
 
     /// Packets arrived but built no instance: a session that is reading and not

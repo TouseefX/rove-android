@@ -322,9 +322,6 @@ pub struct Session {
     /// The property-acknowledgment payload in flight, until the transport says
     /// whether it was written.
     ack_in_flight: Option<u64>,
-    /// `ReplicationFocus` packets sent, and the id the next one carries.
-    pub focus_sent: u64,
-    focus_id: u32,
 }
 
 impl Session {
@@ -394,8 +391,6 @@ impl Session {
             property_acks: rove_client_core::property_acknowledgments::PropertyAcknowledgments::new(),
             property_acks_sent: 0,
             ack_in_flight: None,
-            focus_sent: 0,
-            focus_id: 1,
         }
     }
 
@@ -1135,7 +1130,6 @@ impl Session {
             unknown_datagrams: self.unknown_datagrams,
             property_acks_sent: self.property_acks_sent,
             program_challenges: self.program_challenges,
-            focus_updates: self.focus_sent,
         }
     }
 
