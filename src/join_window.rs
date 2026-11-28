@@ -858,19 +858,17 @@ impl Editor {
                         CoverStep::Now => rustudio_engine::ti::glyph("point"),
                         CoverStep::Waiting => None,
                     };
-                    let mark = match (state, icon) {
-                        (CoverStep::Waiting, _) => "\u{00b7}".to_string(),
-                        (_, Some((ch, _))) => ch.to_string(),
+                    let size = if *state == CoverStep::Now { 21.0 } else { 18.0 };
+                    // One match, taking `icon` once: the mark and the family it
+                    // must be asked for together, in the font that has it.
+                    let (mark, family) = match (state, icon) {
+                        (CoverStep::Waiting, _) => ("\u{00b7}".to_string(), egui::FontFamily::Proportional),
+                        (_, Some((ch, family))) => (ch.to_string(), family),
                         // The icon set is bundled, so these are not reachable,
                         // and both codepoints are in Ubuntu Light's cmap — the
                         // rule `tests/ui_glyphs.rs` holds the rest of the tree to.
-                        (CoverStep::Done, None) => "\u{2714}".to_string(),
-                        (CoverStep::Now, None) => "\u{2022}".to_string(),
-                    };
-                    let size = if *state == CoverStep::Now { 21.0 } else { 18.0 };
-                    let family = match icon {
-                        Some((_, family)) => family,
-                        None => egui::FontFamily::Proportional,
+                        (CoverStep::Done, None) => ("\u{2714}".to_string(), egui::FontFamily::Proportional),
+                        (CoverStep::Now, None) => ("\u{2022}".to_string(), egui::FontFamily::Proportional),
                     };
                     let galley =
                         painter.layout_no_wrap(mark, egui::FontId::new(size, family), colour);
