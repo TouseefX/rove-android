@@ -263,12 +263,28 @@ mod tests {
     fn a_verified_program_runs_in_the_restricted_environment() {
         let normalized = crate::bytecode_format::normalize(CALCULATION, None)
             .expect("the pinned fixture needs no rewriting");
-        // `calculation.luau` reads `...` as `(a, b)` and returns
-        // `bit32.bxor(a + b, 0x1234)` plus a marker string, so only the first
-        // return value is read here (`evaluate` returns the first).
-        let value = evaluate(&normalized.bytes, "00000000-0000-4000-8000-000000000001", 4, 5)
-            .expect("the fixture runs");
-        assert_eq!(value, f64::from(9u32 ^ 0x1234));
+        // `calculation.luau` in full:
+        //
+        //     local a, b = ...
+        //     local values = {marker = "owned-v9", enabled = true}
+        //     values.sum = a + b
+        //     if a < b then values.sum += 1 end
+        //     local function calculate(value) return bit32.bxor(value, 0x1234) end
+        //     return calculate(values.sum), values.marker
+        //
+        // so with `(a, b) = (4, 5)`: `4 + 5 = 9`, plus one because `4 < 5`,
+        // `bit32.bxor(10, 0x1234) = 4670`, and `evaluate` reads the first return.
+        let (a, b) = (4u32, 5u32);
+        let sum = a + b + u32::from(a < b);
+        let value = evaluate(
+            &normalized.bytes,
+            "00000000-0000-4000-8000-000000000001",
+            a,
+            b,
+        )
+        .expect("the fixture runs");
+        assert_eq!(value, f64::from(sum ^ 0x1234));
+        assert_eq!(value, 4670.0, "the number the source's arithmetic gives");
     }
 
     #[test]
