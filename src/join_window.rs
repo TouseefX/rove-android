@@ -66,6 +66,21 @@ enum CoverStep {
     Waiting,
 }
 
+/// How long replication must be quiet before Play starts on the world.
+///
+/// `start_play_live` is seconds of synchronous work (`install_client_core`,
+/// `Physics::new`, `start_core_scripts`) on the frame thread. Doing it *during*
+/// the initial patch is what made a join look frozen and what let batches pile
+/// up behind it; doing it in a gap between bursts is free. Half a second is
+/// longer than the gap between a place's own patches and shorter than a person
+/// would call a pause.
+const LIVE_SETTLE_QUIET: Duration = Duration::from_millis(500);
+
+/// The floor under [`LIVE_SETTLE_QUIET`]: a place that never goes quiet (a
+/// streaming map, a busy server) still enters Play after this long, because a
+/// person watching a cover for eight seconds has already decided it is broken.
+const LIVE_SETTLE_BOUND: Duration = Duration::from_secs(8);
+
 /// What the cover draws this frame.
 struct CoverPhase {
     steps: Vec<(String, CoverStep)>,
@@ -179,6 +194,13 @@ pub struct JoinWindow {
     /// document and the join window must not hold the editor mutably while it
     /// asks for it.
     pub play_next_tick: bool,
+    /// The last time a replication batch was applied, for the settle rule: Play
+    /// must start *between* bursts of the initial world, not in the middle of
+    /// them (`LIVE_SETTLE_QUIET`).
+    pub live_last_batch: Option<Instant>,
+    /// When the first batch arrived at all, so a place that never goes quiet —
+    /// or never sends a part — still enters Play (`LIVE_SETTLE_BOUND`).
+    pub live_first_batch: Option<Instant>,
 }
 
 impl Default for JoinWindow {
@@ -211,6 +233,8 @@ impl JoinWindow {
             live_applied: 0,
             core_gui_was: None,
             play_next_tick: false,
+            live_last_batch: None,
+            live_first_batch: None,
         }
     }
 
@@ -321,6 +345,13 @@ impl Editor {
         self.join_win.live_local = Some(live_local);
         self.join_win.live_converter = converter;
         self.join_win.live_applied += written;
+        // The two clocks the settle rule reads (`live_world_settled`): the last
+        // burst, and the first one. Counted here rather than in `publish`,
+        // because this is the frame the *editor* applied them on — the thing
+        // Play starting would interrupt.
+        let now = Instant::now();
+        self.join_win.live_last_batch = Some(now);
+        self.join_win.live_first_batch.get_or_insert(now);
         // The report is written once the world has stopped changing, not as it
         // arrives: a per-service count taken mid-stream is a count of half a
         // place, and the refusal list is not sorted until there is something to
@@ -371,20 +402,96 @@ impl Editor {
                 "join: the world is here ({} instance(s)); it keeps arriving while you play",
                 self.game.doc.dom.len()
             ));
-            // **And enter it.** Installing the world is not playing it: the
-            // document sits in the editor looking like an opened `.rbxl`, with
-            // the explorer, the tabs and no camera bound to a character, which
-            // is exactly what a person who joined someone's place must not see.
-            // `play_next_tick` was only ever set by the *button*, so an
-            // automatic join arrived at the world and stopped there.
-            //
-            // Deferred by a frame for the same reason the button's path is: the
-            // install gave `set_document` a document, and Play reads it.
-            if self.game.play.is_none() {
-                self.join_win.play_next_tick = true;
-            }
+        }
+        // **And enter it — once the world has stopped arriving in bursts.**
+        // Installing the world is not playing it: the document sits in the
+        // editor looking like an opened `.rbxl`, with the explorer, the tabs and
+        // no camera bound to a character, which is exactly what a person who
+        // joined someone's place must not see.
+        //
+        // This used to fire on the *first* batch. `start_play_live` then runs
+        // `install_client_core` + `Physics::new` + `start_core_scripts` on the
+        // frame thread, which is seconds of work — and it did it while the
+        // server was still streaming the place, so the batches that arrived
+        // during those seconds queued behind a frozen editor (the reason
+        // `BATCH_BACKLOG` had to grow) and the map arrived in the wrong order
+        // for whatever Play had already snapshotted. The report was "Play
+        // startup freezes the main thread in the middle of replication".
+        //
+        // The right moment is a gap: the initial patch arrives as bursts, and
+        // the quiet between two of them is the cheapest place to do seconds of
+        // synchronous work. See `live_world_settled`.
+        if self.game.play.is_none() && self.live_world_settled() {
+            self.join_win.play_next_tick = true;
         }
         self.live_join_overlay();
+    }
+
+    /// Whether the initial world has arrived well enough to start Play on it.
+    ///
+    /// Four facts, in the order they become true:
+    ///
+    /// * a batch has arrived at all (there is a `Players` to bind, usually);
+    /// * `LocalPlayer` is bound — Play without it is a session with a camera
+    ///   and no character to put behind it;
+    /// * `Workspace` has a replicated `BasePart` — the map, not just the
+    ///   services. A `Workspace` with nothing in it is the state a join sits in
+    ///   while `CoreGui`/`Players` arrive first, and starting Play there is what
+    ///   froze the editor mid-replication;
+    /// * replication has been quiet for [`LIVE_SETTLE_QUIET`] — the bursts are
+    ///   over, so the seconds Play spends synchronously do not hold up the
+    ///   batches that were about to arrive.
+    ///
+    /// A character arriving counts as arrived: the server sending one means it
+    /// considers the join complete, whatever the map looks like.
+    ///
+    /// [`LIVE_SETTLE_BOUND`] is the floor under all of it. A place whose parts
+    /// are all anchored and never move still sends them once, and a place that
+    /// streams its map for a minute must not be kept out of Play for a minute —
+    /// the person can watch the rest arrive from inside.
+    fn live_world_settled(&self) -> bool {
+        let Some(first) = self.join_win.live_first_batch else {
+            return false;
+        };
+        let doc = &self.game.doc;
+        let root = doc.dom.root_ref();
+        let local_player = doc
+            .find_child(root, "Players")
+            .and_then(|players| match doc.prop(players, "LocalPlayer") {
+                Some(Variant::Ref(p)) if doc.exists(p) => Some(p),
+                _ => None,
+            });
+        // A character anywhere under our Player is the server's own "you are in".
+        let character = local_player
+            .and_then(|player| match doc.prop(player, "Character") {
+                Some(Variant::Ref(c)) if doc.exists(c) => Some(c),
+                _ => None,
+            })
+            .is_some();
+        let parts = doc
+            .workspace()
+            .and_then(|ws| doc.dom.get_by_ref(ws))
+            .map(|ws| {
+                ws.children()
+                    .iter()
+                    .filter(|c| {
+                        doc.class_of(**c).is_some_and(|k| {
+                            k != "Terrain" && rustudio_core::doc::is_a(&k, "BasePart")
+                        })
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let quiet = self
+            .join_win
+            .live_last_batch
+            .is_some_and(|at| at.elapsed() >= LIVE_SETTLE_QUIET);
+        let bounded = first.elapsed() >= LIVE_SETTLE_BOUND;
+        let ready = local_player.is_some() && ((character || parts > 0) && quiet);
+        if bounded && !ready {
+            return true;
+        }
+        ready
     }
 
     /// What the world is made of, and what was refused building it (M3).
@@ -789,6 +896,20 @@ impl Editor {
             } else {
                 self.info("join: the session ended; the world it built is still here");
             }
+        }
+        // **Nothing at all once Play is running on the world.** Everything
+        // below this line paints an opaque sheet across the whole screen and
+        // swallows every tap; `cover_wants_banner` only decided *how much* of
+        // it was left. With `cover_until_played` cleared by `live_client_ready`
+        // (the character is bound — the game is playable), the banner was
+        // suppressed as a matter of course and `join_cover_phase` still answered
+        // `Some`, because the session keeps running for as long as the person
+        // plays. So the last state was the worst one: the world fully arrived,
+        // playable, and a wall the colour of the cover over all of it — the
+        // report's "the game never appears behind Joining". The flag *is* the
+        // rule; nothing here may outlive it.
+        if !self.join_win.cover_until_played {
+            return;
         }
         let Some(phase) = self.join_cover_phase() else {
             return;
@@ -1605,6 +1726,11 @@ impl Editor {
         self.join_win.live_logged_at = None;
         self.join_win.live_report_at = None;
         self.join_win.live_reported = false;
+        // A second join does not inherit the first one's clocks: with them,
+        // `LIVE_SETTLE_BOUND` would already have elapsed on the first batch and
+        // Play would start mid-patch — the thing the settle rule exists to stop.
+        self.join_win.live_first_batch = None;
+        self.join_win.live_last_batch = None;
         // A joined place fills the screen, as it does on Roblox: the game is
         // the whole window, not the dock's 3D view with Studio around it. That
         // is also what makes the joining cover a cover — and it is what
