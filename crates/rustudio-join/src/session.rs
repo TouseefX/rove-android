@@ -40,7 +40,7 @@ use rove_client_core::transport::session::{
     receive_unreliable, ReliableReceiver, ReliableSender,
 };
 #[cfg(feature = "transport")]
-use rove_client_core::transport::{connect_webtransport, IssuedAllocation};
+use rove_client_core::transport::{connect_webtransport, Connection, IssuedAllocation};
 
 /// The application and channel a join's login packets and replication stream
 /// travel on. Verified against rove's own live session (`live_session.rs`):
@@ -237,6 +237,12 @@ pub struct Session {
     pub markers: usize,
     /// Marker requests that could not be answered (an unreadable one).
     pub marker_refused: usize,
+    /// Marker replies held until the client has a scope **and** the initial
+    /// world tag. rove's own queue, ported rather than reimplemented: the order
+    /// and the gate are both part of the handshake.
+    markers_queue: rove_client_core::replication_out::MarkerQueue,
+    /// Marker replies actually written, as opposed to queued.
+    pub marker_replies: usize,
     /// The highest journal sequence acknowledged, and how many acknowledgments
     /// failed. The journal prunes behind the acknowledgment, so a session whose
     /// `acknowledged_through` is stuck at 0 is one the journal will fill.
@@ -344,6 +350,39 @@ pub struct Session {
     /// number is what names the reason a server is holding state back.
     pub program_challenges: u64,
     pub program_answered: u64,
+    /// **The world view before the receipt about to be drained.**
+    ///
+    /// `RuntimeDeltaNormalizer` refuses a record whose first action sequence is
+    /// at or below the view's sequence — it needs the world as it stood *before*
+    /// the delta, to know a `set`'s class and to prove a create is unambiguous.
+    /// The committed world is read *after* the packet, so this is captured at
+    /// ingest and consumed by the next drain.
+    pre_view: Option<rove_client_core::world::WorldView>,
+    /// rove's per-record normaliser. Built once the schema is installed: it
+    /// holds the class → property → type index that turns a raw wire value
+    /// (`ReplicationPV` type 57, `CFrame` type 27/51 without its tag, a
+    /// lowercase `size` type 22) into the one the bridge can convert. Without
+    /// it a live `Workspace` has every instance and **no `Part.CFrame` and no
+    /// `Part.Size`** — the map exists and cannot be drawn or stood on.
+    normalizer: Option<rove_client_core::runtime_delta::RuntimeDeltaNormalizer>,
+    /// The world tag `13`: rove's "the initial world has arrived". Some packets
+    /// (markers, streaming) must not be answered before it.
+    initial_tag: bool,
+    /// Records the normaliser refused, counted rather than swallowed: a refusal
+    /// here means the bridge read that record's raw wire shape.
+    normalize_refused: u64,
+    /// The `155` handler for this allocation: one per session, with its own
+    /// bounded duplicate cache and its own job id. Built on the first challenge.
+    program_auth: Option<crate::program_check::ProgramAuth>,
+    /// The allocation's `game.JobId`, which the challenge program reads.
+    game_id: Option<String>,
+    /// A test's scope, when there is no globals packet to commit one. Never set
+    /// in a real session: `core.scope()` is the only honest answer there.
+    marker_gate_open_for_test: bool,
+    /// Challenges refused (a bad container, a failed signature, a VM that would
+    /// not run it). Named separately from answered, because a server that holds
+    /// a client back names no reason of its own.
+    pub program_refused: u64,
     /// **Where this client is**, as `ReplicationFocus` asks the server to
     /// stream around: the last position fed in from the renderer (its camera
     /// or character). `None` until the first frame reports one.
@@ -362,6 +401,30 @@ pub struct Session {
     /// The property-acknowledgment payload in flight, until the transport says
     /// whether it was written.
     ack_in_flight: Option<u64>,
+    /// **The monotonic clock a ping reply's first three words are read from.**
+    ///
+    /// Milliseconds since this session was created, modulo `u32`. Not counters:
+    /// a reply whose "received / queued / written" words are packet and instance
+    /// counts makes the server's queue-delay estimate read seconds of delay for
+    /// a session with none, which is why a reply has to carry real clocks.
+    ping_clock: crate::ping::PingClock,
+    /// The ping request queue: bounded, one write in flight, telemetry-blocked
+    /// rather than filled in. Every request on `(4, 3)` — before globals from the
+    /// wire decoder, after globals from the committed record — goes here.
+    ping_responder: crate::ping::PingResponder,
+    /// What a ping reply's integrity word may say: only checks this session ran.
+    integrity: crate::session_integrity::SessionIntegrity,
+    /// `0xe3` on application 4: an extended packet family whose presence says
+    /// the legacy replication statistics this client does not collect are being
+    /// asked for, which blocks that part of a reply instead of sending zeros.
+    extended_family_seen: bool,
+    /// The capability bits the server negotiated at connect (`0x10_0000` is the
+    /// QUIC profile `rove` reports statistics-zero on).
+    negotiated: u64,
+    /// Replies the responder would not prepare (a missing observation, an
+    /// unsupported request). Counted so "requests with no replies" has a reason
+    /// next to it on the overlay.
+    pub ping_prepare_failures: u64,
 }
 
 impl Session {
@@ -390,6 +453,8 @@ impl Session {
             features: 0,
             markers: 0,
             marker_refused: 0,
+            markers_queue: rove_client_core::replication_out::MarkerQueue::new(),
+            marker_replies: 0,
             started: std::time::Instant::now(),
             rows_applied: 0,
             acknowledged_through: 0,
@@ -425,12 +490,27 @@ impl Session {
             unreadable_datagrams: 0,
             program_challenges: 0,
             program_answered: 0,
+            pre_view: None,
+            normalizer: None,
+            initial_tag: false,
+            normalize_refused: 0,
+            program_auth: None,
+            game_id: None,
+            marker_gate_open_for_test: false,
+            program_refused: 0,
             focus_position: None,
             focus_last_sent: None,
             focus_at: None,
             property_acks: rove_client_core::property_acknowledgments::PropertyAcknowledgments::new(),
             property_acks_sent: 0,
             ack_in_flight: None,
+            ping_clock: crate::ping::PingClock::new(std::time::Instant::now()),
+            ping_responder: crate::ping::PingResponder::new(64)
+                .expect("a ping queue bound of 64 is inside the protocol's 1..=128"),
+            integrity: crate::session_integrity::SessionIntegrity::new(),
+            extended_family_seen: false,
+            negotiated: 0,
+            ping_prepare_failures: 0,
         }
     }
 
@@ -465,6 +545,16 @@ impl Session {
         self.feed_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload)
     }
 
+    /// Feed a packet and report how many handshake replies it left behind.
+    ///
+    /// The network loop writes `outbound` after every packet and does not care
+    /// which packet asked; a test does, and this is the count it can assert
+    /// without reaching into the queue.
+    #[doc(hidden)]
+    pub fn outbound_len(&self) -> usize {
+        self.outbound.len()
+    }
+
     /// A packet that arrived on a known channel: dispatch on where it came
     /// from, then feed the world's packets to the decoder.
     ///
@@ -482,6 +572,14 @@ impl Session {
     ///
     /// Returns whether the packet was world state the decoder accepted.
     pub fn feed_on(&mut self, application: u8, channel: u32, payload: &[u8]) -> bool {
+        let fed = self.dispatch(application, channel, payload);
+        // After the packet, not inside it: see `settle`.
+        self.settle();
+        fed
+    }
+
+    /// The dispatch itself, without the handshakes a packet can unblock.
+    fn dispatch(&mut self, application: u8, channel: u32, payload: &[u8]) -> bool {
         self.note_arrival(application, channel, payload);
         // **A channel announcement**, before anything else looks at the packet:
         // it is how a datagram's bare `wire_id` becomes `(application,
@@ -489,7 +587,12 @@ impl Session {
         // on the world's. (`parse_control_open` is rove's own reader: a
         // ten-byte `2, app, channel u32 be, wire u32 be`.)
         if channel == rove_client_core::channels::CONTROL_CHANNEL {
-            return self.control_channel(application, payload);
+            let fed = self.control_channel(application, payload);
+            // A control packet can announce a channel, and a close can end a
+            // stream, but it never opens the marker gate; still, the settle is
+            // the same one place so a future arm cannot forget it.
+            self.settle();
+            return fed;
         }
         let kind = payload.first().copied().unwrap_or(0);
         match (application, channel, kind) {
@@ -550,11 +653,15 @@ impl Session {
             // report says how many went unanswered.
             (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 155) => {
                 self.program_challenges += 1;
-                log::warn!(
-                    "session: the server asked a signed-program challenge (155); \
-                     this client has no signature trust store, so none was answered"
-                );
-                false
+                match self.program_challenge(payload) {
+                    Some(reply) => {
+                        self.program_answered += 1;
+                        self.outbound
+                            .push(Outbound::Reply(application, channel, reply));
+                        true
+                    }
+                    None => false,
+                }
             }
             // The server's feature-name/value table: the one packet that says
             // which encoding the server will use for the session.
@@ -565,14 +672,19 @@ impl Session {
             // echoed, a zero trailer), and a client that only *counted* the
             // request left the handshake open — the world arrived slowly or not
             // at all. Answered here, where the request is understood.
+            //
+            // **Queued, not answered yet.** A marker reply sent before the
+            // client has its scope and the initial world tag is a reply about a
+            // world that does not exist yet: rove's own rule
+            // (`MarkerQueue::drain`) is to hold every marker until both are
+            // true, and to return them in receive order. Answering one early is
+            // worse than answering late — the server takes the marker as "this
+            // client has the world" and starts streaming into a session that
+            // cannot place what arrives.
             (REPLICATION_APPLICATION, REPLICATION_CHANNEL, 132) => {
                 self.markers += 1;
-                match rove_client_core::replication_out::marker_reply(payload) {
-                    Ok(reply) => {
-                        self.outbound
-                            .push(Outbound::Reply(application, channel, reply));
-                        true
-                    }
+                match self.markers_queue.add(payload) {
+                    Ok(()) => true,
                     Err(error) => {
                         // A marker we cannot read is the server's, not a reason
                         // to drop the session; counted so the report says so.
@@ -587,6 +699,17 @@ impl Session {
                 false
             }
         }
+    }
+
+    /// Finish the packet: release any marker the gate now allows, and answer any
+    /// ping a committed record carried.
+    ///
+    /// Both happen here rather than inside the arms because both depend on what
+    /// this packet changed: a marker's gate is opened by a *record* in an earlier
+    /// packet, and a ping is a record's own field. Calling this after the packet
+    /// has been fed is what makes the order right in one place instead of three.
+    fn settle(&mut self) {
+        self.drain_markers();
     }
 
     /// A packet on the reliable control channel: a datagram channel's
@@ -832,15 +955,7 @@ impl Session {
             return false;
         };
         // Our own Player: the one whose `UserId` is the account's.
-        let me = self.account_user_id.and_then(|uid| {
-            self.player_ids.iter().find(|id| {
-                view.class_name(id) == Some("Player")
-                    && view
-                        .get_property(id, "UserId")
-                        .and_then(|v| v.as_f64())
-                        .is_some_and(|v| v as u64 == uid)
-            })
-        });
+        let me = self.local_player_in(&view);
         // The evidence: a Player of ours exists, or a character has resolved.
         let character = self.character_seen;
         let Some(player) = me else {
@@ -854,7 +969,7 @@ impl Session {
             // tells the server we have a world we do not have.
             return false;
         }
-        let Some(property) = self.gameplay_paused_property_id() else {
+        let Some((property, property_type)) = self.gameplay_paused() else {
             return false;
         };
         let Ok(guid) = parse_instance_guid(player) else {
@@ -864,7 +979,12 @@ impl Session {
             player_spawned: character,
             spawn_region_received: true,
         };
-        match rove_client_core::replication_out::streaming_ready(guid, property, 9, evidence) {
+        match rove_client_core::replication_out::streaming_ready(
+            guid,
+            property,
+            property_type,
+            evidence,
+        ) {
             Ok(payload) => {
                 self.outbound
                     .push(Outbound::Reply(REPLICATION_APPLICATION, REPLICATION_CHANNEL, payload));
@@ -879,30 +999,67 @@ impl Session {
         }
     }
 
-    /// Whether one of our Players has a `Character` that is in the world.
-    fn character_present(&self) -> bool {
-        self.player_ids.iter().any(|id| {
-            self.live
-                .referent(id)
-                .is_some_and(|r| match self.document.prop(r, "Character") {
-                    // `rustudio-core` re-exports the DOM crate as `__rbx`, which
-                    // is how a crate that only holds a `Document` names its
-                    // values without depending on `rbx_dom_weak` itself.
-                    Some(rustudio_core::__rbx::types::Variant::Ref(c)) => self.document.exists(c),
-                    _ => false,
-                })
+    /// **Our own** `Player`, the one whose `UserId` is the account's.
+    ///
+    /// Ours specifically: a server sends every player in the place, and a
+    /// session that names the first `Player` it sees as "me" spawns, focuses
+    /// and simulates somebody else's character. `None` until the account id is
+    /// known and a `Player` carries it.
+    fn local_player_in(&self, view: &rove_client_core::world::WorldView) -> Option<&String> {
+        let uid = self.account_user_id?;
+        self.player_ids.iter().find(|id| {
+            view.class_name(id) == Some("Player")
+                && view
+                    .get_property(id, "UserId")
+                    .and_then(|v| v.as_f64())
+                    .is_some_and(|v| v as u64 == uid)
         })
     }
 
-    /// `Player.GameplayPaused`'s schema id, which the resume packet names.
-    fn gameplay_paused_property_id(&self) -> Option<u16> {
+    /// The same lookup against the committed world.
+    fn local_player(&self) -> Option<String> {
+        let view = self.core.world_view()?;
+        self.local_player_in(&view).cloned()
+    }
+
+    /// Whether **our** Player has a `Character` that is in the world.
+    ///
+    /// Any `Player` with a character is not the same question: the server sends
+    /// the whole `Players` service, so every other player in the place has one
+    /// long before ours exists. Answering with "somebody has a character" is
+    /// how a session decides it has spawned, tells the server it has the spawn
+    /// region, and then stands at the origin looking at its own overlay.
+    fn character_present(&self) -> bool {
+        let Some(me) = self.local_player() else {
+            return false;
+        };
+        self.live
+            .referent(&me)
+            .is_some_and(|r| match self.document.prop(r, "Character") {
+                // `rustudio-core` re-exports the DOM crate as `__rbx`, which
+                // is how a crate that only holds a `Document` names its
+                // values without depending on `rbx_dom_weak` itself.
+                Some(rustudio_core::__rbx::types::Variant::Ref(c)) => self.document.exists(c),
+                _ => false,
+            })
+    }
+
+    /// `Player.GameplayPaused`'s schema id **and type**, which the resume packet
+    /// names.
+    ///
+    /// Both, from the schema, rather than an id from one lookup and a hardcoded
+    /// `9` beside it: `streaming_ready` refuses a type that is not the boolean
+    /// the server expects, so a schema that spelled it differently would fail
+    /// silently with a number nobody could check. Read from one place and the
+    /// mismatch becomes this session's own refusal.
+    fn gameplay_paused(&self) -> Option<(u16, u8)> {
         let schema = self.core.schema()?;
         let class = schema.classes.iter().find(|c| c.name == "Player")?;
         let property = schema
             .properties
             .iter()
             .find(|p| p.name == "GameplayPaused" && class.properties.contains(&p.id))?;
-        u16::try_from(property.id).ok()
+        Some((u16::try_from(property.id).ok()?, property.type_id))
     }
 
     /// Where to ask the streamer to focus: the last region the server sent.
@@ -931,61 +1088,262 @@ impl Session {
         );
     }
 
-    /// A ping on `(4, 3)`, answered rather than counted.
+    /// A ping on `(4, 3)`, **before globals**: a request on the wire, not in a
+    /// committed record.
     ///
-    /// The reply echoes the request's own timestamp and word and adds the
-    /// session's statistics — there is no invented number in it. (rove's
-    /// encoding carries no clock word; the time-sync probe on the datagram
-    /// channel is what moves the replicator clock.) A ping that cannot be
-    /// answered truthfully leaves no reply and is counted, because a fabricated
-    /// reply is worse than a missing one: the server accepts it and trusts it.
+    /// Queued, not answered inline. A reply is built from observations taken at
+    /// three different moments — the packet's arrival, the queue's, and the
+    /// socket write's — and it is the transport that knows the last one. So this
+    /// only enqueues (with the arrival clock word), and `run` flushes the queue
+    /// before the next read.
+    ///
+    /// A request this client cannot answer truthfully is *blocked*: rove's
+    /// responder refuses a flagged request, a queue overflow, or a missing
+    /// observation, and a fabricated reply is worse than a missing one because
+    /// the server accepts it and then trusts the numbers.
     fn ping_requested(&mut self, payload: &[u8]) -> bool {
         self.pings += 1;
-        let telemetry = crate::ping::PingReplyTelemetry {
-            reply_words: self.ping_reply_words(),
-            integrity_status: self.integrity_status,
-        };
-        match crate::ping::reply_to_request(payload, &telemetry) {
-            Ok(Some(reply)) => {
-                self.outbound
-                    .push(Outbound::Reply(crate::ping::PING_APPLICATION, crate::ping::PING_CHANNEL, reply));
-                true
-            }
-            Ok(None) => {
-                // A packet of replies, not a request: nothing to answer.
+        // The arrival clock word, stamped here: the one moment this session can
+        // honestly call "received".
+        let received = self.ping_clock.word();
+        let mut telemetry = self.ping_telemetry();
+        match self
+            .ping_responder
+            .receive_packet(payload, received, &mut telemetry)
+        {
+            Ok(0) => {
+                // Replies, or requests the client does not support: counted by
+                // the responder, and nothing to write.
                 self.ping_unanswered += 1;
                 false
             }
+            Ok(_) => true,
             Err(error) => {
                 self.ping_refused += 1;
-                log::warn!("session: ping refused: {error}");
+                log::warn!("session: a ping packet was refused: {error:?}");
                 false
             }
         }
     }
 
-    /// The six statistics words a ping reply carries.
+    /// Release the marker replies the gate now allows.
     ///
-    /// rove's order: packets received, replication committed, instances known,
-    /// rows applied, held-then-released, and the count refused. They are read
-    /// from the session's own counters rather than estimated, because the server
-    /// compares them against what it sent.
-    fn ping_reply_words(&self) -> [u32; 6] {
-        let word = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
-        [
-            word(self.ingested.packets),
-            word(self.ingested.replication),
-            word(self.document().dom.len()),
-            word(self.journal_rows()),
-            word(self.held),
-            word(self.ingested.refused),
-        ]
+    /// Called after every packet *and* after every record: a marker arrives as
+    /// its own packet and commits no record, so draining only after a record
+    /// would hold it until the next one — and the gate's second fact (the
+    /// initial world tag) usually becomes true in a record that arrived before
+    /// the marker did. Cheap when the queue is empty, which is most packets.
+    fn drain_markers(&mut self) {
+        if self.markers_queue.is_empty() {
+            return;
+        }
+        let readiness = rove_client_core::replication_out::MarkerReadiness {
+            client_scope_received: self.core.scope().is_some() || self.marker_gate_open_for_test,
+            initial_world_tag_received: self.initial_tag,
+        };
+        for reply in self.markers_queue.drain(readiness) {
+            self.outbound.push(Outbound::Reply(
+                REPLICATION_APPLICATION,
+                REPLICATION_CHANNEL,
+                reply,
+            ));
+            self.marker_replies += 1;
+        }
+    }
+
+    /// **Post-globals pings, which live in the record.**
+    ///
+    /// Once globals commit, `(4, 3, 131)` is world state to the decoder: the
+    /// packet is committed as a receipt and its ping items land in
+    /// `SessionRecord.pings`. This is where they are read. It is the whole of
+    /// gap 3A — a session that fed those packets to the decoder and never looked
+    /// at `record.pings` answered nothing at all after globals, so the server
+    /// stopped trusting the client's liveness a second into the join.
+    fn pings_for_record(&mut self, pings: &[serde_json::Value]) -> usize {
+        if pings.is_empty() {
+            return 0;
+        }
+        self.pings += pings.len();
+        let received = self.ping_clock.word();
+        let mut telemetry = self.ping_telemetry();
+        match self
+            .ping_responder
+            .receive_records(pings, received, &mut telemetry)
+        {
+            Ok(enqueued) => {
+                if enqueued == 0 {
+                    self.ping_unanswered += 1;
+                }
+                enqueued
+            }
+            Err(error) => {
+                self.ping_refused += 1;
+                log::warn!("session: committed ping records were refused: {error:?}");
+                0
+            }
+        }
+    }
+
+    /// This session's observations, as the responder asks for them.
+    ///
+    /// The statistics provider is deliberately strict about the profile: on
+    /// anything but the QUIC profile (or once an `0xe3` extended-family packet
+    /// has been seen) the legacy replication statistics are *not* collected, and
+    /// zero is not a reading. It blocks the reply, as upstream blocks it.
+    fn ping_telemetry(&self) -> SessionPingTelemetry {
+        SessionPingTelemetry {
+            clock: self.ping_clock,
+            supported_profile: matches!(self.negotiated, 0 | 0x10_0000),
+            extended_family_seen: self.extended_family_seen,
+            integrity: self.integrity.clone(),
+        }
+    }
+
+    /// Whether a reply is waiting and which route it takes: the transport owner
+    /// asks before each flush so an unreliable reply goes out as a datagram.
+    pub fn ping_pending_route(&self) -> Option<crate::ping::DeliveryRoute> {
+        self.ping_responder.front_route()
+    }
+
+    /// Prepare the next reply. Called by the transport owner immediately before
+    /// the write, and only then: the write clock word is sampled inside.
+    pub fn prepare_ping_reply(
+        &mut self,
+    ) -> Option<crate::ping::PreparedPing> {
+        let mut telemetry = self.ping_telemetry();
+        match self.ping_responder.prepare(&mut telemetry) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Blocked or dropped, never sent with invented content. The
+                // responder's diagnostics say which provider was missing; the
+                // log names it so a report can be read without guessing.
+                if self.ping_prepare_failures < 3 {
+                    log::warn!("session: a ping reply was not prepared: {error:?}");
+                }
+                self.ping_prepare_failures += 1;
+                None
+            }
+        }
+    }
+
+    /// Report an in-flight reply's write, which is what advances the queue.
+    pub fn ping_reply_written(&mut self, token: u128, written: bool) {
+        match self.ping_responder.commit(token, written) {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(error) => log::warn!("session: ping write accounting failed: {error}"),
+        }
+    }
+
+    /// The observations a reply is built from, at the moment of the write.
+    pub fn ping_counts(&self) -> crate::ping::PingDiagnostics {
+        self.ping_responder.diagnostics()
+    }
+
+    /// Replies still queued: a rising number with a flat sent count is a client
+    /// whose writes are failing, which the overlay must show.
+    pub fn ping_pending(&self) -> usize {
+        self.ping_responder.pending()
+    }
+
+    /// The negotiated capability bits, recorded by `run` at connect.
+    pub fn set_negotiated(&mut self, negotiated: u64) {
+        self.negotiated = negotiated;
+    }
+
+    /// An `0xe3` packet on application 4 was seen: the session is on an extended
+    /// family whose statistics this client does not collect.
+    pub fn note_extended_family(&mut self) {
+        self.extended_family_seen = true;
+    }
+
+    /// **A signed-program challenge (`155`), answered by running it.**
+    ///
+    /// The reply is `[155, second, answer]` with the answer the signed program
+    /// itself returned: the trust table verifies the program, the program's own
+    /// arithmetic produces the number, and nothing here knows what it will be.
+    /// A challenge this session cannot verify or run is refused and counted —
+    /// the server then holds back whatever it was gating, and the report names
+    /// the reason rather than showing an answer that was invented.
+    fn program_challenge(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+        if self.program_auth.is_none() {
+            // Built once, from the embedded table and this allocation's job id.
+            match crate::program_check::PublicTrust::embedded() {
+                Ok(trust) => {
+                    match crate::program_check::ProgramAuth::for_allocation(
+                        self.game_id.as_deref(),
+                        trust,
+                    ) {
+                        Ok(mut auth) => {
+                            auth.set_integrity(self.integrity.clone());
+                            self.program_auth = Some(auth);
+                        }
+                        Err(error) => {
+                            self.program_refused += 1;
+                            log::warn!("session: no program challenge can be answered: {error}");
+                            return None;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.program_refused += 1;
+                    log::warn!("session: the embedded signature table was refused: {error}");
+                    return None;
+                }
+            }
+        }
+        match self.program_auth.as_mut().expect("built above").handle(payload) {
+            Ok(reply) => {
+                log::info!(
+                    "session: answered a signed-program challenge (155) with the program's \
+                     own result"
+                );
+                Some(reply)
+            }
+            Err(error) => {
+                self.program_refused += 1;
+                log::warn!("session: a signed-program challenge was refused: {}", error.reason());
+                None
+            }
+        }
+    }
+
+    /// Open the marker gate without a server, for a test.
+    ///
+    /// The gate is two facts — a scope and the initial world tag — and a unit
+    /// test has no globals packet and no tag to give it. This says the two
+    /// things the gate asks about, and nothing about the world: it is
+    /// `#[doc(hidden)]` and exists so the *queue* can be tested (held before,
+    /// answered after) without a recording of a real join.
+    #[doc(hidden)]
+    pub fn open_marker_gate_for_test(&mut self) {
+        self.initial_tag = true;
+        self.marker_gate_open_for_test = true;
+    }
+
+    /// The programme-challenge counts, for the report: what arrived, what was
+    /// answered, and what was refused with which reason.
+    pub fn program_summary(&self) -> serde_json::Value {
+        let mut summary = self
+            .program_auth
+            .as_ref()
+            .map(|auth| auth.summary())
+            .unwrap_or_else(|| serde_json::json!({}));
+        summary["challenges_received"] = serde_json::json!(self.program_challenges);
+        summary["challenges_answered"] = serde_json::json!(self.program_answered);
+        summary["challenges_refused_here"] = serde_json::json!(self.program_refused);
+        summary
     }
 
     /// A compact instance-state packet (161), which upstream reads through
     /// `ingest_instance_state` rather than `ingest`.
     fn feed_instance_state(&mut self, payload: &[u8]) -> bool {
         self.ingested.packets += 1;
+        // The world as it stood before this packet: what the normaliser needs
+        // to read the record the ingest is about to commit. (Captured here and
+        // not in the drain because by then the commit has moved the view past
+        // the record's own sequence.)
+        self.pre_view = self.core.world_view();
         match self.core.ingest_instance_state(payload) {
             Ok(Some(outcome)) => {
                 match outcome {
@@ -1064,6 +1422,7 @@ impl Session {
     /// itself takes only the payload.
     fn feed_inner_on(&mut self, _application: u8, _channel: u32, payload: &[u8]) -> bool {
         self.ingested.packets += 1;
+        self.pre_view = self.core.world_view();
         match self.core.ingest(payload) {
             Ok(outcome) => {
                 match outcome {
@@ -1171,6 +1530,17 @@ impl Session {
             unknown_datagrams: self.unknown_datagrams,
             property_acks_sent: self.property_acks_sent,
             program_challenges: self.program_challenges,
+            program_answered: self.program_answered,
+            normalize_refused: self.normalize_refused,
+            pings_answered: self.ping_counts().replies_sent,
+            pings_pending: self.ping_pending(),
+            pings_blocked: {
+                let counts = self.ping_counts();
+                counts.unsupported_requests
+                    + counts.queue_overflows
+                    + counts.telemetry_failed_requests
+                    + self.ping_prepare_failures
+            },
         }
     }
 
@@ -1197,12 +1567,78 @@ impl Session {
         // is the contract the journal documents; acknowledging before applying
         // would let it prune data this loop still has to read.
         let mut through = self.cursor;
+        // The normaliser is the schema's, built once. It is the one thing
+        // between rove's wire spelling and the bridge's: `ReplicationPV`
+        // (type 57) copied into `CFrame`, a `CFrame` (27/51) given its
+        // `"$cframe"` tag and an explicit identity rotation, a lowercase `size`
+        // (22) copied into `Size`. Every one of those is a property the report
+        // used to count as "written" while the DOM stayed at its default.
+        if self.normalizer.is_none() {
+            // Built into a local first: the schema borrow of `core` must end
+            // before the normaliser is stored next to it.
+            let built = self
+                .core
+                .schema()
+                .map(rove_client_core::runtime_delta::RuntimeDeltaNormalizer::new);
+            match built {
+                Some(Ok(normalizer)) => self.normalizer = Some(normalizer),
+                Some(Err(error)) => {
+                    log::warn!("session: rove refused this schema's normalizer: {error}");
+                }
+                None => {}
+            }
+        }
+        // The world as it stood before this packet, read once for the batch.
+        //
+        // The globals packet is the one receipt with no world before it, and it
+        // is also the record that creates the `DataModel`, the services and our
+        // own `Player`. So an absent view means the empty one — not "skip
+        // normalization", which is how the globals record would arrive raw.
+        let pre_view = Some(self.pre_view.clone().unwrap_or_else(empty_world_view));
         for row in rows {
-            // `SessionDelta` derefs to rove's delta JSON, so this is the
-            // actions array rather than a field of the record.
-            let actions = row.value.world_delta["actions"]
-                .as_array()
-                .cloned()
+            // The world as it stood before this record. Each drain consumes the
+            // one captured at ingest; a second record in the same batch reuses
+            // it only when its sequence is still above that view's, which the
+            // normaliser checks and refuses rather than guessing at.
+            //
+            // It is *not* consumed: a packet can commit more than one record,
+            // and every record in it needs the same "before the packet" world.
+            // The normaliser itself refuses a view that is too new, so a stale
+            // one can only cost a normalization, never a misread.
+            // Tag 13 is rove's "the initial world has arrived". It is read from
+            // the record, as upstream reads it, before the record is given to
+            // the normaliser — records after it may emit compact creates.
+            self.initial_tag |= row.value.tags.contains(&13);
+            let normalized = match &mut self.normalizer {
+                Some(normalizer) => {
+                    match normalizer.normalize(pre_view, &row.value, self.initial_tag) {
+                        Ok(normalized) => Some(normalized.worker_delta),
+                        Err(error) => {
+                            self.normalize_refused += 1;
+                            if self.normalize_refused <= 3 {
+                                log::warn!(
+                                    "session: record {} was not normalized ({error}); its raw \
+                                     wire values are being read instead",
+                                    row.sequence
+                                );
+                            }
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            // The normalized actions, not the raw ones. The raw shape is what
+            // left a live `Workspace` with 954 instances and zero `CFrame`s.
+            let actions = normalized
+                .as_ref()
+                .and_then(|delta| delta["actions"].as_array().cloned())
+                .or_else(|| {
+                    // No normaliser yet (no schema, or a view it could not
+                    // use): the raw actions still build instances, and a world
+                    // that is half right beats a world that stops.
+                    row.value.world_delta["actions"].as_array().cloned()
+                })
                 .unwrap_or_default();
             self.cursor = row.sequence;
             through = row.sequence;
@@ -1248,6 +1684,16 @@ impl Session {
             if !self.character_seen && self.character_present() {
                 self.character_seen = true;
             }
+            // **The pings this record carried.** After globals, a `(4, 3, 131)`
+            // packet is world state to the decoder and its requests land in
+            // `record.pings`; nothing else reads them, which is why a session
+            // that had joined successfully answered no ping at all a second in.
+            self.pings_for_record(&row.value.pings);
+            // **Markers, once the gate is open.** Both facts are required: a
+            // scope (globals committed) and the initial world tag (this record's
+            // own `13`). The drain is in receive order, so the answers the server
+            // is waiting on go out in the order it asked.
+            self.drain_markers();
             // **Acknowledge the `CFrame`s this record changed.** The server
             // keeps a property's next version queued until the client confirms
             // the one it sent; a client that only reads is a client the world
@@ -1481,6 +1927,17 @@ pub async fn run(
     mut progress: impl FnMut(&Session),
 ) -> Result<Stage, &'static str> {
     let allocation = transport_allocation(issued)?;
+    // **Whose character to look for.** The join allocation names the user; every
+    // "our Player", "our character" and "our control" decision in this session
+    // is a comparison against it. It was never assigned, so `local_player()`
+    // answered `None` for a whole session and no character was ever recognised
+    // as ours even when the server sent it.
+    session.account_user_id = Some(issued.user_id);
+    // The job id a `155` challenge program reads as `game.JobId`. Set from the
+    // allocation here, once, so the first challenge has it.
+    if session.game_id.is_none() {
+        session.game_id = issued.game_id.clone();
+    }
     session.stage = Stage::Allocated;
     let (endpoint, connection, _socket) = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -1522,6 +1979,10 @@ pub async fn run(
         return Err("the server did not negotiate the bytecode range");
     }
     log::info!("session: capabilities negotiated: {negotiated:016x}");
+    // The ping responder reads the profile from these bits: on the QUIC profile
+    // the legacy replication statistics are not collected, and the reply says so
+    // by blocking that provider rather than sending a zero it never measured.
+    session.set_negotiated(negotiated);
 
     // --- Before the login packets: the clock and time-sync the server expects
     // a client to have set up. rove's live session does exactly this, in this
@@ -1551,6 +2012,10 @@ pub async fn run(
     for (channel, wire) in [(2u8, 2u32), (3, 4)] {
         session.channels.insert(wire, (6, u32::from(channel)));
     }
+    // Unreliable replies (a ping request whose route byte asked for one) get
+    // their own announced wire id, `rove`'s `PING_WIRE_ID = 6`. One writer for
+    // the session: the announcement is once, and the sequence is per connection.
+    let mut unreliable_writer = UnreliableWriter::default();
     let mut sync = TimeSyncProbe::default();
     sync.start(&clock).map_err(|_| "the time-sync probe could not be started")?;
     log::info!("session: wire clock initialized, clock channels 6/1, 6/2, 6/3 announced");
@@ -1680,11 +2145,21 @@ pub async fn run(
                     end = Some("every stream reader finished");
                     break;
                 };
+                // An `0xe3` on application 4 is the extended packet family: once
+                // one is seen the legacy statistics are not this session's to
+                // report, and its ping replies stop carrying them.
+                if application == REPLICATION_APPLICATION && payload.first() == Some(&0xe3) {
+                    session.note_extended_family();
+                }
                 session.feed_on(application, channel, &payload);
                 // Anything the packet asked for, written before the next one is
                 // read: a handshake the server is waiting on must not queue
                 // behind the world it is holding back.
                 flush_outbound(&mut session, &sender).await;
+                // Pings last, and every time: a record's requests were queued by
+                // the feed above, and a reply is only timely if it is written
+                // before the next read.
+                flush_pings(&mut session, &sender, &connection, &mut unreliable_writer).await;
                 // Republished every 16 packets: often enough that the overlay
                 // moves, rarely enough that the lock is not the hot path.
                 fed += 1;
@@ -1731,6 +2206,10 @@ pub async fn run(
                 if session.refocus(from_editor) {
                     flush_outbound(&mut session, &sender).await;
                 }
+                // The 20 ms tick is the other place replies go out: a request
+                // queued by a record is answered here when the read loop is
+                // quiet, which is most of a joined session.
+                flush_pings(&mut session, &sender, &connection, &mut unreliable_writer).await;
             }
             // **A datagram, routed by its announcement.** This used to keep
             // only the clock's and throw the rest away, which is exactly the
@@ -1775,6 +2254,8 @@ pub async fn run(
                         // timing, and a reply queued behind the next read is a
                         // reply the server has already given up on.
                         flush_outbound(&mut session, &sender).await;
+                        flush_pings(&mut session, &sender, &connection, &mut unreliable_writer)
+                            .await;
                     }
                     // A datagram that will not parse is not the end of the
                     // connection: count it and read the next one.
@@ -1825,6 +2306,124 @@ pub async fn run(
     Ok(session.stage.clone())
 }
 
+/// One unreliable reply channel: announce it once, then send datagrams.
+///
+/// `rove`'s `PingWriter`, reduced to what a join needs. An unreliable reply
+/// must not be written on the reliable stream: the server's timing reads the
+/// *route* the request asked for, and a datagram's sequence is part of the
+/// measurement. The announcement is `control_open(4, 3, 6)` on the control
+/// channel, once, before the first datagram — a bare `wire_id` with no
+/// announcement is a datagram the server cannot attribute.
+#[cfg(feature = "transport")]
+#[derive(Default)]
+struct UnreliableWriter {
+    announced: bool,
+    sequence: u64,
+}
+
+#[cfg(feature = "transport")]
+impl UnreliableWriter {
+    async fn send(
+        &mut self,
+        sender: &ReliableSender,
+        connection: &Connection,
+        application: u8,
+        channel: u32,
+        wire_id: u32,
+        payload: &[u8],
+    ) -> Result<(), &'static str> {
+        if !self.announced {
+            let announcement = rove_client_core::channels::control_open(
+                application,
+                u8::try_from(channel).map_err(|_| "the channel number is too large")?,
+                wire_id,
+            )
+            .map_err(|_| "the datagram channel could not be announced")?;
+            sender
+                .send(
+                    application,
+                    rove_client_core::channels::CONTROL_CHANNEL,
+                    &announcement,
+                )
+                .await
+                .map_err(|_| "the datagram channel announcement was not written")?;
+            self.announced = true;
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or("the datagram sequence is exhausted")?;
+        rove_client_core::transport::session::send_unreliable(
+            connection,
+            wire_id,
+            self.sequence,
+            payload,
+        )
+        .map_err(|_| "the datagram was not written")
+    }
+}
+
+/// **Write every reply the session is waiting to answer, on the route asked.**
+///
+/// A ping reply is the reason this exists as a separate step from
+/// [`flush_outbound`]: its three clock words are *received, queued, written*, so
+/// the last one can only be sampled here, at the write. An unreliable request is
+/// answered with a datagram on its own announced wire id; a reliable one goes out
+/// on `(4, 3)` as before.
+///
+/// Nothing is sent with an observation missing: the responder blocks the reply,
+/// counts why, and drops it. A reply the server accepts and then trusts is worse
+/// than one it never got.
+#[cfg(feature = "transport")]
+async fn flush_pings(
+    session: &mut Session,
+    sender: &ReliableSender,
+    connection: &Connection,
+    unreliable: &mut UnreliableWriter,
+) {
+    // Bounded, as upstream's flush is: a server that floods requests must not
+    // hold the read loop here.
+    for _ in 0..crate::ping::MAX_FLUSH_BATCH {
+        let Some(route) = session.ping_pending_route() else {
+            return;
+        };
+        let Some(prepared) = session.prepare_ping_reply() else {
+            // Blocked at prepare: the responder already dropped it and counted
+            // which observation was missing, so this moves to the next.
+            continue;
+        };
+        let token = prepared.token();
+        let written = match route {
+            crate::ping::DeliveryRoute::Reliable => sender
+                .send(
+                    crate::ping::PING_APPLICATION,
+                    crate::ping::PING_CHANNEL,
+                    prepared.payload(),
+                )
+                .await
+                .is_ok(),
+            crate::ping::DeliveryRoute::Unreliable => unreliable
+                .send(
+                    sender,
+                    connection,
+                    crate::ping::PING_APPLICATION,
+                    crate::ping::PING_CHANNEL,
+                    crate::ping::PING_WIRE_ID,
+                    prepared.payload(),
+                )
+                .await
+                .is_ok(),
+        };
+        if written {
+            session.replies_sent += 1;
+        } else {
+            session.replies_failed += 1;
+            log::warn!("session: a ping reply could not be written");
+        }
+        session.ping_reply_written(token, written);
+    }
+}
+
 /// Write everything a session has queued, in order, and account for it.
 ///
 /// The session's replies are all `(application, channel, payload)` — marker
@@ -1869,6 +2468,48 @@ async fn flush_outbound(session: &mut Session, sender: &ReliableSender) {
     }
     if let Some(written) = ack_written {
         session.property_ack_written(written);
+    }
+}
+
+/// This session's ping observations.
+///
+/// A provider, not a snapshot: the responder calls it at the moment each word is
+/// needed, and every method may refuse. Refusing is the point — the alternative
+/// is a reply with a zero in a field the server reads as a measurement.
+struct SessionPingTelemetry {
+    clock: crate::ping::PingClock,
+    supported_profile: bool,
+    extended_family_seen: bool,
+    integrity: crate::session_integrity::SessionIntegrity,
+}
+
+impl crate::ping::PingTelemetryProvider for SessionPingTelemetry {
+    fn enqueue_clock_word(&mut self) -> Result<u32, &'static str> {
+        Ok(self.clock.word())
+    }
+
+    fn write_clock_word(&mut self) -> Result<u32, &'static str> {
+        // Sampled at the write, which is why `prepare` is called there and
+        // nowhere earlier.
+        Ok(self.clock.word())
+    }
+
+    fn replication_stats(&mut self) -> Result<crate::ping::ReplicationPingStats, &'static str> {
+        if !self.supported_profile || self.extended_family_seen {
+            // Upstream's exact refusal: the legacy statistics belong to a packet
+            // family this session is not on, and zero is not a reading of them.
+            return Err("the server's replication-statistics profile is not collected here");
+        }
+        Ok(crate::ping::ReplicationPingStats {
+            replication_word: 0,
+            tail_words: [0, 0],
+        })
+    }
+
+    fn integrity_status(
+        &mut self,
+    ) -> Result<crate::ping::IntegrityStatusEvidence, &'static str> {
+        self.integrity.wire_evidence()
     }
 }
 
@@ -1924,4 +2565,20 @@ fn parse_instance_guid(id: &str) -> Result<(u32, u32), ()> {
         return Err(());
     }
     Ok((scope, index))
+}
+
+/// The world before the first packet: no nodes, sequence zero.
+///
+/// The globals receipt is the only one that has no world before it, and the
+/// normaliser needs *a* view to check its base sequence against. rove's own
+/// session builds the same empty store internally (`session.rs`, `empty_world`),
+/// so this is the same starting point, not a second opinion about one.
+fn empty_world_view() -> rove_client_core::world::WorldView {
+    rove_client_core::world::WorldStore::from_snapshot(&serde_json::json!({
+        "version": 1,
+        "sequence": 0,
+        "nodes": []
+    }))
+    .expect("the built-in empty world snapshot is valid")
+    .view()
 }

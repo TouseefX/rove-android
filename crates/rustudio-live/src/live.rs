@@ -480,6 +480,17 @@ impl Live {
                 for (property, value) in values {
                     instance.properties.insert(ustr(&property), value);
                     stats.properties += 1;
+                    // **A create's properties are written properties too.**
+                    // Only `set` recorded them, so the report's per-property
+                    // count was a count of *updates*: a joined world whose
+                    // parts were all created with their `CFrame` reported
+                    // `Part.CFrame 0`, which reads as "the frames never
+                    // arrived" when in fact every one did. That is the number
+                    // the M3 report is read for.
+                    *self
+                        .written_properties
+                        .entry(format!("{class}.{property}"))
+                        .or_default() += 1;
                 }
             }
         }

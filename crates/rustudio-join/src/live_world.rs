@@ -115,8 +115,31 @@ pub struct Counters {
     pub unknown_datagrams: u64,
     /// `CFrame` acknowledgments written back on `(4, 1)`.
     pub property_acks_sent: u64,
-    /// Signed-program challenges (`155`) received, and answered.
+    /// Signed-program challenges (`155`) received, and answered. The pair is
+    /// the single most important number in a live report: a server that asks and
+    /// is not answered holds the character and the map back, and a report with
+    /// `12/0` here says why nothing else moved.
     pub program_challenges: u64,
+    pub program_answered: u64,
+    /// **Pings, as the queue sees them.** `pings_answered` is replies actually
+    /// written; `pings_pending` is what is still queued. A session whose
+    /// received count climbs while the answered count stands still is one the
+    /// server has stopped hearing from, and the two numbers next to each other
+    /// are how that is seen on a phone.
+    pub pings_answered: u64,
+    pub pings_pending: usize,
+    /// Requests the responder refused to answer: an unsupported request, a full
+    /// queue, or an observation it did not have. Named separately from the
+    /// answered count because "no reply" and "a reply that was not sent" are
+    /// different faults.
+    pub pings_blocked: u64,
+    /// **Records the delta normaliser refused.** Non-zero means some batches
+    /// reached the bridge in rove's raw wire spelling, where a `Part.CFrame`
+    /// is a `ReplicationPV` (type 57) and a `Part.Size` is a lowercase `size`
+    /// (type 22) — instances that exist and cannot be placed. The number is on
+    /// the overlay because "954 instances and nothing moving" has two causes,
+    /// and this one is invisible everywhere else.
+    pub normalize_refused: u64,
 }
 
 impl Counters {
@@ -126,7 +149,7 @@ impl Counters {
         let line = format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
              acked {}/{} held · markers {}/{} · stream {}/{} {} · \
-             dgram {}/{} on {} ch · acks {} · focus {} · {} s · {}",
+             dgram {}/{} on {} ch · acks {} · ping {}/{} ({} blocked) · focus {} · {} s · {}",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
             self.replication,
@@ -150,11 +173,31 @@ impl Counters {
             self.datagrams_fed + self.unknown_datagrams,
             self.datagram_channels,
             self.property_acks_sent,
-            self.focus_sent,
+            // Pings: the overlay used to print `markers sent/replies` here,
+            // which is the ping pair a person reads a live session by.
+            self.pings_answered,
+            self.pings,
+            self.pings_blocked,
             self.seconds,
-            // The diagnosis, only when there is one: an unannounced wire id
-            // means the client was not told which channel a datagram belongs
-            // to, which is a different fault from "the server sent nothing".
+            // The first diagnosis, and only when there is one: a challenge the
+            // server asked and this client did not answer is the reason a join
+            // stops halfway, and it is invisible in every other number here.
+            // The rest follow in the order a reader asks about them.
+            if self.program_challenges > self.program_answered {
+                format!(
+                    " · 155 {}/{} answered",
+                    self.program_answered, self.program_challenges
+                )
+            } else if self.normalize_refused > 0 {
+                format!(" · {} record(s) unnormalized", self.normalize_refused)
+            } else if self.pings_pending > 0 {
+                format!(" · {} ping(s) queued", self.pings_pending)
+            } else {
+                String::new()
+            },
+            // ... and the second: an unannounced wire id means the client was
+            // not told which channel a datagram belongs to, which is a different
+            // fault from "the server sent nothing".
             if self.unknown_datagrams > 0 {
                 format!(
                     " · {} datagram(s) on unannounced wire ids",
@@ -165,6 +208,11 @@ impl Counters {
             }
         );
         line
+    }
+
+    /// Records that bypassed normalization, for the same one-line diagnosis.
+    pub fn unnormalized(&self) -> bool {
+        self.normalize_refused > 0
     }
 
     /// Packets arrived but built no instance: a session that is reading and not

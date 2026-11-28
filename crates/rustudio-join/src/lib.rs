@@ -46,6 +46,16 @@ pub mod login;
 pub mod session;
 // The replication ping on `(4, 3)`: rove's codec, and the reply a request takes.
 pub mod ping;
+// What a ping reply's integrity word is allowed to say: only checks this session
+// really ran, sticky once failed, and nothing at all when a report was spoilt.
+pub mod session_integrity;
+// The signed-program challenge (`155`): the RSB1 container, the V1 signature
+// over the pinned public table, and the reply built from the program's own
+// answer. Ported from rove, with the trust assets embedded for Android.
+pub mod program_check;
+// Luau bytecode normalization, and the isolated VM a verified challenge runs in.
+pub mod bytecode_format;
+pub mod program_vm;
 // The handover that makes a join *stay* joined (M3): the document moves between
 // the session's thread and the renderer's instead of being copied or diffed.
 pub mod live_world;

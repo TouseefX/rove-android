@@ -387,11 +387,27 @@ fn a_marker_request_leaves_a_reply_for_the_network_loop() {
         "a marker request is accepted"
     );
     assert_eq!(session.markers, 1, "and counted");
+
+    // **Queued, not answered yet.** The reply is held until the client has a
+    // scope *and* the initial world tag (rove's `MarkerQueue`): answering before
+    // those is telling the server this client has a world it does not have yet.
+    // With no globals and no world here, nothing may go out on the marker path —
+    // the dispatch's own comment says why, and this asserts it.
     assert_eq!(
-        session.outbound.len(),
-        1,
-        "a request the server waits on leaves a reply to write"
+        session.outbound_len(),
+        0,
+        "a marker is held until the world gate opens"
     );
+
+    // Open the gate the way a committed world does — a scope and tag `13` — and
+    // feed one marker: now it is answered, on the request's own stream, with
+    // rove's own encoding. A session whose gate never opens queues the request
+    // and writes nothing, which is the honest behaviour and the one asserted
+    // above.
+    let mut session = Session::new();
+    session.open_marker_gate_for_test();
+    assert!(session.feed_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, &request));
+    assert_eq!(session.outbound_len(), 1, "the gate is open: it is answered");
     let reply = session.outbound[0].payload();
     assert_eq!(
         (session.outbound[0].application(), session.outbound[0].channel()),
@@ -416,8 +432,9 @@ fn a_malformed_marker_is_refused_without_a_reply() {
     assert!(!session.feed_on(REPLICATION_APPLICATION, REPLICATION_CHANNEL, &[132u8, 1, 2]));
     assert_eq!(session.markers, 1, "it was still a marker arrival");
     assert_eq!(session.marker_refused, 1, "and its refusal is named");
-    assert!(
-        session.outbound.is_empty(),
+    assert_eq!(
+        session.outbound_len(),
+        0,
         "an unreadable request gets no invented answer"
     );
 }

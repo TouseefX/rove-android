@@ -188,6 +188,21 @@ impl Default for JoinWindow {
 }
 
 impl JoinWindow {
+    /// **Where this client stands**, for `ReplicationFocus`.
+    ///
+    /// The local character's root part, if a character has resolved: a
+    /// streaming server sends the parts around this point, so following the
+    /// character is what keeps a walked-away client from being streamed the
+    /// region it left. `None` before there is one, and the camera answers then.
+    ///
+    /// Read from the live document rather than the gameplay state because this
+    /// is the same `Document` the session's deltas are applied to: the root's
+    /// `CFrame` is exactly what the server last said, or what the local
+    /// simulation last wrote.
+    fn character_focus(&self) -> Option<glam::Vec3> {
+        character_focus_in(&self.game.doc)
+    }
+
     pub fn new() -> Self {
         Self {
             open: false,
@@ -498,6 +513,38 @@ impl Editor {
                     top.join(", ")
                 ));
             }
+            // **The handshake numbers**, which are a different question from
+            // what the world is made of: `155` answered out of received, pings
+            // answered out of received, markers drained, and `CFrame` acks
+            // written. A live report used to list the world and stop there, so a
+            // join held back by an unanswered challenge looked exactly like a
+            // join whose map was arriving slowly.
+            // The counters the handover last published, not a fresh read: the
+            // report describes the same moment the overlay line does.
+            let counters = self.join_win.live.clone();
+            if let Some(counters) = counters.as_ref() {
+                lines.push(format!(
+                    "join live: 155 {}/{} answered · ping {}/{} ({} blocked) · \
+                     markers {} · acks {} · regions {} · focus {}",
+                    counters.program_answered,
+                    counters.program_challenges,
+                    counters.pings_answered,
+                    counters.pings,
+                    counters.pings_blocked,
+                    counters.markers,
+                    counters.property_acks_sent,
+                    counters.regions,
+                    counters.focus_sent,
+                ));
+                if counters.program_challenges > counters.program_answered {
+                    lines.push(format!(
+                        "join live: the server asked {} signed-program challenge(s) this \
+                         client did not answer — it holds the character and the map back \
+                         until one is",
+                        counters.program_challenges - counters.program_answered
+                    ));
+                }
+            }
             let classes = live.refused_classes();
             if !classes.is_empty() {
                 // Sorted, because the point is the top of the list: a world of
@@ -552,7 +599,19 @@ impl Editor {
         // which region the map arrives from. Sent once a second with the overlay
         // (the session only sends when the focus moved or lapsed).
         if let Some(live) = self.join_win.live_world.as_ref() {
-            let at = self.game.cam.pos;
+            // **The character's root while it exists, the camera before it
+            // does.** A streaming server sends the parts around this client's
+            // `ReplicationFocus`; the camera's position is the one thing the
+            // session's thread cannot know by itself. Where the character stands
+            // is the better answer once there is one — a person who walked two
+            // hundred studs should be streamed the parts around *them*, not
+            // around a camera that is still in its default place — and the
+            // camera is what there is until then.
+            let at = self
+                .join_win
+                .character_focus()
+                .or_else(|| self.game.cam.focus)
+                .unwrap_or(self.game.cam.pos);
             live.set_focus([at.x, at.y, at.z]);
         }
         let dropped = self
@@ -1467,3 +1526,69 @@ impl Editor {
         ));
     }
 }
+
+/// The local character's root position in one document, or `None`.
+///
+/// Free rather than a method so it can be tested against a document with no
+/// editor around it: the lookup is four properties and a geometry read, and the
+/// only thing that can go wrong is doing it against the wrong player.
+fn character_focus_in(doc: &rustudio_core::doc::Document) -> Option<glam::Vec3> {
+    // `Players.LocalPlayer` names our Player, and `Player.Character` names
+    // the model: the same pair `run`'s character binding uses, so this can
+    // never point at somebody else's character.
+    let players = doc.dom.get_by_ref(doc.dom.root_ref()).and_then(|root| {
+        root.children()
+            .iter()
+            .find(|r| {
+                doc.dom
+                    .get_by_ref(**r)
+                    .is_some_and(|i| i.class.as_str() == "Players")
+            })
+            .copied()
+    })?;
+    let local = match doc.prop(players, "LocalPlayer") {
+        Some(Variant::Ref(r)) if !r.is_none() => r,
+        _ => return None,
+    };
+    let character = match doc.prop(local, "Character") {
+        Some(Variant::Ref(r)) if !r.is_none() => r,
+        _ => return None,
+    };
+    // The root: `PrimaryPart` when it is named, else a child called
+    // `HumanoidRootPart`, else the character's own `CFrame`.
+    let root = match doc.prop(character, "PrimaryPart") {
+        Some(Variant::Ref(r)) if !r.is_none() => Some(r),
+        _ => doc.dom.get_by_ref(character).and_then(|i| {
+            i.children().iter().copied().find(|child| {
+                doc.dom
+                    .get_by_ref(*child)
+                    .is_some_and(|c| c.name.as_str() == "HumanoidRootPart")
+            })
+        }),
+    };
+    let target = root.unwrap_or(character);
+    let frame_of = |r| match doc.prop(r, "CFrame") {
+        Some(Variant::CFrame(frame)) => Some(frame),
+        _ => None,
+    };
+    let frame = match frame_of(target) {
+        Some(frame) => frame,
+        // A `Model` has no `CFrame`; take the first child that has one, as
+        // the scene does when it has to place a model.
+        _ => {
+            let child = doc
+                .dom
+                .get_by_ref(target)?
+                .children()
+                .iter()
+                .copied()
+                .find(|c| frame_of(*c).is_some())?;
+            frame_of(child)?
+        }
+    };
+    let p = frame.position;
+    (p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
+        .then(|| glam::Vec3::new(p.x, p.y, p.z))
+    }
+
+
