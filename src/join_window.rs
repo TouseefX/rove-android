@@ -81,6 +81,9 @@ const LIVE_SETTLE_QUIET: Duration = Duration::from_millis(500);
 /// person watching a cover for eight seconds has already decided it is broken.
 const LIVE_SETTLE_BOUND: Duration = Duration::from_secs(8);
 
+/// Give the default loading script time to animate away before the fallback.
+const LOADING_SCREEN_GRACE: Duration = Duration::from_secs(3);
+
 /// Decide using elapsed time, including on a frame where no batch arrived.
 fn live_settled(
     first_age: Option<Duration>,
@@ -111,6 +114,32 @@ fn live_handover(settled: bool, playing: bool, loaded: bool) -> LiveHandover {
     } else {
         LiveHandover::StartPlay
     }
+}
+
+/// Find this account's replicated Player before Play has set LocalPlayer.
+fn replicated_local_player(
+    doc: &rustudio_core::doc::Document,
+    account_uid: Option<u64>,
+) -> Option<rbx_dom_weak::types::Ref> {
+    let players = doc.find_child(doc.dom.root_ref(), "Players")?;
+    if let Some(Variant::Ref(player)) = doc.prop(players, "LocalPlayer") {
+        if doc.exists(player) {
+            return Some(player);
+        }
+    }
+    let uid = account_uid?;
+    doc.dom.get_by_ref(players)?.children().iter().copied().find(|&r| {
+        doc.dom.get_by_ref(r).is_some_and(|instance| {
+            if instance.class != "Player" {
+                return false;
+            }
+            match instance.properties.get(&rbx_dom_weak::ustr("UserId")) {
+                Some(Variant::Int64(n)) => u64::try_from(*n).ok() == Some(uid),
+                Some(Variant::Int32(n)) => u64::try_from(*n).ok() == Some(uid),
+                _ => false,
+            }
+        })
+    })
 }
 
 /// What the cover draws this frame.
@@ -226,8 +255,12 @@ pub struct JoinWindow {
     /// document and the join window must not hold the editor mutably while it
     /// asks for it.
     pub play_next_tick: bool,
+    /// When client Play started, for the bounded pre-character cover.
+    play_started_at: Option<Instant>,
     /// `DataModel.Loaded` has fired on the joined client (group 4).
     pub loaded: bool,
+    /// Time of Loaded, until the default-loading-screen fallback has run.
+    loading_guard_at: Option<Instant>,
     /// The last time a replication batch was applied, for the settle rule: Play
     /// must start *between* bursts of the initial world, not in the middle of
     /// them (`LIVE_SETTLE_QUIET`).
@@ -267,7 +300,9 @@ impl JoinWindow {
             live_applied: 0,
             core_gui_was: None,
             play_next_tick: false,
+            play_started_at: None,
             loaded: false,
+            loading_guard_at: None,
             live_last_batch: None,
             live_first_batch: None,
         }
@@ -485,6 +520,14 @@ impl Editor {
         // The right moment is a gap: the initial patch arrives as bursts, and
         // the quiet between two of them is the cheapest place to do seconds of
         // synchronous work. See `live_world_settled`.
+        if self.join_win.loading_guard_at.is_some_and(|at| at.elapsed() >= LOADING_SCREEN_GRACE) {
+            if let Some(hidden) = self.game.with_live_client(|rt| rt.dismiss_stuck_loading_screen()) {
+                self.join_win.loading_guard_at = None;
+                if hidden {
+                    self.warn("join: default loading screen was still enabled after Loaded; hid it");
+                }
+            }
+        }
         let settled = !self.join_win.loaded && self.live_world_settled();
         match live_handover(settled, self.game.play.is_some(), self.join_win.loaded) {
             LiveHandover::Wait => {}
@@ -494,6 +537,7 @@ impl Editor {
                 // A normal Play test is not a live client and returns None.
                 if self.game.with_live_client(|rt| rt.finish_loading()).is_some() {
                     self.join_win.loaded = true;
+                    self.join_win.loading_guard_at = Some(Instant::now());
                     self.info("join: the world is loaded (DataModel.Loaded fired)");
                 }
             }
@@ -505,8 +549,8 @@ impl Editor {
     /// Four facts, in the order they become true:
     ///
     /// * a batch has arrived at all (there is a `Players` to bind, usually);
-    /// * `LocalPlayer` is bound — Play without it is a session with a camera
-    ///   and no character to put behind it;
+    /// * the account's replicated `Player` exists; `LocalPlayer` itself is set
+    ///   only when Play starts;
     /// * `Workspace` has a replicated `BasePart` — the map, not just the
     ///   services. A `Workspace` with nothing in it is the state a join sits in
     ///   while `CoreGui`/`Players` arrive first, and starting Play there is what
@@ -535,13 +579,7 @@ impl Editor {
             return live_settled(first_age, last_age, false, false, false);
         }
         let doc = &self.game.doc;
-        let root = doc.dom.root_ref();
-        let local_player = doc
-            .find_child(root, "Players")
-            .and_then(|players| match doc.prop(players, "LocalPlayer") {
-                Some(Variant::Ref(p)) if doc.exists(p) => Some(p),
-                _ => None,
-            });
+        let local_player = replicated_local_player(doc, self.game.account.user_id());
         // A character anywhere under our Player is the server's own "you are in".
         let character = local_player
             .and_then(|player| match doc.prop(player, "Character") {
@@ -549,26 +587,17 @@ impl Editor {
                 _ => None,
             })
             .is_some();
-        let parts = doc
-            .workspace()
-            .and_then(|ws| doc.dom.get_by_ref(ws))
-            .map(|ws| {
-                ws.children()
-                    .iter()
-                    .filter(|c| {
-                        doc.class_of(**c).is_some_and(|k| {
-                            k != "Terrain" && rustudio_core::doc::is_a(&k, "BasePart")
-                        })
-                    })
-                    .count()
+        let has_parts = doc.workspace().is_some_and(|ws| {
+            doc.dom.descendants_of(ws).any(|i| {
+                i.class != "Terrain" && rustudio_core::doc::is_a(&i.class, "BasePart")
             })
-            .unwrap_or(0);
+        });
         live_settled(
             Some(first.elapsed()),
             self.join_win.live_last_batch.map(|at| at.elapsed()),
             local_player.is_some(),
             character,
-            parts > 0,
+            has_parts,
         )
     }
 
@@ -1160,34 +1189,16 @@ impl Editor {
         }
     }
 
-    /// Whether the cover has become a banner: Play has started on the
-    /// replicated world, so there is a game under it to see and to touch.
-    ///
-    /// Two ways in, because a join can arrive in either order: the world's
-    /// services and a `LocalPlayer` (the ordinary case), or CoreGui live from
-    /// the CoreScripts (a place whose first frames are CoreGui-driven). Neither
-    /// waits for the character: that is exactly what the banner is *about*.
+    /// If the character never arrives, unblock the running game after a bound
+    /// instead of leaving an opaque cover over its menus forever. Until then the
+    /// cover prevents a flash of the unbound camera and CoreGui controls.
     fn cover_wants_banner(&self) -> bool {
-        if !self.join_win.cover_until_played {
-            return false;
-        }
-        let Some(play) = self.game.play.as_ref() else {
-            return false;
-        };
-        if play.mode != rustudio_engine::runtime::RunMode::Client {
-            return false;
-        }
-        if play.game.core_scripts_active {
-            return true;
-        }
-        let doc = &self.game.doc;
-        // **A workspace is enough.** Waiting for `LocalPlayer` as well kept the
-        // wall up for the whole of a join whose `Player` had not replicated yet
-        // (or never would), and the wall is what made the game un-clickable:
-        // CoreGui's menu, chat and TopBar are behind it. Once Play is running on
-        // the replicated world there is a game underneath, and the thing that is
-        // still missing belongs in a banner over it, not in a cover over it.
-        doc.workspace().is_some()
+        self.join_win.cover_until_played
+            && self.game.play.as_ref().is_some_and(|play| {
+                play.mode == rustudio_engine::runtime::RunMode::Client
+            })
+            && self.join_win.play_started_at.is_some_and(|at| at.elapsed() >= LIVE_SETTLE_BOUND)
+            && self.game.doc.workspace().is_some()
     }
 
     /// The cover as a strip: what is still being waited for, over a game that is
@@ -1278,11 +1289,8 @@ impl Editor {
                 _ => None,
             });
         let character = play.character.is_some();
-        // `Player.CharacterAutoLoads == false` means the server will not make
-        // one until a script asks: a cover that waits for a character that is
-        // never coming is a cover that never comes down. (Roblox's own loading
-        // screen ends the same way — at the game, not at the character.)
-        let auto = match me.and_then(|p| doc.prop(p, "CharacterAutoLoads")) {
+        // `Players.CharacterAutoLoads == false` permits games with no spawn.
+        let auto = match doc.find_child(root, "Players").and_then(|p| doc.prop(p, "CharacterAutoLoads")) {
             Some(Variant::Bool(auto)) => auto,
             _ => true,
         };
@@ -1347,7 +1355,9 @@ impl Editor {
         self.join_win.cover_until_played = false;
         self.join_win.installed = false;
         self.join_win.play_next_tick = false;
+        self.join_win.play_started_at = None;
         self.join_win.loaded = false;
+        self.join_win.loading_guard_at = None;
         self.join_win.live_reported = false;
         self.join_win.live_report_at = None;
         if self.game.play.is_some() {
@@ -1452,6 +1462,9 @@ impl Editor {
                 // `start_play` and `play_when_loaded` use the engine's enum, and
                 // the two are separate types with the same variant names.)
                 self.start_play(rustudio_engine::runtime::RunMode::Client);
+                if self.game.play.as_ref().is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Client) {
+                    self.join_win.play_started_at = Some(Instant::now());
+                }
                 // **The check the reviewer asked for**: after Play has had the
                 // document, does the join's own id map still name this
                 // document's instances? If it does not, every later delta is
@@ -1812,7 +1825,9 @@ impl Editor {
         self.join_win.live_first_batch = None;
         self.join_win.live_last_batch = None;
         self.join_win.loaded = false;
+        self.join_win.loading_guard_at = None;
         self.join_win.play_next_tick = false;
+        self.join_win.play_started_at = None;
         // A joined place fills the screen, as it does on Roblox: the game is
         // the whole window, not the dock's 3D view with Studio around it. That
         // is also what makes the joining cover a cover — and it is what
@@ -2050,6 +2065,20 @@ fn local_character_in(doc: &rustudio_core::doc::Document) -> Option<rbx_dom_weak
 #[cfg(test)]
 mod live_handover_tests {
     use super::*;
+
+    #[test]
+    fn replicated_player_is_found_before_local_player_is_assigned() {
+        use rbx_dom_weak::InstanceBuilder;
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let players = doc.find_child(doc.dom.root_ref(), "Players").unwrap();
+        doc.dom.insert(players, InstanceBuilder::new("Player")
+            .with_name("Other").with_property("UserId", 12_i64));
+        let local = doc.dom.insert(players, InstanceBuilder::new("Player")
+            .with_name("Local").with_property("UserId", 34_i64));
+        assert_eq!(replicated_local_player(&doc, Some(34)), Some(local));
+        assert_eq!(replicated_local_player(&doc, Some(99)), None);
+        assert_eq!(replicated_local_player(&doc, None), None);
+    }
 
     #[test]
     fn a_quiet_world_advances_without_another_batch() {

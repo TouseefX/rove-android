@@ -161,7 +161,7 @@ impl Counters {
         let line = format!(
             "{} · {} pkt ({} rep) · {} inst · {} held→{} · {} refused · {} rows · \
              acked {}/{} held · markers {}/{} · stream {}/{} {} · \
-             dgram {}/{} on {} ch · acks {} · ping {}/{} ({} blocked) · phys {} · \
+             dgram {}/{} on {} ch · acks {} · ping {}/{} ({} blocked) · sync {}/{} · phys {} · \
              focus {} · {} s · {}{}",
             if self.stage.is_empty() { "join" } else { &self.stage },
             self.packets,
@@ -191,6 +191,8 @@ impl Counters {
             self.pings_answered,
             self.pings,
             self.pings_blocked,
+            self.sync_replies,
+            self.sync_requests,
             self.physics_frames_sent,
             // `focus` is the last thing before the clock, and the two
             // diagnostics after it: the format string had lost the second of
@@ -604,6 +606,12 @@ mod tests {
         assert!(!worker_side.stop_requested());
         live.request_stop();
         assert!(worker_side.stop_requested());
+    }
+
+    #[test]
+    fn overlay_includes_time_sync_replies_and_requests() {
+        let counters = Counters { sync_replies: 3, sync_requests: 5, ..Default::default() };
+        assert!(counters.line().contains("sync 3/5"), "{}", counters.line());
     }
 
     #[test]

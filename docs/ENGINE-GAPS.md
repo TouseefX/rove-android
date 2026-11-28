@@ -17,6 +17,15 @@ Gap kinds:
 | `write-ignored` | such a property written with nothing in rustudio acting on it |
 | `event-unwired` | an event scripts connect to that nothing in rustudio fires (not named by any fire path in the engine's sources, and not fired during the run) |
 
+## Live join loading lifecycle
+
+When the initial live world is marked loaded, the client now fires both
+`ReplicatedFirst.FinishedReplicating` and `DataModel.Loaded` once. A default
+`CoreGui.RobloxLoadingGui` still enabled three seconds later is hidden as a
+logged fallback; place-owned loading GUIs are not changed. The full behavior of
+Studio's `LoadingScript`, including its fade and asset-queue waits, still needs
+on-device verification.
+
 ## EditableMesh / EditableImage / Content (Place A's skinned guns)
 
 Were silent stubs (AddVertex returned 0, Size (0, 0), ReadPixelsBuffer nil,

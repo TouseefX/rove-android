@@ -274,10 +274,15 @@ pub struct Session {
     /// When this session was created. The overlay's `seconds` is read from it:
     /// a join is measured against wall time, not against packets.
     pub started: std::time::Instant,
+    /// Time login packets finished, for a short metadata-only outbound trace.
+    #[cfg(feature = "transport")]
+    logged_in_at: Option<std::time::Instant>,
     pub acknowledged_through: u64,
     /// Rows applied over the session's life. Distinct from the journal's
     /// retained count, which prunes to zero as the session keeps up.
     pub rows_applied: u64,
+    /// Remote replication events seen; the live RPC runtime bridge is not yet wired.
+    pub remote_events_seen: u64,
     pub acknowledged_errors: usize,
     /// A region has arrived, so this place streams (`note_regions`). Until then
     /// no focus is sent: the streamer does not exist to read one. See `refocus`.
@@ -510,7 +515,10 @@ impl Session {
             markers_queue: rove_client_core::replication_out::MarkerQueue::new(),
             marker_replies: 0,
             started: std::time::Instant::now(),
+            #[cfg(feature = "transport")]
+            logged_in_at: None,
             rows_applied: 0,
+            remote_events_seen: 0,
             streamer_seen: false,
             last_packet_at: None,
             physics_skipped: 0,
@@ -1748,6 +1756,18 @@ impl Session {
             self.cursor = row.sequence;
             through = row.sequence;
             self.rows_applied += 1;
+            // Count protocol events, not arguments or instance IDs. The editor
+            // bridge does not yet dispatch remote RPCs; if the server invokes one,
+            // say so instead of silently treating the receipt as a reply.
+            for event in &row.value.events {
+                let name = event.get("name").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+                if matches!(name, "RemoteOnInvokeClient" | "OnClientEvent" | "RemoteOnInvokeSuccess" | "RemoteOnInvokeError") {
+                    self.remote_events_seen = self.remote_events_seen.saturating_add(1);
+                    if self.remote_events_seen <= 3 {
+                        log::warn!("session: remote event {name} received; live RPC dispatch is not wired ({} seen)", self.remote_events_seen);
+                    }
+                }
+            }
             // Streaming, and the spawn handshake: both read from the record
             // that carried them. A streaming place sends the region set before
             // the parts, and holds the character until this client says the
@@ -1938,7 +1958,7 @@ impl Session {
         log::warn!(
             "session: quiet for {} ms after {} s — {} pkt ({} rep, {} refused, {} rows), \
              held {}, frames {} (acks {} out, {} pending), physics {}/{} ({} skipped), focus {} ({} ready), \
-             datagrams {}/{}, writes {} stalled {} refused, {} tick(s) served since the last \
+             datagrams {}/{}, remote events {}, writes {} stalled {} refused, {} tick(s) served since the last \
              line, top arrivals: {}",
             silent_for.as_millis(),
             self.started.elapsed().as_secs(),
@@ -1957,6 +1977,7 @@ impl Session {
             self.streaming_ready_sent,
             self.datagrams_fed,
             self.unknown_datagrams,
+            self.remote_events_seen,
             self.writes_stalled,
             self.writes_refused,
             ticks,
@@ -2230,6 +2251,7 @@ pub async fn run(
         log::info!("session: login packet {} ({} bytes) sent", index + 1, packet.len());
     }
     session.stage = Stage::LoggedIn;
+    session.logged_in_at = Some(std::time::Instant::now());
     progress(session);
 
     // Every stream the server opens, as rove's client does — not only the
@@ -2642,6 +2664,18 @@ impl std::fmt::Display for WriteError {
     }
 }
 
+/// Metadata only: never print packet contents, login credentials, or IDs.
+#[cfg(feature = "transport")]
+fn trace_early_outbound(session: &Session, route: &str, application: u8, channel: u32, payload: &[u8]) {
+    if application == REPLICATION_APPLICATION
+        && matches!(channel, 1 | 3 | 6)
+        && session.logged_in_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3))
+    {
+        log::info!("session: early outbound {route} {application}/{channel} type={:?} bytes={}",
+            payload.first(), payload.len());
+    }
+}
+
 #[cfg(feature = "transport")]
 async fn send_bounded(
     session: &mut Session,
@@ -2650,6 +2684,7 @@ async fn send_bounded(
     channel: u32,
     payload: &[u8],
 ) -> Result<(), WriteError> {
+    trace_early_outbound(session, "reliable", application, channel, payload);
     match tokio::time::timeout(
         std::time::Duration::from_millis(WRITE_STALL_MS),
         sender.send(application, channel, payload),
@@ -2727,6 +2762,7 @@ impl UnreliableWriter {
             .sequence
             .checked_add(1)
             .ok_or("the datagram sequence is exhausted")?;
+        trace_early_outbound(session, "datagram", application, channel, payload);
         rove_client_core::transport::session::send_unreliable(
             connection,
             wire_id,
@@ -2881,6 +2917,7 @@ impl PhysicsWriter {
                 return false;
             }
         };
+        trace_early_outbound(session, "datagram", crate::physics_sender::APPLICATION, u32::from(crate::physics_sender::CHANNEL), &payload);
         match rove_client_core::transport::session::send_unreliable(
             connection,
             crate::physics_sender::WIRE_ID,

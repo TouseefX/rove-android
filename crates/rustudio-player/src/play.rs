@@ -1495,11 +1495,14 @@ impl Game {
             self.with_live_client(|rt| rt.begin_loading());
         }
         rustudio_core::load_trace::mark("play: globals bound");
-        // Studio loads every plugin again in the Play server and client
-        // DataModels (measured: each copy runs with IsEdit false).
-        self.with_side(Side::Server, |rt, _, _| host.load_plugins(rt));
-        if two || network_client {
-            self.with_side(Side::Client, |rt, _, _| host.load_plugins(rt));
+        // Studio plugins belong to Play Solo's DataModels, not to a live
+        // Roblox client. Loading editor plugins in a joined game runs unrelated
+        // plugin code and can introduce its UI into the player's CoreGui.
+        if !network_client {
+            self.with_side(Side::Server, |rt, _, _| host.load_plugins(rt));
+            if two {
+                self.with_side(Side::Client, |rt, _, _| host.load_plugins(rt));
+            }
         }
         self.with_side(Side::Server, |rt, _, _| rt.warm_queries());
         rustudio_core::load_trace::mark("play: server queries warmed");
@@ -2311,6 +2314,24 @@ impl Game {
                 rt.dispatch();
             });
         }
+        let owner_root = self.doc.prop(humanoid, "RootPart")
+            .and_then(|v| match v {
+                Variant::Ref(r) if !r.is_none() && self.doc.exists(r) => Some(r),
+                _ => None,
+            })
+            .or_else(|| self.doc.find_named(character, "HumanoidRootPart"))
+            .or_else(|| self.doc.find_named(character, "Torso"));
+        let assembly_root = owner_root.and_then(|r| match self.doc.prop(r, "AssemblyRootPart") {
+            Some(Variant::Ref(a)) if !a.is_none() && self.doc.exists(a) => Some(a),
+            _ => Some(r),
+        });
+        log::info!(
+            "Live: character ownership: peer={:?} root={owner_root:?} root_owner={:?} assembly={assembly_root:?} assembly_owner={:?} locally_owned={}",
+            self.doc.self_peer,
+            owner_root.and_then(|r| self.doc.prop(r, "NetworkOwnerV3")),
+            assembly_root.and_then(|r| self.doc.prop(r, "NetworkOwnerV3")),
+            self.live_character_owned(),
+        );
         log::info!(
             "Live: character bound: model={character:?} rig={rig_label} humanoid={humanoid:?} \
              at=({:.1}, {:.1}, {:.1}) camera={}",
@@ -2481,6 +2502,12 @@ impl Game {
             .or_else(|| self.doc.find_named(ch.model, "HumanoidRootPart"))
             .or_else(|| self.doc.find_named(ch.model, "Torso"))
             .unwrap_or(ch.rig.root);
+        // Ownership belongs to the assembly root, which can differ from the
+        // humanoid root (and is also what the physics solver checks).
+        let root = match self.doc.prop(root, "AssemblyRootPart") {
+            Some(Variant::Ref(r)) if !r.is_none() && self.doc.exists(r) => r,
+            _ => root,
+        };
         // `peer_of` reads the value once: `Some(peer)` is a grant (ours, or
         // somebody else's) and `None` is the server's `nil`.
         match rustudio_core::doc::peer_of(self.doc.prop(root, "NetworkOwnerV3")) {

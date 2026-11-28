@@ -7366,14 +7366,34 @@ impl Runtime {
         if !was {
             return;
         }
-        let root = world(&self.lua).map(|w| w.d().dom.root_ref()).ok();
-        if let Some(root) = root.filter(|r| r.is_some()) {
-            if let Ok(mut w) = world(&self.lua) {
-                // `Loaded` itself, then the handlers run (`dispatch` below).
+        if let Ok(mut w) = world(&self.lua) {
+            let root = w.d().dom.root_ref();
+            let replicated_first = w.d().find_child(root, "ReplicatedFirst");
+            if let Some(replicated_first) = replicated_first {
+                w.fire(replicated_first, "FinishedReplicating", vec![]);
+            }
+            if root.is_some() {
                 w.fire(root, "Loaded", vec![]);
             }
-            self.dispatch();
         }
+        self.dispatch();
+    }
+
+    /// If the default CoreGui loading screen is still enabled after the join
+    /// finished, hide just that screen. Returns whether a fallback was needed.
+    pub fn dismiss_stuck_loading_screen(&self) -> bool {
+        let loading_gui = world(&self.lua).ok().and_then(|w| {
+            let root = w.d().dom.root_ref();
+            let core_gui = w.d().find_child(root, "CoreGui")?;
+            let gui = w.d().find_child(core_gui, "RobloxLoadingGui")?;
+            (w.d().class_of(gui).as_deref() == Some("ScreenGui")
+                && !matches!(w.d().prop(gui, "Enabled"), Some(Variant::Bool(false))))
+                .then_some(gui)
+        });
+        let Some(gui) = loading_gui else { return false };
+        self.set(gui, "Enabled", Value::Boolean(false));
+        self.dispatch();
+        world(&self.lua).is_ok_and(|w| matches!(w.d().prop(gui, "Enabled"), Some(Variant::Bool(false))))
     }
 
     /// Whether this runtime's document has `r`. For a caller replaying
@@ -8997,17 +9017,38 @@ mod tests {
         rt.enter(w);
         rt.bind_globals().unwrap();
         rt.begin_loading();
-        rt.lua.load(r#"
+        security::with_main_identity(&rt.lua, security::CORE, || rt.lua.load(r#"
             assert(not game:IsLoaded())
-            loaded_events = 0
+            loaded_events, replication_events = 0, 0
             game.Loaded:Connect(function() loaded_events += 1 end)
-        "#).exec().unwrap();
+            game:GetService("ReplicatedFirst").FinishedReplicating:Connect(function()
+                replication_events += 1
+            end)
+        "#).exec()).unwrap();
         // Like the player, remove and re-enter the world between frames.
         let world = rt.leave();
         rt.enter(world);
         rt.finish_loading();
         rt.finish_loading();
-        rt.lua.load("assert(game:IsLoaded() and loaded_events == 1)").exec().unwrap();
+        rt.lua.load("assert(game:IsLoaded() and loaded_events == 1 and replication_events == 1)").exec().unwrap();
+    }
+
+    #[test]
+    fn stuck_loading_fallback_hides_only_default_loading_gui() {
+        let mut doc = Document::new_place();
+        let core_gui = doc.find_child(doc.dom.root_ref(), "CoreGui").unwrap();
+        let loading = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
+            .with_name("RobloxLoadingGui").with_property("Enabled", true));
+        let other = doc.dom.insert(core_gui, InstanceBuilder::new("ScreenGui")
+            .with_name("ExperienceGui").with_property("Enabled", true));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(doc, RunMode::Client));
+        rt.bind_globals().unwrap();
+        assert!(rt.dismiss_stuck_loading_screen());
+        assert!(!rt.dismiss_stuck_loading_screen());
+        let w = rt.leave();
+        assert_eq!(w.d().prop(loading, "Enabled"), Some(Variant::Bool(false)));
+        assert_eq!(w.d().prop(other, "Enabled"), Some(Variant::Bool(true)));
     }
 
     #[test]
